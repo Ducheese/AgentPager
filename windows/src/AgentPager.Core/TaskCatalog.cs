@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace AgentPager.Core;
 
@@ -104,6 +105,47 @@ public sealed class TaskCatalog
             default:
                 if (_tasks.First(task => task.Id == hook.SessionID).Lifecycle == AgentLifecycle.Running)
                     _requests.Remove(hook.SessionID);
+                break;
+        }
+        Changed();
+        return true;
+    }
+
+    public bool Accept(OpenCodeHookPayload hook, DateTimeOffset? receivedAt = null)
+    {
+        var now = receivedAt ?? DateTimeOffset.UtcNow;
+        var sessionID = OpenCodeEventReducer.SessionID(hook);
+        if (sessionID is null) return false;
+        var existing = _tasks.FirstOrDefault(task => task.Id == sessionID);
+        if (existing is null && hook.Event is "plugin.dispose" or "session.deleted") return false;
+        Upsert(OpenCodeEventReducer.Reduce(hook, existing, now));
+        switch (hook.Event)
+        {
+            case "permission.asked":
+                _requests[sessionID] = new(
+                    sessionID,
+                    PendingRequestKind.Approval,
+                    OpenCodeEventReducer.PermissionSummary(hook.Properties),
+                    []);
+                break;
+            case "question.asked":
+                _requests[sessionID] = new(
+                    sessionID,
+                    PendingRequestKind.Question,
+                    OpenCodeEventReducer.QuestionSummary(hook.Properties),
+                    OpenCodeEventReducer.QuestionOptions(hook.Properties));
+                break;
+            case "permission.replied":
+            case "question.replied":
+            case "question.rejected":
+            case "session.idle":
+            case "session.error":
+                _requests.Remove(sessionID);
+                break;
+            default:
+                if (_tasks.First(task => task.Id == sessionID).Lifecycle is not
+                    (AgentLifecycle.Starting or AgentLifecycle.WaitingApproval or AgentLifecycle.WaitingAnswer))
+                    _requests.Remove(sessionID);
                 break;
         }
         Changed();
@@ -668,6 +710,499 @@ public static class ClaudeEventReducer
             .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
         return result.Length == 0 ? null : result;
     }
+}
+
+public static class ModelNames
+{
+    /// <summary>ccproxy/deepseek-flash → deepseek-flash（取最后一个 / 段）。</summary>
+    public static string? Label(string? model)
+    {
+        if (string.IsNullOrWhiteSpace(model)) return null;
+        var segment = model.Trim().Split('/', StringSplitOptions.RemoveEmptyEntries).LastOrDefault();
+        return string.IsNullOrEmpty(segment) ? null : segment;
+    }
+}
+
+public static class OpenCodeEventReducer
+{
+    private static readonly string[] InputKeys =
+        ["command", "description", "filePath", "file_path", "path", "pattern", "query", "url", "subagent_type", "agent", "skill"];
+
+    // 与 opencode Session.isDefaultTitle 对齐：New session - / Child session - + ISO 时间戳。
+    private static readonly Regex DefaultTitlePattern = new(
+        @"^(New session - |Child session - )\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$",
+        RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+    public static string? SessionID(OpenCodeHookPayload hook)
+    {
+        if (hook.Properties is not { } properties) return null;
+        if (Text(properties, "sessionID") is { Length: > 0 } sessionID) return sessionID;
+        if (Child(properties, "info") is { } info && Text(info, "id") is { Length: > 0 } id) return id;
+        return null;
+    }
+
+    public static TaskSnapshot Reduce(OpenCodeHookPayload hook, TaskSnapshot? existing, DateTimeOffset now)
+    {
+        var sessionID = SessionID(hook) ?? existing?.Id ?? "opencode";
+        var project = ProjectName(hook.Properties) ?? existing?.ProjectName ?? "opencode";
+        var task = existing ?? new TaskSnapshot(
+            sessionID, AgentSource.OpenCode, project, project,
+            null, null, null, [],
+            AgentLifecycle.Idle, null,
+            SessionCreatedAt(hook.Properties) ?? now, now, null,
+            false, false, false, []);
+        task = task with { ProjectName = project, UpdatedAt = now };
+
+        switch (hook.Event)
+        {
+            case "session.created":
+                return task with
+                {
+                    Lifecycle = task.IsTerminal ? task.Lifecycle : AgentLifecycle.Idle,
+                    Activity = null,
+                    StartedAt = SessionCreatedAt(hook.Properties) ?? task.StartedAt,
+                    Title = SessionTitleText(task, hook.Properties) ?? task.Title,
+                    Capabilities = [],
+                };
+            case "session.updated":
+                return SessionTitle(task, hook.Properties);
+            case "session.deleted":
+                return task with
+                {
+                    Lifecycle = task.IsTerminal ? task.Lifecycle : AgentLifecycle.Offline,
+                    Activity = null,
+                    Capabilities = [],
+                    PromptQueued = false,
+                };
+            case "chat.message":
+            {
+                var next = UserPrompt(task, Text(hook.Properties, "text"), now);
+                if (ModelFromProperties(hook.Properties) is { } model) next = next with { ModelName = model };
+                return next with { PromptQueued = Flag(hook.Properties, "queued") };
+            }
+            case "prompt.active":
+                // 排队的 prompt 被接单（新的 assistant 消息开始生成）
+                return task.PromptQueued ? task with { PromptQueued = false } : task;
+            case "session.status":
+                return StatusEvent(task, hook.Properties, now);
+            case "session.idle":
+                return Idle(task, now);
+            case "session.error":
+                return Failed(task, ErrorSummary(SessionError(hook.Properties)), now);
+            case "message.updated":
+                return MessageUpdated(task, hook.Properties, now);
+            case "message.part.updated":
+                return PartUpdated(task, hook.Properties);
+            case "reply":
+                // 正文预览（插件从 assistant text part 节流转发）：只更新第三行，不动生命周期。
+                return Text(hook.Properties, "text") is { } preview ? WithStep(task, Clamp(preview, 220)) : task;
+            case "permission.asked":
+                return task with
+                {
+                    Lifecycle = AgentLifecycle.WaitingApproval,
+                    Activity = AgentActivity.Executing,
+                    CompletedAt = null,
+                    Capabilities = [],
+                };
+            case "permission.replied":
+                return PermissionReply(task, hook.Properties, now);
+            case "question.asked":
+                return WithStep(task with
+                {
+                    Lifecycle = AgentLifecycle.WaitingAnswer,
+                    Activity = AgentActivity.Thinking,
+                    CompletedAt = null,
+                    Capabilities = [],
+                }, QuestionSummary(hook.Properties));
+            case "question.replied":
+                return task with
+                {
+                    Lifecycle = AgentLifecycle.Running,
+                    Activity = AgentActivity.Thinking,
+                    CompletedAt = null,
+                    Capabilities = [],
+                };
+            case "question.rejected":
+                return Interrupted(task, null, now);
+            case "plugin.dispose":
+                return task with
+                {
+                    Lifecycle = task.IsTerminal ? task.Lifecycle : AgentLifecycle.Offline,
+                    Activity = null,
+                    Capabilities = [],
+                    PromptQueued = false,
+                };
+            default:
+                return task;
+        }
+    }
+
+    public static string? PermissionSummary(JsonElement? properties)
+    {
+        if (properties is not { } value) return null;
+        var permission = Text(value, "permission");
+        var patterns = StringArray(value, "patterns");
+        var detail = patterns.Count > 0 ? string.Join(", ", patterns.Take(4)) : null;
+        var summary = (permission, detail) switch
+        {
+            (not null, not null) => $"{permission} · {detail}",
+            (not null, null) => permission,
+            (null, not null) => detail,
+            _ => null,
+        };
+        return summary is null ? null : Clamp(summary, 220);
+    }
+
+    public static string? QuestionSummary(JsonElement? properties)
+    {
+        if (properties is not { } value) return null;
+        if (!value.TryGetProperty("questions", out var questions) || questions.ValueKind != JsonValueKind.Array)
+            return null;
+        foreach (var item in questions.EnumerateArray())
+        {
+            var summary = Text(item, "header") ?? Text(item, "question");
+            if (summary is not null) return Clamp(summary, 220);
+        }
+        return null;
+    }
+
+    public static List<string> QuestionOptions(JsonElement? properties)
+    {
+        var result = new List<string>();
+        if (properties is not { } value) return result;
+        if (!value.TryGetProperty("questions", out var questions) || questions.ValueKind != JsonValueKind.Array)
+            return result;
+        foreach (var item in questions.EnumerateArray()) result.AddRange(StringArray(item, "options"));
+        return result.Take(16).ToList();
+    }
+
+    private static TaskSnapshot StatusEvent(TaskSnapshot task, JsonElement? properties, DateTimeOffset now)
+    {
+        var status = properties is { } value ? Child(value, "status") : null;
+        var type = status is { } state ? Text(state, "type") : null;
+        switch (type)
+        {
+            case "busy":
+                return task with
+                {
+                    Lifecycle = AgentLifecycle.Running,
+                    Activity = task.Activity ?? AgentActivity.Thinking,
+                    CompletedAt = null,
+                    Capabilities = [],
+                };
+            case "retry":
+                var attempt = Number(status, "attempt");
+                var message = Text(status, "message");
+                var step = message is null ? "重试中" : $"重试 #{attempt}: {message}";
+                return WithStep(task with
+                {
+                    Lifecycle = AgentLifecycle.Running,
+                    Activity = AgentActivity.Thinking,
+                    CompletedAt = null,
+                    Capabilities = [],
+                }, Clamp(step, 220));
+            default:
+                return Idle(task, now);
+        }
+    }
+
+    private static TaskSnapshot Idle(TaskSnapshot task, DateTimeOffset now)
+    {
+        if (task.Lifecycle == AgentLifecycle.Interrupted) return task;
+        return task with
+        {
+            Lifecycle = AgentLifecycle.Succeeded,
+            Activity = null,
+            CompletedAt = task.IsTerminal ? task.CompletedAt ?? now : now,
+            IsUnread = true,
+            Capabilities = [],
+        };
+    }
+
+    private static TaskSnapshot Failed(TaskSnapshot task, string? step, DateTimeOffset now)
+    {
+        var next = task with
+        {
+            Lifecycle = AgentLifecycle.Interrupted,
+            Activity = null,
+            CompletedAt = now,
+            IsUnread = true,
+            Capabilities = [],
+        };
+        return step is null ? next : WithStep(next, Clamp($"✗ {step}", 220));
+    }
+
+    private static TaskSnapshot Interrupted(TaskSnapshot task, string? step, DateTimeOffset now) =>
+        Failed(task, step, now);
+
+    private static TaskSnapshot MessageUpdated(TaskSnapshot task, JsonElement? properties, DateTimeOffset now)
+    {
+        if (properties is not { } value) return task;
+        var info = Child(value, "info");
+        if (info is not { } message) return task;
+        var usage = TokenUsageFrom(message);
+        if (usage is not null) task = task with { TokenUsage = usage };
+        if (ModelNames.Label(Text(message, "modelID")) is { } model) task = task with { ModelName = model };
+        var error = Child(message, "error");
+        return error is { } failure ? Failed(task, ErrorSummary(failure), now) : task;
+    }
+
+    private static string? ModelFromProperties(JsonElement? properties)
+    {
+        var model = properties is { } value ? Child(value, "model") : null;
+        if (model is { } source && ModelNames.Label(Text(source, "modelID")) is { } label) return label;
+        return ModelNames.Label(Text(properties, "modelID"));
+    }
+
+    private static bool Flag(JsonElement? element, string name) =>
+        element is { } value &&
+        value.ValueKind == JsonValueKind.Object &&
+        value.TryGetProperty(name, out var child) &&
+        child.ValueKind == JsonValueKind.True;
+
+    private static TaskSnapshot PartUpdated(TaskSnapshot task, JsonElement? properties)
+    {
+        if (properties is not { } value) return task;
+        var part = Child(value, "part");
+        if (part is not { } item) return task;
+        var state = Child(item, "state");
+        var status = state is { } current ? Text(current, "status") : null;
+        var tool = Text(item, "tool");
+        var step = LatestStep(tool, state);
+
+        switch (status)
+        {
+            case "pending":
+            case "running":
+                if (task.Lifecycle == AgentLifecycle.Interrupted) return task;
+                return WithStep(task with
+                {
+                    Lifecycle = AgentLifecycle.Running,
+                    Activity = ActivityFor(tool, state),
+                    CompletedAt = null,
+                    Capabilities = [],
+                }, step);
+            case "completed":
+                if (task.Lifecycle == AgentLifecycle.Interrupted) return task;
+                return WithStep(task with
+                {
+                    Lifecycle = AgentLifecycle.Running,
+                    Activity = AgentActivity.Thinking,
+                    CompletedAt = null,
+                    Capabilities = [],
+                }, step);
+            case "error":
+                if (task.Lifecycle == AgentLifecycle.Interrupted) return task;
+                var failure = state is { } failed ? Text(failed, "error") : null;
+                return WithStep(task with
+                {
+                    Lifecycle = AgentLifecycle.Running,
+                    Activity = AgentActivity.Thinking,
+                    CompletedAt = null,
+                    Capabilities = [],
+                }, failure is null ? null : Clamp($"✗ {failure}", 220));
+            default:
+                return task;
+        }
+    }
+
+    /// <summary>
+    /// 第三行（LatestStep）永不显示用户 prompt：候选为空则保留原值；
+    /// 候选与当前 UserPrompt 相同或整段包含它（prompt ≥4 字）时丢弃，保留上一步。
+    /// </summary>
+    private static TaskSnapshot WithStep(TaskSnapshot task, string? step)
+    {
+        if (step is null) return task;
+        if (task.UserPrompt is { Length: >= 4 } prompt &&
+            step.Contains(prompt, StringComparison.OrdinalIgnoreCase))
+            return task;
+        return task with { LatestStep = step };
+    }
+
+    private static TaskSnapshot PermissionReply(TaskSnapshot task, JsonElement? properties, DateTimeOffset now)
+    {
+        var reply = Text(properties, "reply");
+        if (reply == "reject") return Interrupted(task, null, now);
+        return task with
+        {
+            Lifecycle = AgentLifecycle.Running,
+            Activity = AgentActivity.Thinking,
+            CompletedAt = null,
+            Capabilities = [],
+        };
+    }
+
+    private static TaskSnapshot UserPrompt(TaskSnapshot task, string? prompt, DateTimeOffset now)
+    {
+        var normalized = Normalize(prompt);
+        // 本轮计时：一轮的第一个 prompt 开始计时；轮内插入的 prompt 不重置。
+        var startsTurn = task.Lifecycle is AgentLifecycle.Idle or AgentLifecycle.Offline
+            or AgentLifecycle.Succeeded or AgentLifecycle.Interrupted;
+        return task with
+        {
+            Lifecycle = AgentLifecycle.Running,
+            Activity = AgentActivity.Thinking,
+            UserPrompt = normalized ?? task.UserPrompt,
+            StartedAt = startsTurn ? now : task.StartedAt,
+            CompletedAt = null,
+            Capabilities = [],
+        };
+    }
+
+    private static TaskSnapshot SessionTitle(TaskSnapshot task, JsonElement? properties)
+    {
+        var next = SessionTitleText(task, properties);
+        return next is null || next == task.Title ? task : task with { Title = next };
+    }
+
+    private static string? SessionTitleText(TaskSnapshot task, JsonElement? properties)
+    {
+        var info = properties is { } value ? Child(value, "info") : null;
+        var title = info is { } session ? Text(session, "title") : null;
+        if (title is null || DefaultTitlePattern.IsMatch(title)) return null;
+        return Clamp($"{task.ProjectName} · {title}", 120);
+    }
+
+    private static string? ProjectName(JsonElement? properties)
+    {
+        var info = properties is { } value ? Child(value, "info") : null;
+        var directory = info is { } session ? Text(session, "directory") : null;
+        if (directory is null) return null;
+        var leaf = directory.TrimEnd('\\', '/').Split('\\', '/').LastOrDefault(part => part.Length > 0);
+        return string.IsNullOrEmpty(leaf) ? null : leaf;
+    }
+
+    private static DateTimeOffset? SessionCreatedAt(JsonElement? properties)
+    {
+        var info = properties is { } value ? Child(value, "info") : null;
+        if (info is not { } session) return null;
+        var time = Child(session, "time");
+        if (time is not { } clock || clock.ValueKind != JsonValueKind.Object) return null;
+        if (!clock.TryGetProperty("created", out var created) || created.ValueKind != JsonValueKind.Number) return null;
+        var milliseconds = created.GetDouble();
+        return milliseconds <= 0 ? null : DateTimeOffset.FromUnixTimeMilliseconds((long)Math.Round(milliseconds));
+    }
+
+    private static AgentActivity ActivityFor(string? tool, JsonElement? state)
+    {
+        var name = tool?.ToLowerInvariant() ?? "";
+        if (name.Length == 0) return AgentActivity.Executing;
+        if (name.Contains("todo")) return AgentActivity.Thinking;
+        if (name.Contains("question")) return AgentActivity.Thinking;
+        if (name.Contains("read") || name == "list" || name.EndsWith("_list")) return AgentActivity.Reading;
+        if (name.Contains("glob") || name.Contains("grep") || name.Contains("search")) return AgentActivity.Searching;
+        if (name.Contains("task") || name.Contains("agent")) return AgentActivity.Delegating;
+        if (name.Contains("webfetch") || name.Contains("websearch") || name.Contains("browser")) return AgentActivity.Browsing;
+        if (name.Contains("edit") || name.Contains("write") || name.Contains("patch")) return AgentActivity.Editing;
+        if (name.Contains("skill") || name.Contains("lsp")) return AgentActivity.Reading;
+        if (name.Contains("bash") || name.Contains("shell") || name.Contains("terminal"))
+            return IsTestCommand(state) ? AgentActivity.Testing : AgentActivity.Executing;
+        if (name.Contains("test")) return AgentActivity.Testing;
+        return AgentActivity.Executing;
+    }
+
+    private static bool IsTestCommand(JsonElement? state)
+    {
+        var input = state is { } value ? Child(value, "input") : null;
+        var command = input is { } arguments ? Text(arguments, "command") : null;
+        return command is not null &&
+               (command.Contains("test", StringComparison.OrdinalIgnoreCase) ||
+                command.Contains("gradle", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static string? LatestStep(string? tool, JsonElement? state)
+    {
+        if (state is { } value)
+        {
+            var title = Text(value, "title");
+            if (title is not null) return Clamp(title, 220);
+            var summary = SummarizeInput(value);
+            if (summary is not null) return Clamp(tool is null ? summary : $"{tool} {summary}", 220);
+        }
+        return tool is null ? null : Clamp(tool, 220);
+    }
+
+    private static string? SummarizeInput(JsonElement state)
+    {
+        var input = Child(state, "input");
+        if (input is not { } value) return null;
+        foreach (var key in InputKeys)
+            if (Text(value, key) is { } text)
+                return text;
+        return null;
+    }
+
+    private static TokenUsage? TokenUsageFrom(JsonElement info)
+    {
+        var tokens = Child(info, "tokens");
+        if (tokens is not { } value) return null;
+        var input = Number(value, "input");
+        var output = Number(value, "output");
+        var reasoning = Number(value, "reasoning");
+        var cached = Child(value, "cache") is { } cache ? Number(cache, "read") : 0;
+        var total = Number(value, "total");
+        if (total <= 0) total = input + output + reasoning + cached;
+        if (total <= 0 && input <= 0 && output <= 0) return null;
+        return new TokenUsage(input, cached, output, reasoning, total);
+    }
+
+    private static JsonElement? SessionError(JsonElement? properties) =>
+        properties is { } value ? Child(value, "error") : null;
+
+    private static string? ErrorSummary(JsonElement? error)
+    {
+        if (error is not { } value) return null;
+        var data = Child(value, "data");
+        var message = data is { } detail ? Text(detail, "message") : null;
+        message ??= Text(value, "message");
+        return message is null ? Text(value, "name") : Clamp(message, 220);
+    }
+
+    private static JsonElement? Child(JsonElement parent, string name) =>
+        parent.ValueKind == JsonValueKind.Object &&
+        parent.TryGetProperty(name, out var value) &&
+        value.ValueKind is not (JsonValueKind.Null or JsonValueKind.Undefined)
+            ? value
+            : null;
+
+    private static string? Text(JsonElement? element, string name)
+    {
+        if (element is not { } value || value.ValueKind != JsonValueKind.Object) return null;
+        if (!value.TryGetProperty(name, out var child) || child.ValueKind != JsonValueKind.String) return null;
+        return Normalize(child.GetString());
+    }
+
+    private static int Number(JsonElement? element, string name) =>
+        element is { } value &&
+        value.ValueKind == JsonValueKind.Object &&
+        value.TryGetProperty(name, out var child) &&
+        child.ValueKind == JsonValueKind.Number
+            ? (int)Math.Max(0, Math.Round(child.GetDouble()))
+            : 0;
+
+    private static List<string> StringArray(JsonElement element, string name)
+    {
+        var result = new List<string>();
+        if (!element.TryGetProperty(name, out var value) || value.ValueKind != JsonValueKind.Array) return result;
+        foreach (var item in value.EnumerateArray())
+        {
+            var text = item.ValueKind == JsonValueKind.String
+                ? Normalize(item.GetString())
+                : item.ValueKind == JsonValueKind.Object ? Text(item, "label") : null;
+            if (text is not null) result.Add(text);
+        }
+        return result;
+    }
+
+    private static string? Normalize(string? value)
+    {
+        if (value is null) return null;
+        var result = string.Join(' ', value.Replace('\n', ' ')
+            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+        return result.Length == 0 ? null : result;
+    }
+
+    private static string Clamp(string value, int limit) => value.Length > limit ? value[..limit] : value;
 }
 
 public static class ToolStepSanitizer

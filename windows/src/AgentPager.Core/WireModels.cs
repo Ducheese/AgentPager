@@ -3,7 +3,7 @@ using System.Text.Json.Serialization;
 
 namespace AgentPager.Core;
 
-public enum AgentSource { CodexDesktop, CodexCLI, ClaudeCode }
+public enum AgentSource { CodexDesktop, CodexCLI, ClaudeCode, OpenCode }
 public enum AgentLifecycle { Offline, Idle, Starting, Running, WaitingApproval, WaitingAnswer, Succeeded, Interrupted }
 public enum AgentActivity { Thinking, Reading, Searching, Editing, Executing, Testing, Browsing, Delegating }
 public enum TaskCapability { Approve, Deny, Answer, Interrupt, Retry }
@@ -59,7 +59,9 @@ public sealed record TaskSnapshot(
     bool IsUnread,
     bool IsPinned,
     bool IsMuted,
-    HashSet<TaskCapability> Capabilities)
+    HashSet<TaskCapability> Capabilities,
+    string? ModelName = null,
+    bool PromptQueued = false)
 {
     [JsonIgnore]
     public bool IsTerminal => Lifecycle is AgentLifecycle.Succeeded or AgentLifecycle.Interrupted;
@@ -230,6 +232,7 @@ internal sealed class WireEnumConverter<T> : JsonConverter<T> where T : struct, 
         {
             if (name == nameof(AgentSource.CodexCLI)) return "codexCLI";
             if (name == nameof(AgentSource.ClaudeCode)) return "claudeCode";
+            if (name == nameof(AgentSource.OpenCode)) return "opencode";
         }
         return char.ToLowerInvariant(name[0]) + name[1..];
     }

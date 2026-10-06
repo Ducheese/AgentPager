@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO;
 using System.Windows;
+using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using AgentPager.Core;
 using QRCoder;
@@ -34,6 +35,13 @@ public partial class MainWindow : Window
         PhoneCountText.Text = state.PhoneCount.ToString();
         HookStatusText.Text = state.HookInstalled ? "已写入" : "未安装";
         ClaudeHookStatusText.Text = state.ClaudeHookInstalled ? "已写入" : "未安装";
+        OpenCodeStatusText.Text = state.OpenCodePluginText;
+        OpenCodeStatusText.Foreground = state.OpenCodePluginState switch
+        {
+            OpenCodePluginStatus.Installed => new SolidColorBrush(System.Windows.Media.Color.FromRgb(0x4A, 0xDE, 0x80)),
+            OpenCodePluginStatus.Outdated => new SolidColorBrush(System.Windows.Media.Color.FromRgb(0xFD, 0xBA, 0x4A)),
+            _ => new SolidColorBrush(System.Windows.Media.Color.FromRgb(0x7F, 0x8A, 0x9A)),
+        };
         LastHookText.Text = state.LastHookAt?.ToString("yyyy-MM-dd HH:mm:ss") ?? "尚未收到";
         PairingTextBox.Text = state.PairingText;
         PairingQrImage.Source = QrCode(state.PairingText);
@@ -59,6 +67,8 @@ public partial class MainWindow : Window
     private void UninstallHook_Click(object sender, RoutedEventArgs e) => _runtime.UninstallHook();
     private void InstallClaudeHook_Click(object sender, RoutedEventArgs e) => _runtime.InstallClaudeHook();
     private void UninstallClaudeHook_Click(object sender, RoutedEventArgs e) => _runtime.UninstallClaudeHook();
+    private void InstallOpenCode_Click(object sender, RoutedEventArgs e) => _runtime.InstallOpenCodePlugin();
+    private void UninstallOpenCode_Click(object sender, RoutedEventArgs e) => _runtime.UninstallOpenCodePlugin();
     private void RefreshNetworks_Click(object sender, RoutedEventArgs e) => _runtime.RefreshNetworks();
 
     private void NetworkCombo_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)

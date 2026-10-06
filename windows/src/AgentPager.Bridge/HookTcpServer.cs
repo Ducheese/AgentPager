@@ -84,6 +84,7 @@ public sealed class HookTcpServer(Func<HookEnvelope, Task> hookHandler, DailyFil
             {
                 HookEnvelope.Codex codex => codex.Hook.SessionID,
                 HookEnvelope.Claude claude => claude.Hook.SessionID,
+                HookEnvelope.OpenCode openCode => OpenCodeEventReducer.SessionID(openCode.Hook),
                 _ => null,
             };
             if (sessionID is null) { client.Dispose(); return; }
@@ -127,6 +128,9 @@ public sealed class HookTcpServer(Func<HookEnvelope, Task> hookHandler, DailyFil
                 : null,
             HookSource.Claude => JsonSerializer.Deserialize<ClaudeHookPayload>(payloadNode, WireJson.Options) is { } claude
                 ? new HookEnvelope.Claude(claude)
+                : null,
+            HookSource.OpenCode => JsonSerializer.Deserialize<OpenCodeHookPayload>(payloadNode, WireJson.Options) is { } openCode
+                ? new HookEnvelope.OpenCode(openCode)
                 : null,
             _ => null,
         };

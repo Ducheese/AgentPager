@@ -13,6 +13,9 @@ enum class AgentSource {
 
     @SerialName("claudeCode")
     CLAUDE_CODE,
+
+    @SerialName("opencode")
+    OPENCODE,
 }
 
 @Serializable
@@ -137,6 +140,8 @@ data class TaskSnapshot(
     val isPinned: Boolean = false,
     val isMuted: Boolean = false,
     val capabilities: Set<TaskCapability> = emptySet(),
+    val modelName: String? = null,
+    val promptQueued: Boolean = false,
 ) {
     val isTerminal: Boolean
         get() = lifecycle in setOf(

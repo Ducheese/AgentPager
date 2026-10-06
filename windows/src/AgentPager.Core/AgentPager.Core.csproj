@@ -3,4 +3,9 @@
     <AssemblyName>AgentPager.Core</AssemblyName>
     <RootNamespace>AgentPager.Core</RootNamespace>
   </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Resources\agentpager-opencode.js">
+      <LogicalName>AgentPager.Core.Resources.agentpager-opencode.js</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
 </Project>

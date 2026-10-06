@@ -299,6 +299,31 @@
                                Text="Bridge 不在线时 Hook 自动放行，不会阻塞 Claude Code。"/>
                 </StackPanel>
             </TabItem>
+
+            <TabItem Header="OPENCODE">
+                <StackPanel Margin="28">
+                    <TextBlock Text="OpenCode 状态插件" FontSize="18" FontWeight="Bold"
+                               Foreground="#4ADE80"/>
+                    <Border Margin="0,18,0,0" Padding="18" Background="#090D12"
+                            BorderBrush="{StaticResource Border}" BorderThickness="1">
+                        <StackPanel>
+                            <DockPanel>
+                                <TextBlock Text="配置状态"/>
+                                <TextBlock x:Name="OpenCodeStatusText" DockPanel.Dock="Right"
+                                           Foreground="#4ADE80" FontWeight="Bold"/>
+                            </DockPanel>
+                            <TextBlock Margin="0,18,0,0" Foreground="{StaticResource Muted}" TextWrapping="Wrap"
+                                       Text="向 opencode 配置目录的 plugins/ 写入 agentpager-opencode.js，opencode 启动时自动加载，无需信任步骤；保留并备份同名用户文件。"/>
+                            <StackPanel Orientation="Horizontal" Margin="0,18,0,0">
+                                <Button Content="安装或修复" Click="InstallOpenCode_Click"/>
+                                <Button Content="卸载" BorderBrush="#FF5D72" Click="UninstallOpenCode_Click"/>
+                            </StackPanel>
+                        </StackPanel>
+                    </Border>
+                    <TextBlock Margin="0,18,0,0" Foreground="{StaticResource Muted}" TextWrapping="Wrap"
+                               Text="Bridge 不在线时插件自动忽略，不会阻塞 opencode。手机端暂不支持批准/回答操作。"/>
+                </StackPanel>
+            </TabItem>
         </TabControl>
 
         <Border Grid.Row="4" Padding="11,8" Background="{StaticResource Surface}"

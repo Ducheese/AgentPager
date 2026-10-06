@@ -149,6 +149,8 @@ internal static class Maintenance
         catch { ok = 1; }
         try { _ = new ClaudeHookConfiguration().Uninstall(); }
         catch { ok = 1; }
+        try { _ = new OpenCodePluginConfiguration().Uninstall(); }
+        catch { ok = 1; }
         try { StartupRegistration.Disable(); }
         catch { ok = 1; }
         return ok;

@@ -634,32 +634,21 @@ private fun TaskRow(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
-                if (shouldShowTokenSummary(task)) {
+                Column(
+                    modifier = Modifier.offset(y = (-2).dp),
+                    verticalArrangement = Arrangement.spacedBy(0.dp),
+                ) {
                     Text(
-                        "TOKEN  ${tokenDetailsText(task)}",
-                        color = AgentGridColors.Cyan.copy(alpha = rowAlpha),
-                        fontSize = 10.sp,
+                        task.userPrompt?.let { if (task.promptQueued) "你（排队中）：$it" else "你：$it" } ?: "你：—",
+                        color = AgentGridColors.Muted.copy(alpha = rowAlpha),
+                        fontSize = 11.sp,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.offset(y = (-1).dp),
                     )
-                } else {
-                    Column(
-                        modifier = Modifier.offset(y = (-2).dp),
-                        verticalArrangement = Arrangement.spacedBy(0.dp),
-                    ) {
-                        Text(
-                            task.userPrompt?.let { "你：$it" } ?: "你：—",
-                            color = AgentGridColors.Muted.copy(alpha = rowAlpha),
-                            fontSize = 11.sp,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        CommandTicker(
-                            text = task.latestStep ?: statusText(task.lifecycle),
-                            color = statusColor(task).copy(alpha = rowAlpha),
-                        )
-                    }
+                    CommandTicker(
+                        text = task.latestStep ?: statusText(task.lifecycle),
+                        color = statusColor(task).copy(alpha = rowAlpha),
+                    )
                 }
             }
 
@@ -784,7 +773,7 @@ private fun TaskMeta(task: TaskSnapshot, alpha: Float) {
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             MetaTag(agentBadge(task.source), agentBadgeColor(task.source), alpha)
             MetaTag(
-                agentOriginLabel(task.source),
+                task.modelName ?: agentOriginLabel(task.source),
                 AgentGridColors.Muted,
                 alpha,
             )
@@ -1097,10 +1086,12 @@ private fun lifecycleColor(
 private fun agentBadge(source: AgentSource): String = when (source) {
     AgentSource.CODEX_DESKTOP, AgentSource.CODEX_CLI -> "Codex"
     AgentSource.CLAUDE_CODE -> "Claude"
+    AgentSource.OPENCODE -> "OpenCode"
 }
 
 private fun agentBadgeColor(source: AgentSource): Color = when (source) {
     AgentSource.CLAUDE_CODE -> AgentGridColors.Violet
+    AgentSource.OPENCODE -> AgentGridColors.Green
     else -> AgentGridColors.Blue
 }
 
@@ -1108,6 +1099,7 @@ private fun agentOriginLabel(source: AgentSource): String = when (source) {
     AgentSource.CODEX_DESKTOP -> "ChatGPT.app"
     AgentSource.CODEX_CLI -> "Terminal"
     AgentSource.CLAUDE_CODE -> "Claude Code"
+    AgentSource.OPENCODE -> "opencode"
 }
 
 private fun activityText(activity: AgentActivity?): String = when (activity) {

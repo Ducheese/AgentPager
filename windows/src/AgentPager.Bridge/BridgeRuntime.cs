@@ -9,6 +9,8 @@ public sealed record BridgeViewState(
     int PhoneCount,
     bool HookInstalled,
     bool ClaudeHookInstalled,
+    string OpenCodePluginText,
+    OpenCodePluginStatus OpenCodePluginState,
     DateTimeOffset? LastHookAt,
     string? LastError,
     string PairingText,
@@ -35,6 +37,7 @@ public sealed class BridgeRuntime : IAsyncDisposable
     private readonly CodexUsageLoader _usageLoader = new();
     private readonly CodexHookConfiguration _hookConfiguration = new();
     private readonly ClaudeHookConfiguration _claudeHookConfiguration = new();
+    private readonly OpenCodePluginConfiguration _openCodePluginConfiguration = new();
     private readonly ReplayGuard _replayGuard = new();
     private readonly byte[] _pairingSecret;
     private readonly TaskCatalog _catalog;
@@ -164,6 +167,39 @@ public sealed class BridgeRuntime : IAsyncDisposable
         PublishState();
     }
 
+    public void InstallOpenCodePlugin()
+    {
+        try
+        {
+            var result = _openCodePluginConfiguration.Install();
+            var version = OpenCodePluginConfiguration.EmbeddedVersion;
+            _log.Write("INFO", result.Changed ? $"OpenCode 插件已安装（v{version}）。" : $"OpenCode 插件已是最新状态（v{version}）。");
+            _lastError = null;
+        }
+        catch (Exception error)
+        {
+            _lastError = $"安装 OpenCode 插件失败：{error.Message}";
+            _log.Write("ERROR", _lastError);
+        }
+        PublishState();
+    }
+
+    public void UninstallOpenCodePlugin()
+    {
+        try
+        {
+            _ = _openCodePluginConfiguration.Uninstall();
+            _lastError = null;
+            _log.Write("INFO", "OpenCode 插件已移除。");
+        }
+        catch (Exception error)
+        {
+            _lastError = $"卸载 OpenCode 插件失败：{error.Message}";
+            _log.Write("ERROR", _lastError);
+        }
+        PublishState();
+    }
+
     public void SelectAddress(string address)
     {
         if (_networks.All(value => value.Address != address)) return;
@@ -205,6 +241,7 @@ public sealed class BridgeRuntime : IAsyncDisposable
                         {
                             HookEnvelope.Codex codex => HandleCodexHook(codex.Hook),
                             HookEnvelope.Claude claude => _catalog.Accept(claude.Hook),
+                            HookEnvelope.OpenCode openCode => _catalog.Accept(openCode.Hook),
                             _ => false,
                         };
                         break;
@@ -342,17 +379,33 @@ public sealed class BridgeRuntime : IAsyncDisposable
         return JsonSerializer.Serialize(MessageEnvelope<StateSnapshotPayload>.Create("state.snapshot", payload), WireJson.Options);
     }
 
-    private BridgeViewState CreateState() => new(
-        _serviceStatus,
-        _phoneCount,
-        _hookConfiguration.IsInstalled(),
-        _claudeHookConfiguration.IsInstalled(),
-        _lastHookAt,
-        _lastError,
-        PairingText(),
-        _selectedAddress,
-        _networks,
-        _catalog.Projection().Tasks.Count);
+    private BridgeViewState CreateState()
+    {
+        var pluginStatus = _openCodePluginConfiguration.Status;
+        var pluginVersion = OpenCodePluginConfiguration.EmbeddedVersion;
+        var installedVersion = _openCodePluginConfiguration.InstalledVersion;
+        var pluginText = pluginStatus switch
+        {
+            OpenCodePluginStatus.NotInstalled => "未安装",
+            OpenCodePluginStatus.Outdated => installedVersion is int installed
+                ? $"待更新 v{installed} → v{pluginVersion}"
+                : $"待更新 → v{pluginVersion}",
+            _ => $"已写入 v{pluginVersion}",
+        };
+        return new(
+            _serviceStatus,
+            _phoneCount,
+            _hookConfiguration.IsInstalled(),
+            _claudeHookConfiguration.IsInstalled(),
+            pluginText,
+            pluginStatus,
+            _lastHookAt,
+            _lastError,
+            PairingText(),
+            _selectedAddress,
+            _networks,
+            _catalog.Projection().Tasks.Count);
+    }
 
     private void PublishState()
     {
