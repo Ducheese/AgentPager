@@ -18,7 +18,7 @@
   - `prompt.active`：排队的 prompt 被接单（新的 assistant 消息开始生成）时发送，用于清除排队标记；
   - `reply`：assistant 正文预览——插件监听 text part 的 `message.part.delta`/结束帧，节流转发（首包 + 结束帧 + 间隔 ≥300ms 的增量），单行截断 ≤120 字；
   - `plugin.dispose`：opencode 退出/插件卸载时按会话发送。
-- 子会话（`info.parentID` 非空，即 task 工具派发的内部子会话）由插件整体丢弃，不建任务、不上报。
+- 子会话（`info.parentID` 非空，即 task 工具派发的内部子会话）不建独立任务；其事件由插件转换成 `subagent` 事件映射进父任务的 Subagents（见第二节末「子代理映射」）。
 
 ## 二、生命周期（Lifecycle）映射总表
 
@@ -38,7 +38,7 @@
 | 12 | `permission.asked` | 等待权限批准 | `waitingApproval` | `executing` | PendingRequest(approval, `permission · patterns`)、Capabilities=∅ | 置顶+提示音；本基线不支持手机批准 |
 | 13 | `permission.replied` reply=`once`/`always` | 权限已放行 | `running` | `thinking` | 移除挂起请求 | 工具继续执行 |
 | 14 | `permission.replied` reply=`reject` | 权限被拒 | `interrupted` | 清空 | CompletedAt=now、IsUnread=true、移除请求 | 与 Claude PermissionDenied 语义对齐 |
-| 15 | `question.asked` | 等待用户回答 | `waitingAnswer` | `thinking` | PendingRequest(question, `header/question`, options=选项 label)、Capabilities=∅ | 只在 TUI 可作答 |
+| 15 | `question.asked` | 等待用户回答 | `waitingAnswer` | `thinking` | PendingRequest(question, 卡片摘要=问题全文 `question ?? header`)、第三行=header ?? question、options=各问题选项 label（协议携带，app 暂不渲染）、Capabilities=∅ | 只在 TUI 可作答；手机为只读展示 |
 | 16 | `question.replied` | 已回答 | `running` | `thinking` | 移除挂起请求 | — |
 | 21 | `reply`（合成，assistant 正文流） | 模型写回复 | 不变 | 不变 | LatestStep=正文预览（≤120 字单行截断；回显整段 prompt 时被守卫丢弃） | 插件节流：首包 + 结束帧 + ≥300ms 增量；不做生命周期迁移 |
 | 22 | `prompt.active`（合成） | 排队的 prompt 被接单（新 assistant 消息开始生成） | 不变 | 不变 | PromptQueued=false | 排队窗口结束 |
@@ -48,6 +48,24 @@
 | 20 | `plugin.dispose`（合成） | opencode 退出 | 终态保持；否则 `offline` | 清空 | — | 每个已知会话发一条；强杀不触发 |
 
 不在上表的事件一律忽略（`todo.updated`、`session.compacted`、`file.edited`、`tui.*`、`installation.*`、`lsp.*`、`server.connected` 等）。
+
+> **通用竞态守卫**：`WaitingApproval` / `WaitingAnswer` 期间，工具 part 更新一律忽略（实测 opencode 会在 `question.asked` / `permission.asked` 之后补发该工具 part 的 running/标题更新，不拦会把等待状态压回 running 并清掉挂起卡片）。
+
+### 子代理映射（child session → SubagentSnapshot）
+
+子会话（task 工具派生）不建独立任务；插件把它的关键事件转换成合成的 `subagent` 事件（`phase` 字段区分），父任务的 Subagents 行随之更新：
+
+| 子会话事件 | subagent phase | 效果 |
+|---|---|---|
+| `session.created`（带 parentID） | `started` | 新建 SubagentSnapshot：名字与路径取自标题里的 `(@agent subagent)`，状态 Running / activity delegating |
+| 工具 part（pending/running/completed/error） | `tool` | activity=工具活动映射，LatestStep=工具步骤（标题优先；回显整段用户 prompt 时丢弃；与主任务同款 part 去重） |
+| assistant `message.updated` 完成 | `tokens` | TokenUsage 跟随该子会话最新一条完成消息 |
+| `session.idle` / `session.status idle` | `done` | Succeeded（终态的 subagent 行约 4 秒后从列表淡出） |
+| `session.error` | `failed` | Interrupted + `✗ 错误摘要` |
+
+- 父任务在任一子代理未终态时显示 activity=`delegating`（「正在协作」），app 会自动展开该行并显示子代理面板（标题按来源显示，如 `OPENCODE (1)`）。
+- 孙会话（父不是已存在任务的会话 id）丢弃，不建幽灵任务；子代理终态后迟到的 tool 事件不复活。
+- 子会话的 chat.message / 正文预览 / 权限请求不上报（其提示词与正文不进入手机）。
 
 ## 三、工具 → Activity 映射
 
@@ -80,7 +98,7 @@
 | `UserPrompt` | `chat.message` 文本部分（过滤 `synthetic`）拼接，截 1000 字 |
 | `LatestStep` | 第三行=二态：**工具**=tool `state.title` 或 `工具名 <输入摘要>`（运行中与完成时都显示，粘滞到下一条正文/工具；白名单键 command/description/filePath/path/pattern/query/url/subagent_type/agent/skill，不含 prompt）；**回复**=正文预览（≤120 字单行截断，回合结束保留）。无“思考”占位（`busy` 等不写第三行，避免盖掉正文预览）。截 220 字。**守卫：候选与当前 UserPrompt 相同或整段包含它（≥4 字）时丢弃、保留上一值——第三行永不重复用户 prompt** |
 | `TokenUsage` | assistant `tokens`：`input`→Input、`cache.read`→CachedInput、`output`→Output、`reasoning`→ReasoningOutput、`total`→Total（缺省时求和）。每条完成的助手消息直接覆盖为最新值（不取最大值）——永远跟随最新消息，上下文压缩后如实回落 |
-| `Subagents` | 基线恒空（子会话丢弃） |
+| `Subagents` | opencode 子会话映射（见第二节末「子代理映射」）：名字=子会话标题里的 `(@agent subagent)` 解析、状态=子会话生命周期、步骤=子会话工具 part、token=子会话 assistant 用量 |
 | `StartedAt` | 本轮计时起点：一轮的第一个 prompt 到达时置为接收时间；轮内插入 prompt 不重置；`idle`/`error`/拒绝后由 CompletedAt 冻结为本轮耗时；下一轮 prompt 重新从 0 开始。首轮之前由 `session.created` 的 `info.time.created`（毫秒）初始化 |
 | `CompletedAt` | `idle`/`error`/拒绝时的接收时间 |
 | `IsUnread` | 成功/失败/拒绝置 true |
@@ -92,6 +110,7 @@
 ## 五、手机控制（本基线不含）
 
 - `permission.asked` / `question.asked` 照常显示（置顶、提示音、展示摘要与选项），但不提供批准/回答按钮。
+- 问题卡片为只读展示：`QUESTION <问题全文>`（选项随协议携带但暂不渲染——无现成排版参照）；批准确认卡片同理只读。
 - 后续扩展路径（已预留通道约束，不在本次实现）：插件对权限事件改为阻塞等待 Bridge 回包，桥端回传 allow/deny，插件调用 opencode SDK `permission.reply`；`question` 同理。届时再把 Capabilities 打开。
 
 ## 六、已知限制
@@ -112,5 +131,5 @@
 6. `Esc` 中断 → 「已中断」。
 7. 触发权限询问（如 write/bash 需要批准）→ 「等待批准」置顶，展示 `permission · pattern`；在 TUI 里放行后回到运行。
 8. 关闭 opencode → 任务变「离线」。
-9. 子代理（task 工具）→ 父任务显示「正在协作」，不出现子任务行。
+9. 子代理（task 工具）→ 父任务显示「正在协作」，展开区出现子代理行（名字/状态/耗时/最新步骤/token），完成后约 4 秒淡出。
 10. 任务运行中再发一条 prompt → 第二行显示「你（排队中）：…」；该条被接单（新的 assistant 消息开始生成）后标记消失。

@@ -294,15 +294,6 @@ private fun TaskTerminal(
         onDispose(sound::close)
     }
 
-    LaunchedEffect(
-        automaticallyExpandedTask?.id,
-        automaticallyExpandedTask?.lifecycle,
-        automaticallyExpandedTask?.subagents?.map { it.id to it.lifecycle },
-    ) {
-        if (automaticallyExpandedTask != null) {
-            expandedTaskID = automaticallyExpandedTask.id
-        }
-    }
     LaunchedEffect(tasks.map { Triple(it.id, it.lifecycle, it.isMuted) }) {
         soundTracker.nextCue(tasks, soundEnabled)?.let(sound::play)
     }
@@ -406,6 +397,7 @@ private fun TaskTerminal(
                             task = task,
                             pending = pending,
                             expanded = expandedTaskID == task.id,
+                            autoVisible = task.id == projection.automaticallyExpandedTaskID,
                             dimmed = projection.urgentTaskID != null &&
                                 projection.urgentTaskID != task.id,
                             showDivider = index < visibleTasks.lastIndex,
@@ -579,6 +571,7 @@ private fun TaskRow(
     task: TaskSnapshot,
     pending: PendingRequest?,
     expanded: Boolean,
+    autoVisible: Boolean,
     dimmed: Boolean,
     showDivider: Boolean,
     onClick: () -> Unit,
@@ -592,7 +585,7 @@ private fun TaskRow(
     Column(
         modifier = modifier
             .fillMaxWidth()
-            .background(if (expanded) AgentGridColors.Surface else Color.Transparent)
+            .background(if (expanded || autoVisible) AgentGridColors.Surface else Color.Transparent)
             .clickable(onClick = onClick)
             .padding(horizontal = 4.dp),
     ) {
@@ -656,7 +649,7 @@ private fun TaskRow(
         }
 
         AnimatedVisibility(
-            visible = expanded,
+            visible = expanded || autoVisible,
             enter = expandVertically(
                 animationSpec = tween(
                     durationMillis = 280,
@@ -681,6 +674,7 @@ private fun TaskRow(
             TaskDetails(
                 task = task,
                 pending = pending,
+                showToken = expanded,
                 onControl = onControl,
             )
         }
@@ -817,6 +811,7 @@ private fun MetaTag(text: String, color: Color, alpha: Float) {
 private fun TaskDetails(
     task: TaskSnapshot,
     pending: PendingRequest?,
+    showToken: Boolean,
     onControl: (String, ControlAction, String?) -> Unit,
 ) {
     var answer by remember(task.id) { mutableStateOf("") }
@@ -829,14 +824,16 @@ private fun TaskDetails(
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         if (task.subagents.isNotEmpty()) {
-            SubagentPanel(task.subagents)
+            SubagentPanel(task.subagents, agentBadge(task.source).uppercase())
         }
-        task.tokenUsage?.let {
-            DetailLine(
-                "TOKEN",
-                tokenDetailsText(task),
-                AgentGridColors.Cyan,
-            )
+        if (showToken) {
+            task.tokenUsage?.let {
+                DetailLine(
+                    "TOKEN",
+                    tokenDetailsText(task),
+                    AgentGridColors.Cyan,
+                )
+            }
         }
         AnimatedContent(
             targetState = pending,
@@ -911,7 +908,7 @@ private fun TaskDetails(
 }
 
 @Composable
-private fun SubagentPanel(subagents: List<SubagentSnapshot>) {
+private fun SubagentPanel(subagents: List<SubagentSnapshot>, label: String) {
     val now by produceState(
         initialValue = System.currentTimeMillis(),
         key1 = subagents.map { it.id to it.lifecycle },
@@ -930,7 +927,7 @@ private fun SubagentPanel(subagents: List<SubagentSnapshot>) {
         verticalArrangement = Arrangement.spacedBy(9.dp),
     ) {
         Text(
-            "CODEX (${subagents.size})",
+            "$label (${subagents.size})",
             color = AgentGridColors.Muted,
             fontSize = 10.sp,
             fontWeight = FontWeight.Bold,

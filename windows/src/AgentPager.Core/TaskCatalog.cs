@@ -117,7 +117,7 @@ public sealed class TaskCatalog
         var sessionID = OpenCodeEventReducer.SessionID(hook);
         if (sessionID is null) return false;
         var existing = _tasks.FirstOrDefault(task => task.Id == sessionID);
-        if (existing is null && hook.Event is "plugin.dispose" or "session.deleted") return false;
+        if (existing is null && hook.Event is "plugin.dispose" or "session.deleted" or "subagent") return false;
         Upsert(OpenCodeEventReducer.Reduce(hook, existing, now));
         switch (hook.Event)
         {
@@ -132,7 +132,7 @@ public sealed class TaskCatalog
                 _requests[sessionID] = new(
                     sessionID,
                     PendingRequestKind.Question,
-                    OpenCodeEventReducer.QuestionSummary(hook.Properties),
+                    OpenCodeEventReducer.QuestionText(hook.Properties),
                     OpenCodeEventReducer.QuestionOptions(hook.Properties));
                 break;
             case "permission.replied":
@@ -355,7 +355,7 @@ public sealed class TaskCatalog
     {
         _tasks.RemoveAll(task =>
             task.Id.StartsWith("agentgrid-", StringComparison.Ordinal) && now - task.UpdatedAt >= TimeSpan.FromMinutes(1) ||
-            task.IsTerminal && task.CompletedAt is not null && now - task.CompletedAt > TimeSpan.FromHours(1));
+            task.IsTerminal && task.CompletedAt is not null && now - task.CompletedAt > TimeSpan.FromMinutes(30));
         for (var index = 0; index < _tasks.Count; index++)
             _tasks[index] = _tasks[index] with
             {
@@ -783,6 +783,8 @@ public static class OpenCodeEventReducer
             case "prompt.active":
                 // 排队的 prompt 被接单（新的 assistant 消息开始生成）
                 return task.PromptQueued ? task with { PromptQueued = false } : task;
+            case "subagent":
+                return ApplyOpenCodeSubagent(task, hook.Properties, now);
             case "session.status":
                 return StatusEvent(task, hook.Properties, now);
             case "session.idle":
@@ -794,7 +796,9 @@ public static class OpenCodeEventReducer
             case "message.part.updated":
                 return PartUpdated(task, hook.Properties);
             case "reply":
-                // 正文预览（插件从 assistant text part 节流转发）：只更新第三行，不动生命周期。
+                // 正文预览（插件从 assistant text part 节流转发）：只更新第三行，不动生命周期；
+                // 等待用户输入期间忽略（迟到正文不盖掉问题/批准卡片的标题）。
+                if (task.Lifecycle is AgentLifecycle.WaitingApproval or AgentLifecycle.WaitingAnswer) return task;
                 return Text(hook.Properties, "text") is { } preview ? WithStep(task, Clamp(preview, 220)) : task;
             case "permission.asked":
                 return task with
@@ -862,6 +866,20 @@ public static class OpenCodeEventReducer
         {
             var summary = Text(item, "header") ?? Text(item, "question");
             if (summary is not null) return Clamp(summary, 220);
+        }
+        return null;
+    }
+
+    /// <summary>卡片摘要用：优先问题全文，其次 header。</summary>
+    public static string? QuestionText(JsonElement? properties)
+    {
+        if (properties is not { } value) return null;
+        if (!value.TryGetProperty("questions", out var questions) || questions.ValueKind != JsonValueKind.Array)
+            return null;
+        foreach (var item in questions.EnumerateArray())
+        {
+            var text = Text(item, "question") ?? Text(item, "header");
+            if (text is not null) return Clamp(text, 220);
         }
         return null;
     }
@@ -970,11 +988,16 @@ public static class OpenCodeEventReducer
         var tool = Text(item, "tool");
         var step = LatestStep(tool, state);
 
+        // 等待用户输入（批准/回答）期间忽略工具 part 更新：opencode 存在
+        // question.asked / permission.asked 之后工具 part 才补发 running/标题的竞态，
+        // 不拦会把 waiting 状态压回 running 并清掉挂起请求。
+        if (task.Lifecycle is AgentLifecycle.Interrupted or AgentLifecycle.WaitingApproval or AgentLifecycle.WaitingAnswer)
+            return task;
+
         switch (status)
         {
             case "pending":
             case "running":
-                if (task.Lifecycle == AgentLifecycle.Interrupted) return task;
                 return WithStep(task with
                 {
                     Lifecycle = AgentLifecycle.Running,
@@ -983,7 +1006,6 @@ public static class OpenCodeEventReducer
                     Capabilities = [],
                 }, step);
             case "completed":
-                if (task.Lifecycle == AgentLifecycle.Interrupted) return task;
                 return WithStep(task with
                 {
                     Lifecycle = AgentLifecycle.Running,
@@ -992,7 +1014,6 @@ public static class OpenCodeEventReducer
                     Capabilities = [],
                 }, step);
             case "error":
-                if (task.Lifecycle == AgentLifecycle.Interrupted) return task;
                 var failure = state is { } failed ? Text(failed, "error") : null;
                 return WithStep(task with
                 {
@@ -1012,11 +1033,80 @@ public static class OpenCodeEventReducer
     /// </summary>
     private static TaskSnapshot WithStep(TaskSnapshot task, string? step)
     {
-        if (step is null) return task;
-        if (task.UserPrompt is { Length: >= 4 } prompt &&
-            step.Contains(prompt, StringComparison.OrdinalIgnoreCase))
-            return task;
+        if (step is null || EchoesPrompt(task, step)) return task;
         return task with { LatestStep = step };
+    }
+
+    /// <summary>候选文本与当前 UserPrompt 相同或整段包含它（prompt ≥4 字）→ 视为回显。</summary>
+    private static bool EchoesPrompt(TaskSnapshot task, string candidate) =>
+        task.UserPrompt is { Length: >= 4 } prompt && candidate.Contains(prompt, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>opencode 子会话（task 工具派生）映射为父任务的 Subagents 行。</summary>
+    private static TaskSnapshot ApplyOpenCodeSubagent(TaskSnapshot task, JsonElement? properties, DateTimeOffset now)
+    {
+        if (properties is not { } value) return task;
+        var id = Text(value, "id");
+        var phase = Text(value, "phase");
+        if (id is null || phase is null) return task;
+        var existing = task.Subagents.FirstOrDefault(item => item.Id == id);
+        if (existing?.IsTerminal == true && phase != "tokens") return task;
+        var agent = Text(value, "agent");
+        var path = existing?.Path ?? (agent is null ? "/subagent" : "/" + agent);
+        var subagent = existing ?? new SubagentSnapshot(
+            id, path, SubagentName(agent, Text(value, "title")),
+            AgentLifecycle.Running, AgentActivity.Delegating, null, null, now, now);
+        subagent = subagent with { UpdatedAt = now };
+
+        switch (phase)
+        {
+            case "started":
+                subagent = subagent with { Lifecycle = AgentLifecycle.Running };
+                break;
+            case "tool":
+                var step = Text(value, "step");
+                if (step is not null && !EchoesPrompt(task, step)) subagent = subagent with { LatestStep = Clamp(step, 220) };
+                subagent = subagent with { Lifecycle = AgentLifecycle.Running, Activity = ActivityFor(Text(value, "tool"), null) };
+                break;
+            case "tokens":
+                if (TokenUsageFrom(value) is { } usage) subagent = subagent with { TokenUsage = usage };
+                break;
+            case "done":
+                subagent = subagent with { Lifecycle = AgentLifecycle.Succeeded, Activity = null };
+                break;
+            case "failed":
+                var failure = Text(value, "step");
+                subagent = subagent with
+                {
+                    Lifecycle = AgentLifecycle.Interrupted,
+                    Activity = null,
+                    LatestStep = failure is null ? subagent.LatestStep : Clamp($"✗ {failure}", 220),
+                };
+                break;
+            default:
+                return task;
+        }
+
+        var subagents = task.Subagents.Where(item => item.Id != id).Append(subagent)
+            .OrderBy(item => item.IsTerminal).ThenBy(item => item.StartedAt).ToList();
+        return task with
+        {
+            Subagents = subagents,
+            UpdatedAt = now,
+            Activity = task.Lifecycle == AgentLifecycle.Running
+                ? subagents.Any(item => !item.IsTerminal) ? AgentActivity.Delegating : AgentActivity.Thinking
+                : task.Activity,
+        };
+    }
+
+    private static string SubagentName(string? agent, string? title)
+    {
+        if (agent is not null) return char.ToUpperInvariant(agent[0]) + agent[1..];
+        if (title is not null)
+        {
+            var index = title.IndexOf(" (@", StringComparison.Ordinal);
+            return Clamp(index > 0 ? title[..index] : title, 40);
+        }
+        return "opencode 子代理";
     }
 
     private static TaskSnapshot PermissionReply(TaskSnapshot task, JsonElement? properties, DateTimeOffset now)

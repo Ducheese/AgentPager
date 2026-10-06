@@ -45,6 +45,7 @@
 - **模型标签**：行内灰色标签 = 模型名（取最后一个 `/` 段：`ccproxy/deepseek-flash` → `deepseek-flash`），缺失时回落来源标签；彩色徽标（Codex/Claude/OpenCode）不动。
 - **插件版本化**：首行 `// agentpager-opencode vN`；bridge 三态识别：未安装 / 已写入 vN（内容与内置逐字一致）/ 待更新 vX → vN。
 - **UI 形态**：无"切换式"——完成后不再用 TOKEN 行替换第二/三行；第二行恒为「你：prompt」。
+- **App 展示分层**：自动层（问题/批准卡片 + 子代理面板：出现即显示、结束即自动收起）与手动层（TOKEN 明细：仅点击展开）相互独立——TOKEN 永不被自动内容带出，紧急态不占用行展开位。
 
 ## 四、证物与工具（复用处）
 
@@ -67,6 +68,7 @@
 4. **中文数据不要用 PowerShell 直接看**：控制台编码（GBK/UTF-8）会把内容显示成乱码导致误判（曾把 title 看错）。查中文一律用 node + UTF-8。
 5. **Windows 上运行中的 exe 不可覆盖**：所以 bridge 每次构建到新的 `vN` 文件夹，交付时明确说"启动哪个新路径"。
 6. **"你别改"教训**：用户问"对不对 / 为什么"时只是信息交流，代码一个字都不要动；拿不准就先问，宁可慢半拍。
+7. **2026-10-06 等待态被工具 part 压回（实测竞态）**：`question.asked` 正确推送 waitingAnswer + 卡片后，8ms 内又被该工具补发的 part running 更新压回 running（并把挂起请求清掉）。修复：WaitingApproval / WaitingAnswer 期间忽略工具 part 更新（bridge v11）。诊断手法：WS 行车记录仪（watch-git.mjs）+ DB part 序列双证。
 
 ## 六、一句话的验收模板（交付时照抄）
 
