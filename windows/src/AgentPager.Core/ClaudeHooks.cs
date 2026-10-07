@@ -61,7 +61,7 @@ public static class ClaudeHookOutput
     }
 }
 
-public enum HookSource { Codex, Claude, OpenCode }
+public enum HookSource { Codex, Claude, OpenCode, Antigravity }
 
 /// <summary>桥接服务器收到并已分类的 Hook 事件。</summary>
 public abstract record HookEnvelope
@@ -69,6 +69,7 @@ public abstract record HookEnvelope
     public sealed record Codex(CodexHookPayload Hook) : HookEnvelope;
     public sealed record Claude(ClaudeHookPayload Hook) : HookEnvelope;
     public sealed record OpenCode(OpenCodeHookPayload Hook) : HookEnvelope;
+    public sealed record Antigravity(AgyHookPayload Hook) : HookEnvelope;
 }
 
 /// <summary>

@@ -85,6 +85,7 @@ public sealed class HookTcpServer(Func<HookEnvelope, Task> hookHandler, DailyFil
                 HookEnvelope.Codex codex => codex.Hook.SessionID,
                 HookEnvelope.Claude claude => claude.Hook.SessionID,
                 HookEnvelope.OpenCode openCode => OpenCodeEventReducer.SessionID(openCode.Hook),
+                HookEnvelope.Antigravity agy => agy.Hook.SessionID,
                 _ => null,
             };
             if (sessionID is null) { client.Dispose(); return; }
@@ -131,6 +132,9 @@ public sealed class HookTcpServer(Func<HookEnvelope, Task> hookHandler, DailyFil
                 : null,
             HookSource.OpenCode => JsonSerializer.Deserialize<OpenCodeHookPayload>(payloadNode, WireJson.Options) is { } openCode
                 ? new HookEnvelope.OpenCode(openCode)
+                : null,
+            HookSource.Antigravity => JsonSerializer.Deserialize<AgyHookPayload>(payloadNode, WireJson.Options) is { } agy
+                ? new HookEnvelope.Antigravity(agy)
                 : null,
             _ => null,
         };

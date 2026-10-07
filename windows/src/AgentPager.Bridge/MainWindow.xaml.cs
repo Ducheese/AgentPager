@@ -42,6 +42,13 @@ public partial class MainWindow : Window
             OpenCodePluginStatus.Outdated => new SolidColorBrush(System.Windows.Media.Color.FromRgb(0xFD, 0xBA, 0x4A)),
             _ => new SolidColorBrush(System.Windows.Media.Color.FromRgb(0x7F, 0x8A, 0x9A)),
         };
+        AgyStatusText.Text = state.AgyHookText;
+        AgyStatusText.Foreground = state.AgyHookState switch
+        {
+            AntigravityPluginStatus.Installed => new SolidColorBrush(System.Windows.Media.Color.FromRgb(0x38, 0xBD, 0xF8)),
+            AntigravityPluginStatus.Outdated => new SolidColorBrush(System.Windows.Media.Color.FromRgb(0xFD, 0xBA, 0x4A)),
+            _ => new SolidColorBrush(System.Windows.Media.Color.FromRgb(0x7F, 0x8A, 0x9A)),
+        };
         LastHookText.Text = state.LastHookAt?.ToString("yyyy-MM-dd HH:mm:ss") ?? "尚未收到";
         PairingTextBox.Text = state.PairingText;
         PairingQrImage.Source = QrCode(state.PairingText);
@@ -69,6 +76,8 @@ public partial class MainWindow : Window
     private void UninstallClaudeHook_Click(object sender, RoutedEventArgs e) => _runtime.UninstallClaudeHook();
     private void InstallOpenCode_Click(object sender, RoutedEventArgs e) => _runtime.InstallOpenCodePlugin();
     private void UninstallOpenCode_Click(object sender, RoutedEventArgs e) => _runtime.UninstallOpenCodePlugin();
+    private void InstallAgy_Click(object sender, RoutedEventArgs e) => _runtime.InstallAgyHook();
+    private void UninstallAgy_Click(object sender, RoutedEventArgs e) => _runtime.UninstallAgyHook();
     private void RefreshNetworks_Click(object sender, RoutedEventArgs e) => _runtime.RefreshNetworks();
 
     private void NetworkCombo_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e)

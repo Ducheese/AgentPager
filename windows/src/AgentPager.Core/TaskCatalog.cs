@@ -152,6 +152,156 @@ public sealed class TaskCatalog
         return true;
     }
 
+    public bool Accept(AgyHookPayload hook, DateTimeOffset? receivedAt = null)
+    {
+        var now = receivedAt ?? DateTimeOffset.UtcNow;
+        var sessionID = hook.SessionID;
+        if (string.IsNullOrWhiteSpace(sessionID)) return false;
+
+        // 1. 查询会话元数据（SQLite）：会话真实标题与父会话 ID
+        var dbInfo = AgyConversationDatabase.Query(sessionID);
+        var parentSessionID = !string.IsNullOrWhiteSpace(dbInfo?.ParentConversationId) ? dbInfo.ParentConversationId : null;
+
+        // 2. 如果是子代理会话，更新父任务的 Subagents 列表，绝不建立幽灵顶层任务
+        if (parentSessionID is not null)
+        {
+            // 物理剔除顶层幽灵任务（若此前首包由于 SQLite 时差被误建为顶层任务）
+            _tasks.RemoveAll(task => task.Id == sessionID);
+
+            var parentTask = _tasks.FirstOrDefault(task => task.Id == parentSessionID);
+            if (parentTask is not null)
+            {
+                var updatedParent = ApplyAgySubagent(parentTask, hook, dbInfo, now);
+                Upsert(updatedParent);
+                Changed();
+                return true;
+            }
+            return true;
+        }
+
+        // 3. 顶层主任务状态流转
+        var existing = _tasks.FirstOrDefault(task => task.Id == sessionID);
+        var updated = AgyEventReducer.Reduce(hook, existing, dbInfo, now);
+        Upsert(updated);
+
+        // 4. 用户交互问题（ask_question）挂起与移除逻辑
+        if (hook.EffectiveEvent == "PreToolUse" &&
+            hook.ToolCall?.Name?.Equals("ask_question", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            var questionText = AgyEventReducer.QuestionText(hook.ToolCall?.Args) ?? "等待输入与选择";
+            var questionOptions = AgyEventReducer.QuestionOptions(hook.ToolCall?.Args);
+            _requests[sessionID] = new(
+                sessionID,
+                PendingRequestKind.Question,
+                questionText,
+                questionOptions);
+        }
+        else if (hook.EffectiveEvent == "PostToolUse" &&
+                 hook.ToolCall?.Name?.Equals("ask_question", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            // 问题作答完毕，移除挂起请求
+            _requests.Remove(sessionID);
+        }
+        else if (hook.EffectiveEvent is "Stop")
+        {
+            _requests.Remove(sessionID);
+        }
+        else
+        {
+            if (updated.Lifecycle is not (AgentLifecycle.Starting or AgentLifecycle.WaitingApproval or AgentLifecycle.WaitingAnswer))
+                _requests.Remove(sessionID);
+        }
+
+        Changed();
+        return true;
+    }
+
+    private static TaskSnapshot ApplyAgySubagent(TaskSnapshot parent, AgyHookPayload hook, AgyConversationSummary? dbInfo, DateTimeOffset now)
+    {
+        var id = hook.SessionID;
+        var existing = parent.Subagents.FirstOrDefault(item => item.Id == id);
+        if (existing?.IsTerminal == true && hook.EffectiveEvent != "PostInvocation") return parent;
+
+        var agentName = dbInfo?.AgentName ?? "research";
+        var displayName = SubagentDisplayName(agentName, dbInfo?.Title);
+        var path = existing?.Path ?? ("/" + agentName);
+
+        var subagent = existing ?? new SubagentSnapshot(
+            id, path, displayName,
+            AgentLifecycle.Running, AgentActivity.Thinking,
+            null, null, now, now);
+        subagent = subagent with { UpdatedAt = now };
+
+        switch (hook.EffectiveEvent)
+        {
+            case "PreInvocation":
+                subagent = subagent with { Lifecycle = AgentLifecycle.Running, Activity = AgentActivity.Thinking };
+                break;
+            case "PreToolUse":
+            {
+                var tool = hook.ToolCall?.Name;
+                var activity = AgyEventReducer.ActivityFor(tool ?? "", hook.ToolCall?.Args);
+                var step = AgyEventReducer.FormatToolStep(tool, hook.ToolCall?.Args, hook.Cwd);
+                subagent = subagent with
+                {
+                    Lifecycle = AgentLifecycle.Running,
+                    Activity = activity,
+                    LatestStep = step is not null ? ClampText(step, 220) : subagent.LatestStep,
+                };
+                break;
+            }
+            case "PostToolUse":
+                subagent = subagent with
+                {
+                    Lifecycle = AgentLifecycle.Running,
+                    Activity = AgentActivity.Thinking,
+                };
+                break;
+            case "Stop":
+            {
+                var isError = hook.TerminationReason == "error" || !string.IsNullOrWhiteSpace(hook.Error);
+                subagent = subagent with
+                {
+                    Lifecycle = isError ? AgentLifecycle.Interrupted : AgentLifecycle.Succeeded,
+                    Activity = null,
+                    LatestStep = isError ? ClampText($"✗ {hook.Error ?? "子代理异常终止"}", 220) : subagent.LatestStep,
+                };
+                break;
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(hook.TranscriptPath))
+        {
+            var (_, _, tokens) = AgyTranscriptReader.ExtractLatest(hook.TranscriptPath);
+            if (tokens is not null) subagent = subagent with { TokenUsage = tokens };
+        }
+
+        // 关键：剔除同一子代理的临时占位符（如 research-123456），确保真实 UUID 子代理唯一
+        var subagents = parent.Subagents
+            .Where(item => item.Id != id && !item.Id.StartsWith($"{agentName}-", StringComparison.OrdinalIgnoreCase))
+            .Append(subagent)
+            .OrderBy(item => item.IsTerminal).ThenBy(item => item.StartedAt).ToList();
+
+        return parent with
+        {
+            Subagents = subagents,
+            UpdatedAt = now,
+            Activity = parent.Lifecycle == AgentLifecycle.Running
+                ? subagents.Any(item => !item.IsTerminal)
+                    ? AgentActivity.Delegating
+                    : (parent.Activity == AgentActivity.Delegating ? AgentActivity.Thinking : parent.Activity)
+                : parent.Activity,
+        };
+    }
+
+    private static string SubagentDisplayName(string agentName, string? title)
+    {
+        if (!string.IsNullOrWhiteSpace(title)) return ClampText(title, 40);
+        return agentName.Length > 0 ? char.ToUpperInvariant(agentName[0]) + agentName[1..] : "Subagent";
+    }
+
+    private static string ClampText(string value, int limit) => value.Length > limit ? value[..limit] : value;
+
     public bool Accept(IEnumerable<CodexRolloutSignal> values)
     {
         var changed = false;
@@ -164,13 +314,149 @@ public sealed class TaskCatalog
         return changed;
     }
 
+    private DateTimeOffset? _lastAgyDbModified;
+
     public bool Maintain(DateTimeOffset? now = null)
     {
+        var currentTime = now ?? DateTimeOffset.UtcNow;
+        var changed = CheckAgyQueuedPrompts(currentTime);
+        changed = MaintainAgyDatabase(currentTime) || changed;
         var before = _tasks.Count + _tasks.Sum(task => task.Subagents.Count);
-        Normalize(now ?? DateTimeOffset.UtcNow);
-        if (before == _tasks.Count + _tasks.Sum(task => task.Subagents.Count)) return false;
-        Changed();
-        return true;
+        Normalize(currentTime);
+        if (changed || before != _tasks.Count + _tasks.Sum(task => task.Subagents.Count))
+        {
+            Changed();
+            return true;
+        }
+        return false;
+    }
+
+    private bool MaintainAgyDatabase(DateTimeOffset now)
+    {
+        if (!_tasks.Any(task => task.Source == AgentSource.Antigravity))
+            return false;
+
+        var dbPath = AgyConversationDatabase.DefaultDbPath;
+        if (!File.Exists(dbPath)) return false;
+
+        try
+        {
+            var lastWrite = File.GetLastWriteTimeUtc(dbPath);
+            if (_lastAgyDbModified is not null && lastWrite <= _lastAgyDbModified.Value)
+                return false;
+
+            _lastAgyDbModified = lastWrite;
+            var changed = CheckAgyTitles(now, dbPath);
+            changed = PruneAgyGhostTasks(now, dbPath) || changed;
+            return changed;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private bool PruneAgyGhostTasks(DateTimeOffset now, string dbPath)
+    {
+        var changed = false;
+        for (var i = _tasks.Count - 1; i >= 0; i--)
+        {
+            var task = _tasks[i];
+            if (task.Source != AgentSource.Antigravity) continue;
+
+            var dbInfo = AgyConversationDatabase.Query(task.Id, dbPath);
+            if (!string.IsNullOrWhiteSpace(dbInfo?.ParentConversationId))
+            {
+                var parentId = dbInfo.ParentConversationId;
+                _tasks.RemoveAt(i);
+                changed = true;
+
+                var parent = _tasks.FirstOrDefault(t => t.Id == parentId);
+                if (parent is not null)
+                {
+                    var agentName = dbInfo.AgentName ?? "research";
+                    var displayName = SubagentDisplayName(agentName, dbInfo.Title);
+                    var sub = new SubagentSnapshot(
+                        task.Id, "/" + agentName, displayName,
+                        task.Lifecycle, task.Activity ?? AgentActivity.Thinking,
+                        task.LatestStep, task.TokenUsage,
+                        task.StartedAt, task.UpdatedAt);
+                    var updatedSubs = parent.Subagents
+                        .Where(s => s.Id != task.Id && !s.Id.StartsWith($"{agentName}-", StringComparison.OrdinalIgnoreCase))
+                        .Append(sub)
+                        .OrderBy(s => s.IsTerminal).ThenBy(s => s.StartedAt).ToList();
+                    var parentIdx = _tasks.FindIndex(t => t.Id == parentId);
+                    if (parentIdx >= 0)
+                    {
+                        _tasks[parentIdx] = parent with
+                        {
+                            Subagents = updatedSubs,
+                            UpdatedAt = now,
+                            Activity = parent.Lifecycle == AgentLifecycle.Running
+                                ? updatedSubs.Any(s => !s.IsTerminal)
+                                    ? AgentActivity.Delegating
+                                    : (parent.Activity == AgentActivity.Delegating ? AgentActivity.Thinking : parent.Activity)
+                                : parent.Activity,
+                        };
+                    }
+                }
+            }
+        }
+        return changed;
+    }
+
+    private bool CheckAgyTitles(DateTimeOffset now, string dbPath)
+    {
+        var changed = false;
+        for (var i = 0; i < _tasks.Count; i++)
+        {
+            var task = _tasks[i];
+            if (task.Source != AgentSource.Antigravity) continue;
+
+            var dbInfo = AgyConversationDatabase.Query(task.Id, dbPath);
+            if (string.IsNullOrWhiteSpace(dbInfo?.Title)) continue;
+
+            var expectedTitle = $"{task.ProjectName} · {dbInfo.Title}";
+            if (task.Title != expectedTitle)
+            {
+                _tasks[i] = task with
+                {
+                    Title = expectedTitle,
+                    UpdatedAt = now,
+                };
+                changed = true;
+            }
+        }
+
+        return changed;
+    }
+
+    private bool CheckAgyQueuedPrompts(DateTimeOffset now)
+    {
+        var changed = false;
+        for (var i = 0; i < _tasks.Count; i++)
+        {
+            var task = _tasks[i];
+            if (task.Source != AgentSource.Antigravity || task.Lifecycle != AgentLifecycle.Running)
+                continue;
+
+            var (prompt, timestamp) = AgyHistoryReader.ExtractLatestPrompt(task.Id);
+            if (prompt is not null && timestamp is not null && timestamp.Value > task.StartedAt &&
+                prompt != task.UserPrompt)
+            {
+                if (!task.PromptQueued || task.UserPrompt != prompt)
+                {
+                    _tasks[i] = task with
+                    {
+                        UserPrompt = prompt,
+                        PromptQueued = true,
+                        UpdatedAt = now,
+                    };
+                    changed = true;
+                }
+            }
+        }
+        return changed;
     }
 
     public ControlAckPayload Perform(Guid requestID, ControlPayload control, ICodexPermissionResolver resolver)
@@ -357,11 +643,30 @@ public sealed class TaskCatalog
             task.Id.StartsWith("agentgrid-", StringComparison.Ordinal) && now - task.UpdatedAt >= TimeSpan.FromMinutes(1) ||
             task.IsTerminal && task.CompletedAt is not null && now - task.CompletedAt > TimeSpan.FromMinutes(30));
         for (var index = 0; index < _tasks.Count; index++)
-            _tasks[index] = _tasks[index] with
+        {
+            var task = _tasks[index];
+            var subs = task.Subagents;
+            // 仅对 Antigravity 来源执行终态级联，杜绝跨来源误杀 Claude / OpenCode 正常运行中的子代理
+            if (task.Source == AgentSource.Antigravity && task.IsTerminal && subs.Any(s => !s.IsTerminal))
             {
-                Subagents = _tasks[index].Subagents
-                    .Where(value => !value.IsTerminal || now - value.UpdatedAt < TimeSpan.FromSeconds(4)).ToList(),
+                subs = subs.Select(s => s.IsTerminal ? s : s with
+                {
+                    Lifecycle = task.Lifecycle == AgentLifecycle.Interrupted ? AgentLifecycle.Interrupted : AgentLifecycle.Succeeded,
+                    Activity = null,
+                    UpdatedAt = now,
+                }).ToList();
+            }
+
+            _tasks[index] = task with
+            {
+                Subagents = subs.Where(value => !value.IsTerminal || now - value.UpdatedAt < TimeSpan.FromSeconds(4)).ToList(),
+                Activity = task.Lifecycle == AgentLifecycle.Running
+                    ? subs.Any(value => !value.IsTerminal)
+                        ? AgentActivity.Delegating
+                        : (task.Activity == AgentActivity.Delegating ? AgentActivity.Thinking : task.Activity)
+                    : task.Activity,
             };
+        }
         foreach (var key in _requests.Keys.Where(key => _tasks.All(task => task.Id != key)).ToList())
             _requests.Remove(key);
         while (_tasks.Count > _capacity)
@@ -415,20 +720,20 @@ internal static class ToolStep
 
     public static string Label(string toolName) => toolName.Split('.').Last().ToLowerInvariant() switch
     {
-        "bash" or "shell" or "exec" or "exec_command" or "terminal_interaction" => "Bash",
+        "bash" or "shell" or "exec" or "exec_command" or "terminal_interaction" or "run_command" => "Bash",
         "apply_patch" or "patch" => "Patch",
-        "edit" => "Edit",
-        "write" => "Write",
-        "read" or "read_file" or "view" => "Read",
+        "edit" or "replace_file_content" => "Edit",
+        "write" or "write_to_file" => "Write",
+        "read" or "read_file" or "view" or "view_file" or "read_url_content" or "read_resource" or "list_resources" => "Read",
         "glob" => "Glob",
         "grep" => "Grep",
-        "task" => "Task",
+        "task" or "invoke_subagent" or "manage_subagents" or "manage_task" => "Task",
         "webfetch" => "WebFetch",
-        "websearch" => "WebSearch",
+        "websearch" or "search_web" => "WebSearch",
         "todowrite" or "todoread" or "todo" => "Todo",
         "skill" => "Skill",
         "lsp" => "LSP",
-        "question" => "Question",
+        "question" or "ask_question" => "Question",
         _ => toolName,
     };
 

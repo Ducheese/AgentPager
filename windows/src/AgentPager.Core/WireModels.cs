@@ -3,7 +3,7 @@ using System.Text.Json.Serialization;
 
 namespace AgentPager.Core;
 
-public enum AgentSource { CodexDesktop, CodexCLI, ClaudeCode, OpenCode }
+public enum AgentSource { CodexDesktop, CodexCLI, ClaudeCode, OpenCode, Antigravity }
 public enum AgentLifecycle { Offline, Idle, Starting, Running, WaitingApproval, WaitingAnswer, Succeeded, Interrupted }
 public enum AgentActivity { Thinking, Reading, Searching, Editing, Executing, Testing, Browsing, Delegating }
 public enum TaskCapability { Approve, Deny, Answer, Interrupt, Retry }

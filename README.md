@@ -49,6 +49,7 @@ AgentPager 将 Codex Desktop、Codex CLI 与 Claude Code 的运行状态通过�
 | Codex Desktop / CLI | 支持 | 支持批准或拒绝权限请求 |
 | Claude Code | 支持 | 暂不支持 |
 | opencode | 支持 | 暂不支持 |
+| Antigravity (agy) | 支持 | 暂不支持 |
 
 ## 下载
 
@@ -69,7 +70,7 @@ AgentPager 将 Codex Desktop、Codex CLI 与 Claude Code 的运行状态通过�
 
 1. 从 Releases 下载 APK，以及对应电脑系统的 DMG 或 Windows 安装器。
 2. 打开电脑上的 `AgentPager Bridge`。
-3. 点击 macOS 菜单栏或 Windows 系统托盘中的图标，选择“安装 Codex Hook”、“安装 Claude Code Hook”或“安装 OpenCode 插件”。AgentPager 会保留原有 Hook 配置并自动备份。
+3. 点击 macOS 菜单栏或 Windows 系统托盘中的图标，选择“安装 Codex Hook”、“安装 Claude Code Hook”、“安装 OpenCode 插件”或“安装 Antigravity Hook”。AgentPager 会保留原有 Hook 配置并自动备份。
 4. 在对应 Agent 中信任 AgentPager Hook，否则 Hook 不会被实际调用：
    - **Codex CLI / TUI**：运行 `/hooks`，把 AgentPager Hook 标记为信任。
    - **Codex Desktop（macOS 桌面版）**：在“设置”里找到 AgentPager Hook 并点击信任，没有 `/hooks` 斜杠命令。
@@ -155,6 +156,7 @@ That is how AgentPager came to be: putting an idle phone back to work as a genui
 | Codex Desktop / CLI | Supported | Approve or reject permission requests |
 | Claude Code | Supported | Not yet supported |
 | opencode | Supported | Not yet supported |
+| Antigravity (agy) | Supported | Not yet supported |
 
 ## Download
 
@@ -174,7 +176,7 @@ Go to [GitHub Releases](../../releases/latest) to download the installers direct
 
 1. Download the APK and the DMG or Windows installer for your computer.
 2. Open `AgentPager Bridge` on your computer.
-3. Click the icon in the macOS menu bar or Windows system tray and choose **Install Codex Hook**, **Install Claude Code Hook** or **Install OpenCode Plugin**. AgentPager keeps your existing Hook configuration and automatically creates a backup.
+3. Click the icon in the macOS menu bar or Windows system tray and choose **Install Codex Hook**, **Install Claude Code Hook**, **Install OpenCode Plugin** or **Install Antigravity Hook**. AgentPager keeps your existing Hook configuration and automatically creates a backup.
 4. Trust the AgentPager Hook in the corresponding agent, otherwise the Hook will not actually be invoked:
    - **Codex CLI / TUI**: run `/hooks` and mark the AgentPager Hook as trusted.
    - **Codex Desktop (macOS app)**: trust the AgentPager Hook in **Settings**; there is no `/hooks` slash command.

@@ -16,6 +16,9 @@ enum class AgentSource {
 
     @SerialName("opencode")
     OPENCODE,
+
+    @SerialName("antigravity")
+    ANTIGRAVITY,
 }
 
 @Serializable

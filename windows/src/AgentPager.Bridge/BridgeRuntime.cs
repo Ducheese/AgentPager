@@ -16,7 +16,9 @@ public sealed record BridgeViewState(
     string PairingText,
     string SelectedAddress,
     List<NetworkAddressOption> Networks,
-    int TaskCount);
+    int TaskCount,
+    string AgyHookText = "未安装",
+    AntigravityPluginStatus AgyHookState = AntigravityPluginStatus.NotInstalled);
 
 public sealed class BridgeRuntime : IAsyncDisposable
 {
@@ -38,6 +40,7 @@ public sealed class BridgeRuntime : IAsyncDisposable
     private readonly CodexHookConfiguration _hookConfiguration = new();
     private readonly ClaudeHookConfiguration _claudeHookConfiguration = new();
     private readonly OpenCodePluginConfiguration _openCodePluginConfiguration = new();
+    private readonly AgyHookConfiguration _agyHookConfiguration = new();
     private readonly ReplayGuard _replayGuard = new();
     private readonly byte[] _pairingSecret;
     private readonly TaskCatalog _catalog;
@@ -200,6 +203,39 @@ public sealed class BridgeRuntime : IAsyncDisposable
         PublishState();
     }
 
+    public void InstallAgyHook()
+    {
+        try
+        {
+            var result = _agyHookConfiguration.Install();
+            var version = AgyHookConfiguration.EmbeddedVersion;
+            _log.Write("INFO", result.Changed ? $"Antigravity Hook 已安装（v{version}）。" : $"Antigravity Hook 已是最新状态（v{version}）。");
+            _lastError = null;
+        }
+        catch (Exception error)
+        {
+            _lastError = $"安装 Antigravity Hook 失败：{error.Message}";
+            _log.Write("ERROR", _lastError);
+        }
+        PublishState();
+    }
+
+    public void UninstallAgyHook()
+    {
+        try
+        {
+            _ = _agyHookConfiguration.Uninstall();
+            _lastError = null;
+            _log.Write("INFO", "Antigravity Hook 已移除。");
+        }
+        catch (Exception error)
+        {
+            _lastError = $"卸载 Antigravity Hook 失败：{error.Message}";
+            _log.Write("ERROR", _lastError);
+        }
+        PublishState();
+    }
+
     public void SelectAddress(string address)
     {
         if (_networks.All(value => value.Address != address)) return;
@@ -242,6 +278,7 @@ public sealed class BridgeRuntime : IAsyncDisposable
                             HookEnvelope.Codex codex => HandleCodexHook(codex.Hook),
                             HookEnvelope.Claude claude => _catalog.Accept(claude.Hook),
                             HookEnvelope.OpenCode openCode => _catalog.Accept(openCode.Hook),
+                            HookEnvelope.Antigravity agy => _catalog.Accept(agy.Hook),
                             _ => false,
                         };
                         break;
@@ -392,6 +429,17 @@ public sealed class BridgeRuntime : IAsyncDisposable
                 : $"待更新 → v{pluginVersion}",
             _ => $"已写入 v{pluginVersion}",
         };
+        var agyStatus = _agyHookConfiguration.Status;
+        var agyVersion = AgyHookConfiguration.EmbeddedVersion;
+        var agyInstalledVersion = _agyHookConfiguration.InstalledVersion;
+        var agyText = agyStatus switch
+        {
+            AntigravityPluginStatus.NotInstalled => "未安装",
+            AntigravityPluginStatus.Outdated => agyInstalledVersion is int installed
+                ? $"待更新 v{installed} → v{agyVersion}"
+                : $"待更新 → v{agyVersion}",
+            _ => $"已写入 v{agyVersion}",
+        };
         return new(
             _serviceStatus,
             _phoneCount,
@@ -404,7 +452,9 @@ public sealed class BridgeRuntime : IAsyncDisposable
             PairingText(),
             _selectedAddress,
             _networks,
-            _catalog.Projection().Tasks.Count);
+            _catalog.Projection().Tasks.Count,
+            agyText,
+            agyStatus);
     }
 
     private void PublishState()

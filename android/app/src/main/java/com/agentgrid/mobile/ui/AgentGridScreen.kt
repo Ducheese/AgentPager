@@ -586,13 +586,13 @@ private fun TaskRow(
         modifier = modifier
             .fillMaxWidth()
             .background(if (expanded || autoVisible) AgentGridColors.Surface else Color.Transparent)
-            .clickable(onClick = onClick)
             .padding(horizontal = 4.dp),
     ) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(78.dp),
+                .height(78.dp)
+                .clickable(onClick = onClick),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             AndroidView(
@@ -1084,11 +1084,13 @@ private fun agentBadge(source: AgentSource): String = when (source) {
     AgentSource.CODEX_DESKTOP, AgentSource.CODEX_CLI -> "Codex"
     AgentSource.CLAUDE_CODE -> "Claude"
     AgentSource.OPENCODE -> "OpenCode"
+    AgentSource.ANTIGRAVITY -> "AGY"
 }
 
 private fun agentBadgeColor(source: AgentSource): Color = when (source) {
     AgentSource.CLAUDE_CODE -> AgentGridColors.Violet
     AgentSource.OPENCODE -> AgentGridColors.Green
+    AgentSource.ANTIGRAVITY -> AgentGridColors.Cyan
     else -> AgentGridColors.Blue
 }
 
@@ -1097,6 +1099,7 @@ private fun agentOriginLabel(source: AgentSource): String = when (source) {
     AgentSource.CODEX_CLI -> "Terminal"
     AgentSource.CLAUDE_CODE -> "Claude Code"
     AgentSource.OPENCODE -> "opencode"
+    AgentSource.ANTIGRAVITY -> "Antigravity"
 }
 
 private fun activityText(activity: AgentActivity?): String = when (activity) {
