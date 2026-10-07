@@ -58,7 +58,7 @@
   - **工具态**：统一 `工具名 内容` 前缀（`Bash git log`、`Read hooks.md`、`Edit app.js`）；
   - **回复态**：正文预览 ≤120 字单行截断，仅在 `Stop`（且本轮无工具调用）写入，回合结束保留；
   - **守卫**：候选文本若原样包含用户当前 Prompt（≥4 字）直接丢弃并保留上一值，杜绝第三行回显第二行。
-- **子代理**：通过 `invoke_subagent` 派发时映射为 `SubagentSnapshot`，父任务显示 `delegating`，手机端自动展开 `ANTIGRAVITY (N)`。
+- **子代理**：`invoke_subagent` 派发时父任务置 `delegating`；子代理行在真实子会话钩子到达时经父级路由建立（v2 起不再造哈希占位行，遗留占位由前缀清理兜底）。
 - **提问态（`ask_question`）**：触发 `WaitingAnswer` 状态锁与顶部 `QUESTION` 卡片展示，手机端只读，作答在 CLI 完成。
 - **Windows UTF-8 No-BOM 红线**：Bridge 对 `~/.gemini/config/hooks.json` 进行管理与注入时，必须强制 UTF-8 No-BOM，防止写入 `\ufeff` 导致 Antigravity 的 Go JSON 解析器崩溃。
 
@@ -72,7 +72,7 @@
 | 全局钩子配置文件 | `~/.gemini/config/hooks.json` | 挂载与调试 Antigravity 生命周期钩子 |
 | 手机同款快照观察器 | `ap-verify-plugin\snapshot-now.mjs` | WS 连 bridge，直接读取手机收到的 `state.snapshot` |
 | 胶水脚本本地单测 | 命令行执行 `node agentpager-antigravity.js PreToolUse` | 模拟管道输入，验证首帧放行与 TCP 组包 |
-| Bridge Reducer 隔离测试 | `%TEMP%\antigravity\ap-verify-agy` | 针对 AgyEventReducer 进行纯内存状态机流转断言 |
+| Bridge Reducer 隔离测试 | 仓库 `windows/tests/AgentPager.Core.Tests`（`dotnet run`）+ 插件单测 `windows/tests/opencode-plugin.test.mjs`（`node`） | AgyEventReducer / 转录本解析 / opencode 全链断言（2026-10-08 入库） |
 
 ---
 
@@ -92,6 +92,7 @@
    → **结论**：解析 Prompt 时必须使用正则表达式精准截取 `<USER_REQUEST>(.*?)</USER_REQUEST>` 内部的正文，剥离系统冗余信息。
 7. **`ask_question` 等待态被后续事件意外冲掉**：触发提问后，`WaitingAnswer` 卡片应常驻置顶。若后续伴随工具清理或状态事件，不可将任务压回 `Running`。
    → **结论**：生命周期处于 `WaitingAnswer` 期间，忽略普通工具更新与流式变动。
+8. **2026-10-08 终稿丢失实锤与两道修复**：transcript 里终稿存在（1816 字纯文本）但桥端 `succeeded` 时第三行空前空——实锤两个机制：① `Stop` 钩子读转录本与终稿落盘存在竞速（`Stop` 是唯一写预览的时机，读早一拍即永久丢）→ 修复：预览缺失时登记，`Maintain` 每 3 秒重读一次、1 分钟窗口，任务仍终态时补写（`AgyEventReducer.TryApplyLatePreview`）；② 胶水脚本 1 秒安全兜底在负载下可能抢在转发前杀进程导致事件丢失（该轮工具 step 也未落）→ 修复：开始转发后兜底不再生效，退出交给 socket 事件闭环（脚本 v2）；另叠加 A4 静默 10 分钟离线，杜绝事件全丢后的永久 running。
 
 ---
 

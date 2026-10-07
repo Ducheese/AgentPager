@@ -50,7 +50,6 @@ Antigravity (agy.exe)
       "transcriptPath": "C:/Users/alord/.gemini/antigravity-cli/brain/c5ab9fca-dcb5-42c5-a493-f3629fc96434/.system_generated/logs/transcript.jsonl",
       "artifactDirectoryPath": "C:/Users/alord/.gemini/antigravity-cli/brain/c5ab9fca-dcb5-42c5-a493-f3629fc96434",
       "modelName": "auto",
-      "stepIdx": 19,
       "toolCall": {
         "name": "run_command",
         "args": {
@@ -60,8 +59,7 @@ Antigravity (agy.exe)
         }
       },
       "error": null,
-      "terminationReason": null,
-      "fullyIdle": true
+      "terminationReason": null
     }
   }
   ```
@@ -84,9 +82,9 @@ Antigravity (agy.exe)
 | 6 | `PostToolUse`（工具正常结束） | 工具执行成功 | `running` | `thinking` | 保持上一工具标题（粘滞至下一事件） | 等待后续模型生成或下一工具 |
 | 7 | `PostToolUse`（工具返回错误） | 工具执行失败（`error` 非空） | `running`（若已为 `interrupted` 则保持） | `thinking` | `LatestStep="✗ " + 错误摘要` | 报错粘滞提示；不打断会话（等待模型自我修复） |
 | 8 | `PostInvocation` | 单轮模型输出与工具调度结束 | 不变（等待后续或 `Stop`） | `thinking` | `TokenUsage`（从 transcript 当前轮最新 `PLANNER_RESPONSE` 提取）；保持当前步骤不变（正文预览延至 `Stop` 写入，防工具步践踏） | 保持当前活跃工具或思考状态 |
-| 9 | `Stop`（`terminationReason == "model_stop"`） | 回合正常完成（模型完成作答） | `succeeded`（当前为 `interrupted` 时保持） | 清空 | `CompletedAt=now`、`IsUnread=true`、`LatestStep` 置为纯文本正文预览（≤120 字，仅限本轮未调用工具的纯回复）或保留最终工具步 | 触发爆闪与提示音，本轮计时冻结 |
+| 9 | `Stop`（`terminationReason == "model_stop"`） | 回合正常完成（模型完成作答） | `succeeded`（当前为 `interrupted` 时保持） | 清空 | `CompletedAt=now`、`IsUnread=true`、`LatestStep` 置为纯文本正文预览（≤120 字，仅限本轮未调用工具的纯回复）或保留最终工具步 | 触发爆闪与提示音，本轮计时冻结；预览缺失（终稿落盘竞速）时 Maintain 在 1 分钟窗口内自动补读一次 |
 | 10 | `Stop`（`error` 或异常终止） | 回合异常中止或用户强行中断 | `interrupted` | 清空 | `CompletedAt=now`、`IsUnread=true`、`LatestStep="✗ " + (error ?? reason)` | 红色断口定格 |
-| 11 | 会话超时 / CLI 退出 | 进程关闭或长久失联（无 Stop 到达） | 终态保持 30 分钟后由 Maintain 回收；非终态因缺失 Stop 保持在 running（见第六节已知限制） | 清空 | — | 终态 30 分钟回收，非终态不回收 |
+| 11 | 会话超时 / CLI 退出 | 进程关闭或长久失联（无 Stop 到达） | 终态保持 30 分钟后由 Maintain 回收；非终态且静默 ≥10 分钟（无工具活动）由 Maintain 判为 `offline` | 清空 | — | 静默判定不含 executing/reading 等工具活动；下一次钩子到达自动恢复 |
 
 > **通用竞态与乱序守卫（Antigravity 专有）**：
 > 1. **`WaitingAnswer` 状态锁**：一旦 `ask_question` 触发进入 `WaitingAnswer`，在用户回答前，后续任何并发工具回调不得将其压回 `Running`。
@@ -117,7 +115,7 @@ Antigravity 拥有原生首类子代理系统（`invoke_subagent` / `manage_suba
 | `view_file`、`read_url_content`、`read_resource`、`list_resources` | `reading` | 文件只读查阅、文档抓取与静态资源读取 |
 | `search_web` | `browsing` | 网页搜索与外部网络检索 |
 | `write_to_file`、`replace_file_content` | `editing` | 源码创建、块替换与文件写入 |
-| `run_command`（命中 `test`/`pytest`/`jest`/`cargo test`/`go test`/`dotnet test`/`npm test`） | `testing` | 测试套件与自动化单元测试执行 |
+| `run_command`（命令含独立词 `test`/`pytest`/`jest`/`vitest`，词边界匹配；`latest` 不误报、`gradlew build` 不算测试） | `testing` | 测试套件与自动化单元测试执行 |
 | `run_command`（其他命令行操作） | `executing` | 构建、工具运行与系统 Shell 执行 |
 | `ask_question` | `thinking` | 触发 `waitingAnswer` 交互态 |
 | `invoke_subagent`、`send_message`、`manage_subagents` | `delegating` | 子代理派生、消息调度与团队协同 |
@@ -165,7 +163,7 @@ Antigravity 拥有原生首类子代理系统（`invoke_subagent` / `manage_suba
 
 ## 六、已知限制
 
-1. **强杀进程无 Stop 触发**：若用户直接关闭终端窗口或通过任务管理器杀掉 `agy.exe`，Antigravity 不会触发 `Stop` 钩子，任务在 Bridge 侧将保持在 `running`，直到新会话到达或 Bridge 重启。
+1. **强杀进程无 Stop 触发**：若用户直接关闭终端窗口或通过任务管理器杀掉 `agy.exe`，Antigravity 不会触发 `Stop` 钩子，任务在 Bridge 侧将保持在 `running`，直到新会话到达或 Bridge 重启。（2026-10-08 缓解：Maintain 心跳在静默 ≥10 分钟且无工具活动时判为 `offline`，不再永久停留 running。）
 2. **转录本文件并发读取**：Bridge 读取 `transcript.jsonl` 时必须显式声明 `FileShare.ReadWrite` 共享读锁，防止与正在高速落盘的 `agy` 进程产生 Windows 文件锁冲突。
 3. **正文预览非打字机流式**：因 Antigravity 仅在 Invocation 结束或工具发起时落盘转录本，手机端正文预览为块级阶段性刷新，而非逐字打字机流式。
 4. **多工作区路径聚合**：当 CLI 带有多个 `--add-dir` 时，`ProjectName` 优先取主工作区（`workspacePaths[0]`）。
@@ -228,7 +226,7 @@ Antigravity (hooks.json + transcript) ──脚本(TCP 49361)──► TaskSnaps
 | `view_file` / `read_url_content` / `read_resource` | `reading` | 横向扫描线（自上而下掠过） |
 | MCP 检索工具（含 search/find/query） | `searching` | 外圈 8 格跑马灯 |
 | `write_to_file` / `replace_file_content` | `editing` | 横向书写波 + 中列光标闪 |
-| `run_command` 命中测试套件 | `testing` | 斜向扫线 + 末尾判定脉冲 |
+| `run_command` 含独立词 test/pytest/jest/vitest | `testing` | 斜向扫线 + 末尾判定脉冲 |
 | `run_command` 其他 / 通用 MCP | `executing` | 竖直流光柱（逐格下落） |
 | `search_web` | `browsing` | 翻页带自上而下 |
 | `invoke_subagent` | `delegating` | 中心脉冲 + 外圈分支扩散 |

@@ -27,7 +27,7 @@
 | 1 | `session.created` | 会话建立 | `idle` | 无 | ProjectName/StartedAt（`info.directory`、`info.time.created`） | 新建任务；不置 Starting，避免空会话误报 |
 | 2 | `chat.message`（合成） | 用户提交 prompt | `running` | `thinking` | UserPrompt；`queued` 标记（提交时会话仍在跑 = 排队）；本轮计时起点（仅上一状态为 idle/offline/succeeded/interrupted 时重置 StartedAt=now，轮内插入不重置）；新一轮清空第三行（轮内插入不清，lifecycle 文案兜底） | 清除 CompletedAt/挂起请求；不产生标题 |
 | 3 | `session.status` `busy` | 回合开始/继续 | `running` | 保持现值（空则 `thinking`） | — | 不动第三行（避免盖掉正文预览） |
-| 4 | `session.status` `retry` | 上游重试 | `running` | `thinking` | LatestStep=`重试 #<attempt>: <message>`（message 缺失时=`重试中`；`TaskCatalog.cs:945`） | 重试耗尽会转为 `session.error` |
+| 4 | `session.status` `retry` | 上游重试 | `running` | `thinking` | LatestStep=`重试 #<attempt>: <message>`（message 缺失时=`重试中`；`TaskCatalog.cs:1274`） | 重试耗尽会转为 `session.error` |
 | 5 | `session.status` `idle` / `session.idle` | 回合结束 | `succeeded`（当前为 `interrupted` 时保持 `interrupted`） | 清空 | CompletedAt=now、IsUnread=true | 两者的去重/收敛规则相同，等价处理 |
 | 6 | `session.error` | 回合异常/中止 | `interrupted` | 清空 | CompletedAt=now、IsUnread=true、LatestStep=错误摘要 | 中止（MessageAbortedError）同映射；随后到达的 `idle` 被第 5 条守卫拦下 |
 | 7 | `message.updated`（assistant 且带 `error`） | 助手消息失败 | `interrupted` | 同上 | 同上 | 与 6 等价（双保险），仅在终态换算去重 |
@@ -44,12 +44,12 @@
 | 22 | `prompt.active`（合成） | 排队的 prompt 被接单（新 assistant 消息开始生成） | 不变 | 不变 | PromptQueued=false | 排队窗口结束 |
 | 17 | `question.rejected` | 问题被放弃 | `interrupted` | 清空 | CompletedAt=now、IsUnread=true、移除请求 | 工具以 RejectedError 结束 |
 | 18 | `session.updated`（标题变化） | 自动生成摘要标题 | 不变 | 不变 | Title=`项目 · <标题>`（默认名 `New session - *` 时忽略） | 其余 updated（touch）只透传忽略 |
-| 19 | `session.deleted` | 会话删除 | 终态保持；否则 `offline` | 清空 | — | 与 Claude SessionEnd 对齐 |
-| 20 | `plugin.dispose`（合成） | opencode 退出 | 终态保持；否则 `offline` | 清空 | — | 每个已知会话发一条；强杀不触发 |
+| 19 | `session.deleted` | 会话删除 | 终态保持；否则 `offline` | 清空 | — | 与 Claude SessionEnd 对齐；未终态子代理级联扫为 interrupted（防残留行落盘） |
+| 20 | `plugin.dispose`（合成） | opencode 退出 | 终态保持；否则 `offline` | 清空 | — | 每个已知会话发一条；强杀不触发；未终态子代理级联扫为 interrupted |
 
 不在上表的事件一律忽略（`todo.updated`、`session.compacted`、`file.edited`、`tui.*`、`installation.*`、`lsp.*`、`server.connected` 等）。
 
-> **通用竞态守卫**（乱序防御，bridge v15 起）：① `WaitingApproval` / `WaitingAnswer` 期间，工具 part 更新一律忽略（实测 opencode 会在 `question.asked` / `permission.asked` 之后补发该工具 part 的 running/标题更新，不拦会把等待状态压回 running 并清掉挂起卡片）；② `Succeeded` / `Interrupted` / `Offline` 终态后，迟到的工具 part 一律忽略（不得把已完成任务复活回 running）；③ 工具活动期间（activity 非空且非 `thinking`），`reply` 整条忽略（实测乱序：正文结束帧可能晚于工具 part 约 200ms，不拦会把刚写入的命令/工具步骤盖回上一段正文）。
+> **通用竞态守卫**（乱序防御，bridge v26 / 插件 v8 起）：① `WaitingApproval` / `WaitingAnswer` 期间，工具 part 更新一律忽略（实测 opencode 会在 `question.asked` / `permission.asked` 之后补发该工具 part 的 running/标题更新，不拦会把等待状态压回 running 并清掉挂起卡片）；② `Succeeded` / `Interrupted` / `Offline` 终态后，迟到的工具 part 一律忽略（不得把已完成任务复活回 running）；③ 插件 v8 源头守卫：正文结束帧若晚于工具 part 到达（toolSinceText 标记）由插件直接丢弃，残帧不出插件；④ 桥侧兜底：工具 part 处于 `pending`/`running` 期间（按状态判定、不依赖 activity，无时间窗），`reply` 整条忽略——覆盖 todowrite 类 thinking 工具，且不吞工具结束后的合法短终稿。
 
 ### 子代理映射（child session → SubagentSnapshot）
 
@@ -78,7 +78,7 @@
 | `edit`、`write`、`apply_patch`、`patch` | `editing` |
 | `webfetch`、`websearch`、`mcp-websearch` | `browsing` |
 | `task` | `delegating` |
-| `bash`/`shell`（命令命中 test/pytest/vitest/jest/gradle/cargo test/go test/dotnet test/npm test） | `testing` |
+| `bash`/`shell`（命令含独立词 `test`/`pytest`/`jest`/`vitest`，词边界匹配；`latest` 等子串不误报、`gradlew build` 不算测试） | `testing` |
 | `bash`/`shell`（其余） | `executing` |
 | `todowrite`/`todoread` | `thinking` |
 | `skill`、`lsp` | `reading` |
@@ -158,9 +158,9 @@ opencode 事件 ──插件(TCP 49361)──► TaskSnapshot(Lifecycle + Activi
 | `session.status retry` | running | thinking | `重试 #n: message`（缺省「重试中」） | 四角轮流 |
 | 工具 pending/running | running | 工具映射（见第三节） | 「工具名 内容」粘滞 | 对应工具动画 |
 | 工具 completed | running | thinking | 「工具名 内容」粘滞（不变） | 四角轮流 |
-| 工具 error | running（interrupted 被 `TaskCatalog.cs:1026` 提前拦下，保持） | thinking | `✗ 错误首行` | 四角轮流 |
-| `reply`（正文流） | 不变（waiting / 工具活动期间整条忽略，:829） | 不变 | 正文预览 ≤120 字 | 保持当前（通常=四角轮流） |
-| `session.status idle` / `session.idle` | succeeded（interrupted 保持，:960） | 清空 | 预览保留 | 爆闪+打勾（1.2s 后定格） |
+| 工具 error | running（interrupted 被 `TaskCatalog.cs:1364` 提前拦下，保持） | thinking | `✗ 错误首行` | 四角轮流 |
+| `reply`（正文流） | 不变（waiting 期间、或工具处于 pending·running 期间整条忽略；残帧由插件 v8 源头丢弃） | 不变 | 正文预览 ≤120 字 | 保持当前（通常=四角轮流） |
+| `session.status idle` / `session.idle` | succeeded（interrupted 保持，:1290） | 清空 | 预览保留 | 爆闪+打勾（1.2s 后定格） |
 | `session.error` | interrupted | 清空 | 错误摘要 | 闪断→沉降为断口（落定定格） |
 | `permission.asked` | waitingApproval | executing | — | 双拍心跳+中心冲击（强辉光） |
 | `permission.replied` once/always | running | thinking | — | 四角轮流 |
@@ -182,7 +182,7 @@ opencode 事件 ──插件(TCP 49361)──► TaskSnapshot(Lifecycle + Activi
 | read / list / skill / lsp | reading | 横向扫描线（自上而下掠过） |
 | glob / grep / `*search*` | searching | 外圈 8 格跑马灯 |
 | edit / write / patch | editing | 横向书写波 + 中列光标闪 |
-| bash 命中 test/pytest/… | testing | 斜向扫线 + 末尾判定脉冲 |
+| bash 含独立词 test/pytest/jest/vitest | testing | 斜向扫线 + 末尾判定脉冲 |
 | bash 其余 / 未知 / MCP | executing | 竖直流光柱（逐格下落） |
 | webfetch / websearch | browsing | 翻页带自上而下 |
 | task | delegating | 中心脉冲 + 外圈分支扩散 |
@@ -190,6 +190,6 @@ opencode 事件 ──插件(TCP 49361)──► TaskSnapshot(Lifecycle + Activi
 
 ### 三个易误认为「设计」的代码事实
 
-1. `session.created` 直接落 `idle`（`TaskCatalog.cs:789`）——opencode 源**永不出现 `starting`**（螺旋点燃动画只被模拟器等来源使用）。
+1. `session.created` 直接落 `idle`（`TaskCatalog.cs:1114`）——opencode 源**永不出现 `starting`**（螺旋点燃动画只被模拟器等来源使用）。
 2. `waitingApproval` / `waitingAnswer` 的像素动画由 lifecycle 决定，activity 只写入不渲染；`reply` 流同样不改 activity，因此模型写回复时像素通常停留在 thinking 动画。
 3. 同一 lifecycle+activity 的连续事件**不重播动画**（真实任务 revision 恒 0）；重播只发生在状态真实迁移时（模拟器除外，见 `AgentGridScreen.kt:606`）。

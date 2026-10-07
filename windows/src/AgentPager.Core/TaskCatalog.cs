@@ -32,6 +32,8 @@ public sealed class TaskCatalog
 {
     private readonly List<TaskSnapshot> _tasks;
     private readonly Dictionary<string, PendingRequest> _requests;
+    // opencode：乱序残帧守卫——处于 pending/running 的工具 part 所属会话（见 Accept(OpenCodeHookPayload)）。
+    private readonly HashSet<string> _openCodeToolActive = new();
     private readonly int _capacity;
     private ulong _revision;
 
@@ -116,6 +118,18 @@ public sealed class TaskCatalog
         var now = receivedAt ?? DateTimeOffset.UtcNow;
         var sessionID = OpenCodeEventReducer.SessionID(hook);
         if (sessionID is null) return false;
+        // 乱序残帧守卫：工具 part 处于 pending/running 期间，reply 一律丢弃。
+        // 状态判定不依赖 activity，覆盖 todowrite 类 thinking 工具；不做时间窗，
+        // 避免“工具结束后 1 秒内的合法短终稿被吞”（乱序残帧源头拦截由插件 v8 结束帧守卫负责）。
+        if (hook.Event == "reply" && _openCodeToolActive.Contains(sessionID))
+            return false;
+        if (hook.Event == "message.part.updated" && OpenCodeEventReducer.ToolPartStatus(hook.Properties) is { } partStatus)
+        {
+            if (partStatus is "pending" or "running") _openCodeToolActive.Add(sessionID);
+            else _openCodeToolActive.Remove(sessionID);
+        }
+        if (hook.Event is "session.idle" or "session.error" or "plugin.dispose" or "session.deleted")
+            _openCodeToolActive.Remove(sessionID);
         var existing = _tasks.FirstOrDefault(task => task.Id == sessionID);
         if (existing is null && hook.Event is "plugin.dispose" or "session.deleted" or "subagent") return false;
         Upsert(OpenCodeEventReducer.Reduce(hook, existing, now));
@@ -158,8 +172,8 @@ public sealed class TaskCatalog
         var sessionID = hook.SessionID;
         if (string.IsNullOrWhiteSpace(sessionID)) return false;
 
-        // 1. 查询会话元数据（SQLite）：会话真实标题与父会话 ID
-        var dbInfo = AgyConversationDatabase.Query(sessionID);
+        // 1. 查询会话元数据（SQLite，mtime 门控缓存，A2）：会话真实标题与父会话 ID
+        var dbInfo = LookupAgyConversation(sessionID);
         var parentSessionID = !string.IsNullOrWhiteSpace(dbInfo?.ParentConversationId) ? dbInfo.ParentConversationId : null;
 
         // 2. 如果是子代理会话，更新父任务的 Subagents 列表，绝不建立幽灵顶层任务
@@ -183,6 +197,14 @@ public sealed class TaskCatalog
         var existing = _tasks.FirstOrDefault(task => task.Id == sessionID);
         var updated = AgyEventReducer.Reduce(hook, existing, dbInfo, now);
         Upsert(updated);
+
+        // Stop 终稿落盘竞速补救登记（条目 1）：预览缺失时交给 Maintain 限期内重读。
+        if (hook.EffectiveEvent == "Stop" && !string.IsNullOrWhiteSpace(hook.TranscriptPath))
+        {
+            var (_, preview, _) = AgyTranscriptReader.ExtractLatest(hook.TranscriptPath);
+            if (preview is null) _agyPreviewRecheck[sessionID] = (hook.TranscriptPath, now.AddMinutes(1));
+            else _agyPreviewRecheck.Remove(sessionID);
+        }
 
         // 4. 用户交互问题（ask_question）挂起与移除逻辑
         if (hook.EffectiveEvent == "PreToolUse" &&
@@ -315,11 +337,18 @@ public sealed class TaskCatalog
     }
 
     private DateTimeOffset? _lastAgyDbModified;
+    // Accept 路径的会话元数据缓存（mtime 门控，A2）：避免每个 hook 事件开一次 SQLite。
+    private DateTime? _agyAcceptDbMtime;
+    private readonly Dictionary<string, AgyConversationSummary?> _agyAcceptDbCache = new();
+    // Stop 终稿落盘竞速补救（条目 1）：转录本路径 + 重读期限。
+    private readonly Dictionary<string, (string TranscriptPath, DateTimeOffset Deadline)> _agyPreviewRecheck = new();
 
     public bool Maintain(DateTimeOffset? now = null)
     {
         var currentTime = now ?? DateTimeOffset.UtcNow;
         var changed = CheckAgyQueuedPrompts(currentTime);
+        changed = CheckAgyOffline(currentTime) || changed;
+        changed = CheckAgyPreviewRecheck(currentTime) || changed;
         changed = MaintainAgyDatabase(currentTime) || changed;
         var before = _tasks.Count + _tasks.Sum(task => task.Subagents.Count);
         Normalize(currentTime);
@@ -431,30 +460,90 @@ public sealed class TaskCatalog
         return changed;
     }
 
+    /// <summary>agy 会话元数据读取（mtime 门控缓存，A2）：DB 文件未变即复用上次结果。</summary>
+    private AgyConversationSummary? LookupAgyConversation(string sessionID)
+    {
+        var dbPath = AgyConversationDatabase.DefaultDbPath;
+        if (!File.Exists(dbPath)) return null;
+        var lastWrite = File.GetLastWriteTimeUtc(dbPath);
+        if (_agyAcceptDbMtime != lastWrite)
+        {
+            _agyAcceptDbMtime = lastWrite;
+            _agyAcceptDbCache.Clear();
+        }
+        if (_agyAcceptDbCache.TryGetValue(sessionID, out var cached)) return cached;
+        var value = AgyConversationDatabase.Query(sessionID, dbPath);
+        _agyAcceptDbCache[sessionID] = value;
+        return value;
+    }
+
     private bool CheckAgyQueuedPrompts(DateTimeOffset now)
     {
         var changed = false;
         for (var i = 0; i < _tasks.Count; i++)
         {
             var task = _tasks[i];
-            if (task.Source != AgentSource.Antigravity || task.Lifecycle != AgentLifecycle.Running)
-                continue;
-
-            var (prompt, timestamp) = AgyHistoryReader.ExtractLatestPrompt(task.Id);
-            if (prompt is not null && timestamp is not null && timestamp.Value > task.StartedAt &&
-                prompt != task.UserPrompt)
+            if (task.Source != AgentSource.Antigravity) continue;
+            if (AgyEventReducer.DetectQueuedPrompt(task.Id, task) is not { } queued) continue;
+            if (!task.PromptQueued || task.UserPrompt != queued.Prompt)
             {
-                if (!task.PromptQueued || task.UserPrompt != prompt)
+                _tasks[i] = task with
                 {
-                    _tasks[i] = task with
-                    {
-                        UserPrompt = prompt,
-                        PromptQueued = true,
-                        UpdatedAt = now,
-                    };
-                    changed = true;
-                }
+                    UserPrompt = queued.Prompt,
+                    PromptQueued = true,
+                    UpdatedAt = now,
+                };
+                changed = true;
             }
+        }
+        return changed;
+    }
+
+    /// <summary>Stop 终稿落盘竞速补救（条目 1）：限期内重读转录本，任务仍处终态时补写正文预览；
+    /// 新回合已开始（非终态）或超期即放弃。</summary>
+    private bool CheckAgyPreviewRecheck(DateTimeOffset now)
+    {
+        if (_agyPreviewRecheck.Count == 0) return false;
+        var changed = false;
+        foreach (var key in _agyPreviewRecheck.Keys.ToList())
+        {
+            var (transcriptPath, deadline) = _agyPreviewRecheck[key];
+            var index = _tasks.FindIndex(task => task.Id == key);
+            if (index < 0 || now > deadline || !_tasks[index].IsTerminal)
+            {
+                _agyPreviewRecheck.Remove(key);
+                continue;
+            }
+            if (AgyEventReducer.TryApplyLatePreview(_tasks[index], transcriptPath) is not { } patched)
+                continue;
+            if (patched.LatestStep != _tasks[index].LatestStep)
+            {
+                _tasks[index] = patched with { UpdatedAt = now };
+                changed = true;
+            }
+            _agyPreviewRecheck.Remove(key);
+        }
+        return changed;
+    }
+
+    /// <summary>agy 无退出钩子：静默 ≥10 分钟且无工具活动（activity 为空或 thinking）时判为离线（A4）；
+    /// 长工具运行中（executing/reading 等）不算静默。</summary>
+    private bool CheckAgyOffline(DateTimeOffset now)
+    {
+        var changed = false;
+        for (var i = 0; i < _tasks.Count; i++)
+        {
+            var task = _tasks[i];
+            if (task.Source != AgentSource.Antigravity || task.IsTerminal || task.Lifecycle == AgentLifecycle.Offline) continue;
+            if (now - task.UpdatedAt <= TimeSpan.FromMinutes(10)) continue;
+            if (task.Activity is not (null or AgentActivity.Thinking)) continue;
+            _tasks[i] = task with
+            {
+                Lifecycle = AgentLifecycle.Offline,
+                Activity = null,
+                Subagents = SubagentSweep.Finalize(task.Subagents),
+            };
+            changed = true;
         }
         return changed;
     }
@@ -669,6 +758,7 @@ public sealed class TaskCatalog
         }
         foreach (var key in _requests.Keys.Where(key => _tasks.All(task => task.Id != key)).ToList())
             _requests.Remove(key);
+        _openCodeToolActive.RemoveWhere(key => _tasks.All(task => task.Id != key));
         while (_tasks.Count > _capacity)
         {
             var removable = _tasks.Where(task => task.IsTerminal).MinBy(task => task.UpdatedAt);
@@ -745,6 +835,29 @@ internal static class ToolStep
     }
 
     private static string Clamp(string value) => value.Length > 220 ? value[..220] : value;
+}
+
+/// <summary>测试命令判定：按独立词匹配 test/pytest/jest/vitest（词边界强约束，
+/// latest 等子串不再误报；gradle 仅在带 test 任务时才命中，gradlew build 不算测试）。</summary>
+internal static class ShellTestRun
+{
+    private static readonly Regex Pattern = new(
+        @"\b(?:test|pytest|jest|vitest)\b",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+    public static bool Matches(string? command) =>
+        !string.IsNullOrWhiteSpace(command) && Pattern.IsMatch(command);
+}
+
+/// <summary>把未终态子代理扫为 interrupted（进程退出/会话删除/静默离线时不再有子会话事件）。</summary>
+internal static class SubagentSweep
+{
+    public static List<SubagentSnapshot> Finalize(List<SubagentSnapshot> subagents) =>
+        subagents.Select(s => s.IsTerminal ? s : s with
+        {
+            Lifecycle = AgentLifecycle.Interrupted,
+            Activity = null,
+        }).ToList();
 }
 
 public static class CodexEventReducer
@@ -1074,6 +1187,15 @@ public static class OpenCodeEventReducer
         return null;
     }
 
+    /// <summary>工具 part 的状态（非工具 part 或无状态返回 null）：乱序残帧守卫判据。</summary>
+    public static string? ToolPartStatus(JsonElement? properties)
+    {
+        var part = properties is { } value ? Child(value, "part") : null;
+        if (part is not { } item || Text(item, "tool") is null) return null;
+        var state = Child(item, "state");
+        return state is { } current ? Text(current, "status") : null;
+    }
+
     public static TaskSnapshot Reduce(OpenCodeHookPayload hook, TaskSnapshot? existing, DateTimeOffset now)
     {
         var sessionID = SessionID(hook) ?? existing?.Id ?? "opencode";
@@ -1104,6 +1226,9 @@ public static class OpenCodeEventReducer
                 {
                     Lifecycle = task.IsTerminal ? task.Lifecycle : AgentLifecycle.Offline,
                     Activity = null,
+                    // 退出/删除时未终态的子代理不会再有子会话事件（随进程一起消失），
+                    // 级联扫为 interrupted，防永久 Running 行残留并落盘（O3）。
+                    Subagents = SubagentSweep.Finalize(task.Subagents),
                     Capabilities = [],
                     PromptQueued = false,
                 };
@@ -1169,6 +1294,7 @@ public static class OpenCodeEventReducer
                 {
                     Lifecycle = task.IsTerminal ? task.Lifecycle : AgentLifecycle.Offline,
                     Activity = null,
+                    Subagents = SubagentSweep.Finalize(task.Subagents),
                     Capabilities = [],
                     PromptQueued = false,
                 };
@@ -1256,7 +1382,8 @@ public static class OpenCodeEventReducer
                     Capabilities = [],
                 }, Clamp(step, 220));
             default:
-                return Idle(task, now);
+                // 未知状态类型一律忽略，避免未来 opencode 新增类型被误判为回合结束（O4）。
+                return task;
         }
     }
 
@@ -1540,9 +1667,7 @@ public static class OpenCodeEventReducer
     {
         var input = state is { } value ? Child(value, "input") : null;
         var command = input is { } arguments ? Text(arguments, "command") : null;
-        return command is not null &&
-               (command.Contains("test", StringComparison.OrdinalIgnoreCase) ||
-                command.Contains("gradle", StringComparison.OrdinalIgnoreCase));
+        return ShellTestRun.Matches(command);
     }
 
     private static string? LatestStep(string? tool, JsonElement? state)

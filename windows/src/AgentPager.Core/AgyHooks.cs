@@ -20,13 +20,8 @@ public sealed record AgyHookPayload(
     [property: JsonPropertyName("artifactDirectoryPath")] string? ArtifactDirectoryPath = null,
     [property: JsonPropertyName("modelName")] string? ModelName = null,
     [property: JsonPropertyName("toolCall")] AgyToolCall? ToolCall = null,
-    [property: JsonPropertyName("stepIdx")] int? StepIdx = null,
-    [property: JsonPropertyName("invocationNum")] int? InvocationNum = null,
-    [property: JsonPropertyName("initialNumSteps")] int? InitialNumSteps = null,
-    [property: JsonPropertyName("executionNum")] int? ExecutionNum = null,
     [property: JsonPropertyName("terminationReason")] string? TerminationReason = null,
-    [property: JsonPropertyName("error")] string? Error = null,
-    [property: JsonPropertyName("fullyIdle")] bool? FullyIdle = null)
+    [property: JsonPropertyName("error")] string? Error = null)
 {
     [JsonIgnore]
     public string EffectiveEvent => Event ?? HookEventName ?? "Unknown";
@@ -323,11 +318,13 @@ public static class AgyEventReducer
             ModelName = FormatModelName(hook.ModelName) ?? task.ModelName,
         };
 
-        // 从转录本中提取最新的 Prompt、正文预览与 Token 用量（严格不自造标题覆盖 Title）
+        // 从转录本中提取最新的 Prompt、正文预览与 Token 用量（严格不自造标题覆盖 Title）。
+        // 按事件门控（A5）：仅 PreInvocation / PostInvocation / Stop 需要，工具事件跳过整段 256KB 读取。
         string? userPrompt = null;
         string? latestResponse = null;
         TokenUsage? tokens = null;
-        if (!string.IsNullOrWhiteSpace(hook.TranscriptPath))
+        if (hook.EffectiveEvent is "PreInvocation" or "PostInvocation" or "Stop" &&
+            !string.IsNullOrWhiteSpace(hook.TranscriptPath))
         {
             (userPrompt, latestResponse, tokens) = AgyTranscriptReader.ExtractLatest(hook.TranscriptPath);
             if (userPrompt is not null && !task.PromptQueued)
@@ -360,18 +357,14 @@ public static class AgyEventReducer
         }
 
         // 检查是否有排队中的新 Prompt（在当前回合启动之后用户新提交的输入）
-        if (task.Lifecycle == AgentLifecycle.Running && hook.EffectiveEvent != "PreInvocation")
+        if (hook.EffectiveEvent != "PreInvocation" &&
+            DetectQueuedPrompt(sessionID, task) is { } queued)
         {
-            var (queuedPrompt, queuedAt) = AgyHistoryReader.ExtractLatestPrompt(sessionID);
-            if (queuedPrompt is not null && queuedAt is not null && queuedAt.Value > task.StartedAt &&
-                queuedPrompt != task.UserPrompt)
+            task = task with
             {
-                task = task with
-                {
-                    UserPrompt = queuedPrompt,
-                    PromptQueued = true,
-                };
-            }
+                UserPrompt = queued.Prompt,
+                PromptQueued = true,
+            };
         }
 
         switch (hook.EffectiveEvent)
@@ -415,13 +408,13 @@ public static class AgyEventReducer
 
                 if (toolName.Equals("invoke_subagent", StringComparison.OrdinalIgnoreCase))
                 {
-                    var subagents = UpdateSubagents(hook.ToolCall?.Args, task.Subagents, now);
+                    // 子代理行只认真实子会话（其 PreInvocation 钩子到达时经父级路由建立，A1：
+                    // 哈希占位轨已移除；遗留占位的前缀清理仍保留在 ApplyAgySubagent / PruneAgyGhostTasks）。
                     var step = FormatToolStep(toolName, hook.ToolCall?.Args, hook.Cwd) ?? "派生子代理";
                     return WithStep(task with
                     {
                         Lifecycle = AgentLifecycle.Running,
                         Activity = AgentActivity.Delegating,
-                        Subagents = subagents,
                         CompletedAt = null,
                         Capabilities = [],
                     }, step);
@@ -539,6 +532,26 @@ public static class AgyEventReducer
             default:
                 return task;
         }
+    }
+
+    /// <summary>排队 prompt 检测（事件侧与 Maintain 心跳共用，A3）：运行中且 history.jsonl
+    /// 出现晚于本轮起点的新 prompt 时返回该 prompt。</summary>
+    public static (string Prompt, DateTimeOffset Timestamp)? DetectQueuedPrompt(string sessionID, TaskSnapshot task)
+    {
+        if (task.Lifecycle != AgentLifecycle.Running) return null;
+        var (prompt, timestamp) = AgyHistoryReader.ExtractLatestPrompt(sessionID);
+        if (prompt is null || timestamp is null) return null;
+        if (timestamp.Value <= task.StartedAt || prompt == task.UserPrompt) return null;
+        return (prompt, timestamp.Value);
+    }
+
+    /// <summary>Stop 终稿落盘竞速补救（条目 1）：重读转录本，有纯文本终稿时经回显守卫补写第三行；
+    /// 暂无则返回 null（由调用方保留登记、下个心跳再试）。</summary>
+    public static TaskSnapshot? TryApplyLatePreview(TaskSnapshot task, string transcriptPath)
+    {
+        var (_, preview, _) = AgyTranscriptReader.ExtractLatest(transcriptPath);
+        if (preview is null) return null;
+        return WithStep(task, preview);
     }
 
     public static string? QuestionText(JsonElement? args)
@@ -680,15 +693,9 @@ public static class AgyEventReducer
 
         if (lower is "run_command")
         {
-            if (args is { ValueKind: JsonValueKind.Object } val &&
-                val.TryGetProperty("CommandLine", out var cmd) &&
-                cmd.GetString() is { Length: > 0 } commandLine)
-            {
-                var cmdLower = commandLine.ToLowerInvariant();
-                if (cmdLower.Contains("test") || cmdLower.Contains("jest") || cmdLower.Contains("vitest") || cmdLower.Contains("pytest"))
-                    return AgentActivity.Testing;
-            }
-            return AgentActivity.Executing;
+            var commandLine = args is { ValueKind: JsonValueKind.Object } val &&
+                              val.TryGetProperty("CommandLine", out var cmd) ? cmd.GetString() : null;
+            return ShellTestRun.Matches(commandLine) ? AgentActivity.Testing : AgentActivity.Executing;
         }
 
         if (lower is "invoke_subagent" or "send_message" or "manage_subagents")
@@ -720,44 +727,6 @@ public static class AgyEventReducer
 
         var clamped = candidate.Length > 220 ? candidate[..220] : candidate;
         return task with { LatestStep = clamped };
-    }
-
-    private static List<SubagentSnapshot> UpdateSubagents(JsonElement? args, List<SubagentSnapshot> current, DateTimeOffset now)
-    {
-        if (args is not { ValueKind: JsonValueKind.Object } value ||
-            !value.TryGetProperty("Subagents", out var subagentsArr) ||
-            subagentsArr.ValueKind != JsonValueKind.Array)
-            return current;
-
-        var list = new List<SubagentSnapshot>(current);
-        foreach (var subNode in subagentsArr.EnumerateArray())
-        {
-            if (subNode.ValueKind != JsonValueKind.Object) continue;
-            var role = subNode.TryGetProperty("Role", out var r) ? r.GetString() : "子代理";
-            var typeName = subNode.TryGetProperty("TypeName", out var t) ? t.GetString() : "agent";
-            var id = $"{typeName}-{Math.Abs((role ?? "").GetHashCode())}";
-            var prompt = subNode.TryGetProperty("Prompt", out var p) ? p.GetString() : null;
-
-            // 若列表中已存在真实 UUID 的该类型子代理（且未终态），不重复添加临时占位项
-            if (list.Any(s => s.Path == $"/{typeName}" && !s.Id.StartsWith($"{typeName}-", StringComparison.OrdinalIgnoreCase) && !s.IsTerminal))
-                continue;
-
-            var existingIndex = list.FindIndex(s => s.Id == id);
-            var snapshot = new SubagentSnapshot(
-                id,
-                $"/{typeName}",
-                role ?? typeName ?? "子代理",
-                AgentLifecycle.Running,
-                AgentActivity.Delegating,
-                NormalizeText(prompt),
-                null,
-                now,
-                now);
-
-            if (existingIndex >= 0) list[existingIndex] = snapshot;
-            else list.Add(snapshot);
-        }
-        return list;
     }
 
     private static string? FormatModelName(string? modelName)
