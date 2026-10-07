@@ -25,9 +25,9 @@
 | # | opencode 事件 / 钩子 | 触发时机 | Lifecycle | Activity | 附带字段与请求 | 备注 |
 |---|---|---|---|---|---|---|
 | 1 | `session.created` | 会话建立 | `idle` | 无 | ProjectName/StartedAt（`info.directory`、`info.time.created`） | 新建任务；不置 Starting，避免空会话误报 |
-| 2 | `chat.message`（合成） | 用户提交 prompt | `running` | `thinking` | UserPrompt；`queued` 标记（提交时会话仍在跑 = 排队）；本轮计时起点（仅上一状态为 idle/offline/succeeded/interrupted 时重置 StartedAt=now，轮内插入不重置）；不动第三行 | 清除 CompletedAt/挂起请求；不产生标题 |
+| 2 | `chat.message`（合成） | 用户提交 prompt | `running` | `thinking` | UserPrompt；`queued` 标记（提交时会话仍在跑 = 排队）；本轮计时起点（仅上一状态为 idle/offline/succeeded/interrupted 时重置 StartedAt=now，轮内插入不重置）；新一轮清空第三行（轮内插入不清，lifecycle 文案兜底） | 清除 CompletedAt/挂起请求；不产生标题 |
 | 3 | `session.status` `busy` | 回合开始/继续 | `running` | 保持现值（空则 `thinking`） | — | 不动第三行（避免盖掉正文预览） |
-| 4 | `session.status` `retry` | 上游重试 | `running` | `thinking` | LatestStep=`retry <attempt>: <message>` | 重试耗尽会转为 `session.error` |
+| 4 | `session.status` `retry` | 上游重试 | `running` | `thinking` | LatestStep=`重试 #<attempt>: <message>`（message 缺失时=`重试中`；`TaskCatalog.cs:945`） | 重试耗尽会转为 `session.error` |
 | 5 | `session.status` `idle` / `session.idle` | 回合结束 | `succeeded`（当前为 `interrupted` 时保持 `interrupted`） | 清空 | CompletedAt=now、IsUnread=true | 两者的去重/收敛规则相同，等价处理 |
 | 6 | `session.error` | 回合异常/中止 | `interrupted` | 清空 | CompletedAt=now、IsUnread=true、LatestStep=错误摘要 | 中止（MessageAbortedError）同映射；随后到达的 `idle` 被第 5 条守卫拦下 |
 | 7 | `message.updated`（assistant 且带 `error`） | 助手消息失败 | `interrupted` | 同上 | 同上 | 与 6 等价（双保险），仅在终态换算去重 |
@@ -40,7 +40,7 @@
 | 14 | `permission.replied` reply=`reject` | 权限被拒 | `interrupted` | 清空 | CompletedAt=now、IsUnread=true、移除请求 | 与 Claude PermissionDenied 语义对齐 |
 | 15 | `question.asked` | 等待用户回答 | `waitingAnswer` | `thinking` | PendingRequest(question, 卡片摘要=问题全文 `question ?? header`)、第三行=header ?? question、options=各问题选项 label（协议携带，app 暂不渲染）、Capabilities=∅ | 只在 TUI 可作答；手机为只读展示 |
 | 16 | `question.replied` | 已回答 | `running` | `thinking` | 移除挂起请求 | — |
-| 21 | `reply`（合成，assistant 正文流） | 模型写回复 | 不变 | 不变 | LatestStep=正文预览（≤120 字单行截断；回显整段 prompt 时被守卫丢弃） | 插件节流：首包 + 结束帧 + ≥300ms 增量；不做生命周期迁移 |
+| 21 | `reply`（合成，assistant 正文流） | 模型写回复 | 不变 | 不变 | LatestStep=正文预览（≤120 字单行截断；回显整段 prompt 时被守卫丢弃） | 插件节流：首包 + 结束帧 + ≥300ms 增量；不做生命周期迁移；工具活动期间整条忽略（乱序守卫，见上） |
 | 22 | `prompt.active`（合成） | 排队的 prompt 被接单（新 assistant 消息开始生成） | 不变 | 不变 | PromptQueued=false | 排队窗口结束 |
 | 17 | `question.rejected` | 问题被放弃 | `interrupted` | 清空 | CompletedAt=now、IsUnread=true、移除请求 | 工具以 RejectedError 结束 |
 | 18 | `session.updated`（标题变化） | 自动生成摘要标题 | 不变 | 不变 | Title=`项目 · <标题>`（默认名 `New session - *` 时忽略） | 其余 updated（touch）只透传忽略 |
@@ -49,7 +49,7 @@
 
 不在上表的事件一律忽略（`todo.updated`、`session.compacted`、`file.edited`、`tui.*`、`installation.*`、`lsp.*`、`server.connected` 等）。
 
-> **通用竞态守卫**：`WaitingApproval` / `WaitingAnswer` 期间，工具 part 更新一律忽略（实测 opencode 会在 `question.asked` / `permission.asked` 之后补发该工具 part 的 running/标题更新，不拦会把等待状态压回 running 并清掉挂起卡片）。
+> **通用竞态守卫**（乱序防御，bridge v15 起）：① `WaitingApproval` / `WaitingAnswer` 期间，工具 part 更新一律忽略（实测 opencode 会在 `question.asked` / `permission.asked` 之后补发该工具 part 的 running/标题更新，不拦会把等待状态压回 running 并清掉挂起卡片）；② `Succeeded` / `Interrupted` / `Offline` 终态后，迟到的工具 part 一律忽略（不得把已完成任务复活回 running）；③ 工具活动期间（activity 非空且非 `thinking`），`reply` 整条忽略（实测乱序：正文结束帧可能晚于工具 part 约 200ms，不拦会把刚写入的命令/工具步骤盖回上一段正文）。
 
 ### 子代理映射（child session → SubagentSnapshot）
 
@@ -58,7 +58,7 @@
 | 子会话事件 | subagent phase | 效果 |
 |---|---|---|
 | `session.created`（带 parentID） | `started` | 新建 SubagentSnapshot：名字与路径取自标题里的 `(@agent subagent)`，状态 Running / activity delegating |
-| 工具 part（pending/running/completed/error） | `tool` | activity=工具活动映射，LatestStep=工具步骤（标题优先；回显整段用户 prompt 时丢弃；与主任务同款 part 去重） |
+| 工具 part（pending/running/completed/error） | `tool` | activity=工具活动映射，LatestStep=工具步骤（与主任务同规则：统一 `工具名 内容` 前缀，标题优先；回显整段用户 prompt 时丢弃；与主任务同款 part 去重） |
 | assistant `message.updated` 完成 | `tokens` | TokenUsage 跟随该子会话最新一条完成消息 |
 | `session.idle` / `session.status idle` | `done` | Succeeded（终态的 subagent 行约 4 秒后从列表淡出） |
 | `session.error` | `failed` | Interrupted + `✗ 错误摘要` |
@@ -96,7 +96,7 @@
 | `ProjectName` | `info.directory` 的叶子目录名；空则 `opencode` |
 | `Title` | 只取 opencode 的 session title，`session.created`/`session.updated` 实时同步：`项目名 · <info.title>`；默认名（`New session - `/`Child session - ` + ISO，与 `Session.isDefaultTitle` 同规则）忽略；无真实标题时显示项目名。不从 prompt 自造标题 |
 | `UserPrompt` | `chat.message` 文本部分（过滤 `synthetic`）拼接，截 1000 字 |
-| `LatestStep` | 第三行=二态：**工具**=tool `state.title` 或 `工具名 <输入摘要>`（运行中与完成时都显示，粘滞到下一条正文/工具；白名单键 command/description/filePath/path/pattern/query/url/subagent_type/agent/skill，不含 prompt）；**回复**=正文预览（≤120 字单行截断，回合结束保留）。无“思考”占位（`busy` 等不写第三行，避免盖掉正文预览）。截 220 字。**守卫：候选与当前 UserPrompt 相同或整段包含它（≥4 字）时丢弃、保留上一值——第三行永不重复用户 prompt** |
+| `LatestStep` | 第三行=二态：**工具**=统一 `工具显示名 内容` 前缀（`Edit src/App.kt`、`Write .gitignore`、`Bash git log`、`Read src/x.ts`、`Grep TODO`…；命令类工具同样带工具名、不再裸命令；标题已含工具名时不重复。格式化函数 `ToolStep.Compose` 同时供 Codex/Claude 行使用）。内容取 tool `state.title` 或输入摘要白名单（command/description/filePath/path/pattern/query/url/subagent_type/agent/skill，不含 prompt），运行中与完成时都显示，粘滞到下一条正文/工具、**新一轮开聊时清空**（轮内插入不清，由 lifecycle 文案兜底）；**回复**=正文预览（≤120 字单行截断，回合结束保留）。无“思考”占位（`busy` 等不写第三行，避免盖掉正文预览）。截 220 字。**守卫：候选与当前 UserPrompt 相同或整段包含它（≥4 字）时丢弃、保留上一值——第三行永不重复用户 prompt** |
 | `TokenUsage` | assistant `tokens`：`input`→Input、`cache.read`→CachedInput、`output`→Output、`reasoning`→ReasoningOutput、`total`→Total（缺省时求和）。每条完成的助手消息直接覆盖为最新值（不取最大值）——永远跟随最新消息，上下文压缩后如实回落 |
 | `Subagents` | opencode 子会话映射（见第二节末「子代理映射」）：名字=子会话标题里的 `(@agent subagent)` 解析、状态=子会话生命周期、步骤=子会话工具 part、token=子会话 assistant 用量 |
 | `StartedAt` | 本轮计时起点：一轮的第一个 prompt 到达时置为接收时间；轮内插入 prompt 不重置；`idle`/`error`/拒绝后由 CompletedAt 冻结为本轮耗时；下一轮 prompt 重新从 0 开始。首轮之前由 `session.created` 的 `info.time.created`（毫秒）初始化 |
@@ -126,10 +126,70 @@
 1. 启动 Bridge（新构建），托盘/窗口确认「OPENCODE 已写入」。
 2. 打开 opencode（TUI）→ 手机出现「项目 · 空闲」行。
 3. 发一条 prompt → 变「正在运行」，总耗时从 0 开始计，标题保持项目名；opencode 生成 session title 后（约数秒）实时变为「项目名 · 生成标题」。
-4. 触发工具 → 第三行变为工具步骤（标题/摘要）并粘滞显示；模型写回复后第三行滚动显示正文预览。
+4. 触发工具 → 第三行变为「工具名 内容」（如 `Edit src/x.kt`、`Bash git status`、`Read src/x.ts`）并粘滞显示；模型写回复后第三行滚动显示正文预览。
 5. 模型写回复 → 第三行滚动显示正文预览（单行截断）；回合结束 → 「任务完成」+ 提示音，预览保留，总耗时冻结为本轮时长；点开任务行看 TOKEN 明细（一直可点）；下一轮 prompt 计时重新从 0 计。
 6. `Esc` 中断 → 「已中断」。
 7. 触发权限询问（如 write/bash 需要批准）→ 「等待批准」置顶，展示 `permission · pattern`；在 TUI 里放行后回到运行。
 8. 关闭 opencode → 任务变「离线」。
 9. 子代理（task 工具）→ 父任务显示「正在协作」，展开区出现子代理行（名字/状态/耗时/最新步骤/token），完成后约 4 秒淡出。
 10. 任务运行中再发一条 prompt → 第二行显示「你（排队中）：…」；该条被接单（新的 assistant 消息开始生成）后标记消失。
+
+## 八、三层映射总表（像素图 ↔ TaskSnapshot ↔ opencode）
+
+> **性质：代码现状快照，不是设计稿。** 本章记录的是提交 `82c8fa6` 时点的实际代码行为（逐条读码校订），不是设计意图；像素动画名是对 `PixelMotionEngine`（`android/app/src/main/java/com/agentgrid/mobile/render/PixelMotionEngine.kt:181-433`）各代码分支的直观描述，如有出入以源码为准。
+
+### 链路
+
+```
+opencode 事件 ──插件(TCP 49361)──► TaskSnapshot(Lifecycle + Activity + LatestStep) ──wire──► app 任务行 ──► 像素图(3×3 九格)
+```
+
+- 像素图输入 = `PixelRenderState(lifecycle, activity, revision)`（`AgentGridScreen.kt:602`）。`revision` 只对内置模拟器任务生效（:606）；真实任务的重播只来自 lifecycle/activity 真实变化（`PixelRenderState.kt:12`）。
+- 帧率/辉光：`waitingApproval` / `waitingAnswer` / `succeeded` 前 1.2s 额外辉光（`PixelMotionEngine.kt:117`）；idle/offline 30fps，succeeded/interrupted 落定 1.2s 后停帧（:91）。
+- 像素引擎对 `waitingApproval` / `waitingAnswer` **只用 lifecycle 分支**，这两个状态下写入的 activity（executing/thinking）不参与渲染（`PixelMotionEngine.kt:234/252` 不读 activity）。
+
+### 主表（事件 → 字段 → 像素图）
+
+| opencode 实际事件/状态 | Lifecycle | Activity | 第三行 lastStep | 像素图动画 |
+|---|---|---|---|---|
+| `session.created` | idle | — | — | 中心慢呼吸（十字微光） |
+| `chat.message`（提交 prompt） | running | thinking | 新一轮清空（轮内插入不清） | 四角轮流+中心脉动 |
+| `session.status busy` | running | 保持现值（空→thinking） | 不动（防盖预览） | 保持当前 |
+| `session.status retry` | running | thinking | `重试 #n: message`（缺省「重试中」） | 四角轮流 |
+| 工具 pending/running | running | 工具映射（见第三节） | 「工具名 内容」粘滞 | 对应工具动画 |
+| 工具 completed | running | thinking | 「工具名 内容」粘滞（不变） | 四角轮流 |
+| 工具 error | running（interrupted 被 `TaskCatalog.cs:1026` 提前拦下，保持） | thinking | `✗ 错误首行` | 四角轮流 |
+| `reply`（正文流） | 不变（waiting / 工具活动期间整条忽略，:829） | 不变 | 正文预览 ≤120 字 | 保持当前（通常=四角轮流） |
+| `session.status idle` / `session.idle` | succeeded（interrupted 保持，:960） | 清空 | 预览保留 | 爆闪+打勾（1.2s 后定格） |
+| `session.error` | interrupted | 清空 | 错误摘要 | 闪断→沉降为断口（落定定格） |
+| `permission.asked` | waitingApproval | executing | — | 双拍心跳+中心冲击（强辉光） |
+| `permission.replied` once/always | running | thinking | — | 四角轮流 |
+| `permission.replied` reject | interrupted | 清空 | — | 闪断 |
+| `question.asked` | waitingAnswer | thinking | 问题全文 | 中行三点省略号（强辉光） |
+| `question.replied` | running | thinking | — | 四角轮流 |
+| `question.rejected` | interrupted | 清空 | — | 闪断 |
+| 子代理事件（改父任务） | 不变 | 父 running 时：任一子代理未终态→delegating，全终态→thinking；否则保持 | — | 分支脉冲 / 回落四角轮流 |
+| `session.deleted` / `plugin.dispose` | offline（终态保持） | 清空 | — | 暗十字间歇双闪 |
+| 排队 prompt（`chat.message` queued） | running | thinking | 第二行「你（排队中）」（第三行不动） | 四角轮流 |
+| `prompt.active` | 不变 | 不变 | — | 不变 |
+
+> 第三行工具步骤统一 `<工具显示名> <内容>`（`Edit/Write/Bash/Read/Grep/Glob/Task/WebFetch/…`）：改代码=`Edit <路径>`、命令=`Bash <命令>`；标题已含工具名时不重复。
+
+### 工具 → Activity → 像素图（RUNNING 细分）
+
+| 工具（按第三节规则命中） | Activity | 像素图动画 |
+|---|---|---|
+| read / list / skill / lsp | reading | 横向扫描线（自上而下掠过） |
+| glob / grep / `*search*` | searching | 外圈 8 格跑马灯 |
+| edit / write / patch | editing | 横向书写波 + 中列光标闪 |
+| bash 命中 test/pytest/… | testing | 斜向扫线 + 末尾判定脉冲 |
+| bash 其余 / 未知 / MCP | executing | 竖直流光柱（逐格下落） |
+| webfetch / websearch | browsing | 翻页带自上而下 |
+| task | delegating | 中心脉冲 + 外圈分支扩散 |
+| todowrite / question / null | thinking | 四角轮流 + 中心脉动 |
+
+### 三个易误认为「设计」的代码事实
+
+1. `session.created` 直接落 `idle`（`TaskCatalog.cs:789`）——opencode 源**永不出现 `starting`**（螺旋点燃动画只被模拟器等来源使用）。
+2. `waitingApproval` / `waitingAnswer` 的像素动画由 lifecycle 决定，activity 只写入不渲染；`reply` 流同样不改 activity，因此模型写回复时像素通常停留在 thinking 动画。
+3. 同一 lifecycle+activity 的连续事件**不重播动画**（真实任务 revision 恒 0）；重播只发生在状态真实迁移时（模拟器除外，见 `AgentGridScreen.kt:606`）。

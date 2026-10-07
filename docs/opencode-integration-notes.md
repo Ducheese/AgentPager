@@ -69,6 +69,7 @@
 5. **Windows 上运行中的 exe 不可覆盖**：所以 bridge 每次构建到新的 `vN` 文件夹，交付时明确说"启动哪个新路径"。
 6. **"你别改"教训**：用户问"对不对 / 为什么"时只是信息交流，代码一个字都不要动；拿不准就先问，宁可慢半拍。
 7. **2026-10-06 等待态被工具 part 压回（实测竞态）**：`question.asked` 正确推送 waitingAnswer + 卡片后，8ms 内又被该工具补发的 part running 更新压回 running（并把挂起请求清掉）。修复：WaitingApproval / WaitingAnswer 期间忽略工具 part 更新（bridge v11）。诊断手法：WS 行车记录仪（watch-git.mjs）+ DB part 序列双证。
+8. **2026-10-07 工具执行期第三行被迟到正文盖回（实测乱序 ~200ms）**：`message.part.updated`（工具 running，+9ms）与正文结束帧（→ reply，+198ms）在插件侧到达顺序与语义相反——命令开始 9ms 就写对了第三行，198ms 后被上一段正文盖回，整个构建期显示旧正文，直到 completed 事件恢复。修复（bridge v15）：工具活动期间（activity 非空且非 thinking）整条忽略 `reply`；同时把工具 part 的忽略守卫扩到终态（Succeeded/Offline），防迟到 part 复活已完成任务。诊断手法：行车记录仪三连快照 + `ap-git-watch.log` 时间线（+9ms / +198ms / +12.2s），一次抓全。
 
 ## 六、一句话的验收模板（交付时照抄）
 

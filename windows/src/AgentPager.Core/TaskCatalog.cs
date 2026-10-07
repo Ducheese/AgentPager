@@ -397,6 +397,51 @@ public sealed class TaskCatalog
         left is not null && left > right ? left.Value : right;
 }
 
+/// <summary>第三行工具步骤的统一显示：`工具名 内容`；命令类工具同样带工具名，内容已带工具名时不重复。</summary>
+internal static class ToolStep
+{
+    public static string? Compose(string? toolName, string? detail)
+    {
+        var tool = Normalize(toolName);
+        var text = Normalize(detail);
+        if (tool is null) return text is null ? null : Clamp(text);
+        var label = Label(tool);
+        if (text is null) return Clamp(label);
+        if (text.Equals(label, StringComparison.OrdinalIgnoreCase) ||
+            text.StartsWith(label + " ", StringComparison.OrdinalIgnoreCase))
+            return Clamp(text);
+        return Clamp($"{label} {text}");
+    }
+
+    public static string Label(string toolName) => toolName.Split('.').Last().ToLowerInvariant() switch
+    {
+        "bash" or "shell" or "exec" or "exec_command" or "terminal_interaction" => "Bash",
+        "apply_patch" or "patch" => "Patch",
+        "edit" => "Edit",
+        "write" => "Write",
+        "read" or "read_file" or "view" => "Read",
+        "glob" => "Glob",
+        "grep" => "Grep",
+        "task" => "Task",
+        "webfetch" => "WebFetch",
+        "websearch" => "WebSearch",
+        "todowrite" or "todoread" or "todo" => "Todo",
+        "skill" => "Skill",
+        "lsp" => "LSP",
+        "question" => "Question",
+        _ => toolName,
+    };
+
+    private static string? Normalize(string? value)
+    {
+        if (value is null) return null;
+        var result = string.Join(' ', value.Replace('\n', ' ').Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+        return result.Length == 0 ? null : result;
+    }
+
+    private static string Clamp(string value) => value.Length > 220 ? value[..220] : value;
+}
+
 public static class CodexEventReducer
 {
     public static TaskSnapshot Reduce(CodexHookPayload hook, TaskSnapshot? existing, DateTimeOffset now)
@@ -458,21 +503,8 @@ public static class CodexEventReducer
         return normalized is null ? projectName : $"{projectName} · {normalized[..Math.Min(34, normalized.Length)]}";
     }
 
-    public static string? LatestStep(string? toolName, string? summary)
-    {
-        var tool = Normalize(toolName);
-        var detail = Normalize(summary);
-        if (tool is not null && IsCommandTool(tool))
-            return detail is null ? null : detail[..Math.Min(220, detail.Length)];
-        var value = (tool, detail) switch
-        {
-            (not null, not null) => $"{tool} {detail}",
-            (not null, null) => tool,
-            (null, not null) => detail,
-            _ => null,
-        };
-        return value is null ? null : value[..Math.Min(220, value.Length)];
-    }
+    public static string? LatestStep(string? toolName, string? summary) =>
+        ToolStep.Compose(toolName, summary);
 
     public static AgentActivity ActivityFor(string? toolName)
     {
@@ -507,10 +539,6 @@ public static class CodexEventReducer
             .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
         return result.Length == 0 ? null : result;
     }
-
-    private static bool IsCommandTool(string value) =>
-        new[] { "exec", "exec_command", "terminal_interaction", "bash", "shell", "apply_patch" }
-            .Contains(value.Split('.').Last().ToLowerInvariant());
 }
 
 public static class ClaudeEventReducer
@@ -799,6 +827,9 @@ public static class OpenCodeEventReducer
                 // 正文预览（插件从 assistant text part 节流转发）：只更新第三行，不动生命周期；
                 // 等待用户输入期间忽略（迟到正文不盖掉问题/批准卡片的标题）。
                 if (task.Lifecycle is AgentLifecycle.WaitingApproval or AgentLifecycle.WaitingAnswer) return task;
+                // 工具活动期间忽略：正文结束帧可能晚于工具 part 约 200ms（实测乱序），
+                // 不拦会把刚写入的命令/工具步骤盖回上一段正文。
+                if (task.Activity is not null and not AgentActivity.Thinking) return task;
                 return Text(hook.Properties, "text") is { } preview ? WithStep(task, Clamp(preview, 220)) : task;
             case "permission.asked":
                 return task with
@@ -988,10 +1019,12 @@ public static class OpenCodeEventReducer
         var tool = Text(item, "tool");
         var step = LatestStep(tool, state);
 
-        // 等待用户输入（批准/回答）期间忽略工具 part 更新：opencode 存在
-        // question.asked / permission.asked 之后工具 part 才补发 running/标题的竞态，
-        // 不拦会把 waiting 状态压回 running 并清掉挂起请求。
-        if (task.Lifecycle is AgentLifecycle.Interrupted or AgentLifecycle.WaitingApproval or AgentLifecycle.WaitingAnswer)
+        // 终态/等待态忽略工具 part 更新：
+        // - Interrupted/Waiting*：question.asked / permission.asked 之后工具 part 补发 running 的竞态，
+        //   不拦会把 waiting 状态压回 running 并清掉挂起请求；
+        // - Succeeded/Offline：回合末尾迟到的 part 不得把已完成任务复活回 running。
+        if (task.Lifecycle is AgentLifecycle.Interrupted or AgentLifecycle.Succeeded or AgentLifecycle.Offline
+            or AgentLifecycle.WaitingApproval or AgentLifecycle.WaitingAnswer)
             return task;
 
         switch (status)
@@ -1063,9 +1096,14 @@ public static class OpenCodeEventReducer
                 subagent = subagent with { Lifecycle = AgentLifecycle.Running };
                 break;
             case "tool":
-                var step = Text(value, "step");
+                var tool = Text(value, "tool");
+                var rawError = Text(value, "error");
+                var toolTitle = Text(value, "title");
+                var step = rawError is not null ? $"✗ {rawError}"
+                    : toolTitle is not null ? ToolStep.Compose(tool, toolTitle)
+                    : Text(value, "step");
                 if (step is not null && !EchoesPrompt(task, step)) subagent = subagent with { LatestStep = Clamp(step, 220) };
-                subagent = subagent with { Lifecycle = AgentLifecycle.Running, Activity = ActivityFor(Text(value, "tool"), null) };
+                subagent = subagent with { Lifecycle = AgentLifecycle.Running, Activity = ActivityFor(tool, null) };
                 break;
             case "tokens":
                 if (TokenUsageFrom(value) is { } usage) subagent = subagent with { TokenUsage = usage };
@@ -1134,6 +1172,8 @@ public static class OpenCodeEventReducer
             Activity = AgentActivity.Thinking,
             UserPrompt = normalized ?? task.UserPrompt,
             StartedAt = startsTurn ? now : task.StartedAt,
+            // 新一轮开始时清空第三行，让 lifecycle 文案兜底；轮内插入不清。
+            LatestStep = startsTurn ? null : task.LatestStep,
             CompletedAt = null,
             Capabilities = [],
         };
@@ -1202,14 +1242,8 @@ public static class OpenCodeEventReducer
 
     private static string? LatestStep(string? tool, JsonElement? state)
     {
-        if (state is { } value)
-        {
-            var title = Text(value, "title");
-            if (title is not null) return Clamp(title, 220);
-            var summary = SummarizeInput(value);
-            if (summary is not null) return Clamp(tool is null ? summary : $"{tool} {summary}", 220);
-        }
-        return tool is null ? null : Clamp(tool, 220);
+        var detail = state is { } value ? Text(value, "title") ?? SummarizeInput(value) : null;
+        return ToolStep.Compose(tool, detail);
     }
 
     private static string? SummarizeInput(JsonElement state)
