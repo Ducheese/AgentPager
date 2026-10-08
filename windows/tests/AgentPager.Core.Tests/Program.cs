@@ -546,6 +546,768 @@ Check(agyPreview2 is null, "agy: preview suppressed when latest step has tool ca
 Check(agyTokens2 is { Input: 10, Output: 5 }, "agy: tokens from tool-call planner");
 File.Delete(agyTp2);
 
+// ===================== 19. Claude Code 断言 =====================
+static ClaudeHookPayload C(string evt, object props)
+{
+    var node = JsonSerializer.SerializeToNode(props)!.AsObject();
+    node["hook_event_name"] = evt;
+    if (node["session_id"] is null) node["session_id"] = "claude_1";
+    if (node["cwd"] is null) node["cwd"] = @"F:\Git\demo";
+    return JsonSerializer.Deserialize<ClaudeHookPayload>(node.ToJsonString(), WireJson.Options)!;
+}
+
+static ClaudeTranscriptSnapshot ReadTranscript(string[] lines)
+{
+    var path = Path.Combine(Path.GetTempPath(), "ap-verify-claude-" + Guid.NewGuid().ToString("N") + ".jsonl");
+    File.WriteAllLines(path, lines);
+    try { return ClaudeTranscriptReader.Read(path); }
+    finally { File.Delete(path); }
+}
+
+// ---- 标题：只取会话真实标题，绝不从 prompt 自造（G1）----
+var claudeNow = DateTimeOffset.UtcNow;
+var claude = new TaskCatalog();
+claude.Accept(C("SessionStart", new { source = "startup" }), claudeNow);
+TaskSnapshot Claude() => claude.Projection().Tasks.First(t => t.Id == "claude_1");
+
+Check(Claude().Lifecycle == AgentLifecycle.Idle, $"claude: session start -> idle (never starting) (got {Claude().Lifecycle})");
+Check(Claude().Title == "demo", $"claude: title starts as project name (got '{Claude().Title}')");
+
+claude.Accept(C("UserPromptSubmit", new { prompt = "  帮我看看   那个登录问题  " }), claudeNow.AddSeconds(1));
+Check(Claude().Lifecycle == AgentLifecycle.Running && Claude().Activity == AgentActivity.Thinking, "claude: prompt -> running/thinking");
+Check(Claude().UserPrompt == "帮我看看 那个登录问题", $"claude: prompt normalized (got '{Claude().UserPrompt}')");
+Check(Claude().StartedAt == claudeNow.AddSeconds(1), "claude: first prompt starts this turn's timer");
+Check(Claude().Title == "demo", $"claude: title still project name, never derived from prompt (got '{Claude().Title}')");
+
+var claudeSnapshot = ReadTranscript(
+[
+    "{\"type\":\"user\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":\"帮我看看那个登录问题\"}}",
+    "{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"已修复登录流程\"}],\"usage\":{\"input_tokens\":150,\"cache_read_input_tokens\":30,\"output_tokens\":40,\"output_tokens_details\":{\"thinking_tokens\":5}},\"model\":\"deepseek/deepseek-v4.1-flash\"}}",
+    "{\"type\":\"ai-title\",\"aiTitle\":\"修复登录流程\"}",
+]);
+Check(claudeSnapshot.Title == "修复登录流程", $"claude: ai-title from transcript (got '{claudeSnapshot.Title}')");
+Check(claudeSnapshot.Tokens is { Input: 150, CachedInput: 30, Output: 40, ReasoningOutput: 5, Total: 220 }, "claude: token usage mapped from message.usage");
+Check(claudeSnapshot.Model == "deepseek-v4.1-flash", $"claude: model label takes last segment (got '{claudeSnapshot.Model}')");
+Check(claudeSnapshot.LatestReply == "已修复登录流程", $"claude: reply preview from transcript (got '{claudeSnapshot.LatestReply}')");
+
+var titled = ClaudeEventReducer.ApplyTranscript(Claude(), claudeSnapshot);
+Check(titled.Title == "demo · 修复登录流程", $"claude: title composed as project · title (got '{titled.Title}')");
+Check(titled.TokenUsage?.Total == 220 && titled.ModelName == "deepseek-v4.1-flash", "claude: tokens + model applied to task");
+
+// ---- 计时：轮内插入不重置，新一轮才重置；新一轮清第三行（G5/G6）----
+claude.Accept(C("PreToolUse", new { tool_name = "Bash", tool_input = new { command = "npm test" } }), claudeNow.AddSeconds(2));
+Check(Claude().LatestStep == "Bash npm test", $"claude: step composed (got '{Claude().LatestStep}')");
+Check(Claude().Activity == AgentActivity.Testing, $"claude: bash npm test -> testing (got {Claude().Activity})");
+
+claude.Accept(C("UserPromptSubmit", new { prompt = "顺手也看看日志" }), claudeNow.AddSeconds(3));
+Check(Claude().StartedAt == claudeNow.AddSeconds(1), "claude: steering prompt keeps the turn timer");
+Check(Claude().LatestStep == "Bash npm test", "claude: steering prompt keeps the running step");
+
+claude.Accept(C("Stop", new { last_assistant_message = "跑完了" }), claudeNow.AddSeconds(4));
+Check(Claude().Lifecycle == AgentLifecycle.Succeeded && Claude().CompletedAt == claudeNow.AddSeconds(4), "claude: stop -> succeeded");
+Check(Claude().LatestStep == "跑完了", $"claude: stop preview from last_assistant_message fallback (got '{Claude().LatestStep}')");
+
+claude.Accept(C("UserPromptSubmit", new { prompt = "再来一轮" }), claudeNow.AddSeconds(5));
+Check(Claude().StartedAt == claudeNow.AddSeconds(5), "claude: new turn restarts the timer");
+Check(Claude().LatestStep is null, "claude: new turn clears the third line");
+
+// ---- 工具映射：判据是工具名 + 命令文本/入参（G8/G19/G20）----
+Check(ClaudeEventReducer.ActivityFor("Bash", JsonSerializer.SerializeToElement(new { command = "gradlew build" })) == AgentActivity.Executing, "claude: gradlew build -> executing");
+Check(ClaudeEventReducer.ActivityFor("Bash", JsonSerializer.SerializeToElement(new { command = "Get-Content latest.log" })) == AgentActivity.Executing, "claude: latest substring -> executing");
+Check(ClaudeEventReducer.ActivityFor("PowerShell", JsonSerializer.SerializeToElement(new { command = "cargo test" })) == AgentActivity.Testing, "claude: powershell cargo test -> testing");
+Check(ClaudeEventReducer.ActivityFor("TodoWrite", JsonSerializer.SerializeToElement(new { todos = new[] { "a" } })) == AgentActivity.Thinking, "claude: TodoWrite -> thinking (not editing)");
+Check(ClaudeEventReducer.ActivityFor("Glob", JsonSerializer.SerializeToElement(new { pattern = "**/*.md" })) == AgentActivity.Searching, "claude: Glob -> searching");
+Check(ClaudeEventReducer.ActivityFor("NotebookEdit", null) == AgentActivity.Editing, "claude: NotebookEdit -> editing");
+Check(ClaudeEventReducer.ActivityFor("Agent", JsonSerializer.SerializeToElement(new { description = "调研" })) == AgentActivity.Delegating, "claude: Agent -> delegating");
+Check(ClaudeEventReducer.ActivityFor("Read", null) == AgentActivity.Reading && ClaudeEventReducer.ActivityFor("WebSearch", null) == AgentActivity.Browsing, "claude: read/web mapped");
+Check(CodexEventReducer.LatestStep("TodoWrite", "x") == "Todo x" &&
+      CodexEventReducer.LatestStep("PowerShell", "git status") == "PowerShell git status" &&
+      CodexEventReducer.LatestStep("AskUserQuestion", "选哪个") == "Question 选哪个",
+    "claude: tool display labels");
+
+// 白名单不含 prompt：Agent 一类入参带 prompt 也不得进第三行（G18）
+Check(ClaudeEventReducer.Summary(JsonSerializer.SerializeToElement(new { prompt = "整段用户提示词", description = "调研用法" })) == "调研用法", "claude: summary skips prompt key");
+
+// ---- 提问态：认 AskUserQuestion 工具名（G7）----
+var askInput = JsonSerializer.SerializeToElement(new
+{
+    questions = new[] { new { question = "选哪个方案？", header = "方案", options = new[] { new { label = "A" }, new { label = "B" } } } },
+});
+Check(ClaudeEventReducer.QuestionText(askInput) == "选哪个方案？" && ClaudeEventReducer.QuestionHeader(askInput) == "方案", "claude: question text/header");
+Check(ClaudeEventReducer.QuestionOptions(askInput) is ["A", "B"], "claude: question options");
+
+// 一次提问可带多题，而手机只渲染一行 summary：必须**全部拼进来**并标号
+// （实测踩过：一次问两题，手机上只看得见第一题，用户也就只答了第一题）
+var multiAsk = JsonSerializer.SerializeToElement(new
+{
+    questions = new[]
+    {
+        new { question = "第一题？", header = "题一", options = new[] { new { label = "A" }, new { label = "B" } } },
+        new { question = "第二题？", header = "题二", options = new[] { new { label = "C" }, new { label = "D" } } },
+    },
+});
+Check(ClaudeEventReducer.QuestionText(multiAsk) == "1. 第一题？ / 2. 第二题？",
+    $"claude: multi-question text keeps every question (got '{ClaudeEventReducer.QuestionText(multiAsk)}')");
+Check(ClaudeEventReducer.QuestionHeader(multiAsk) == "题一（共 2 题）",
+    $"claude: multi-question header shows the count (got '{ClaudeEventReducer.QuestionHeader(multiAsk)}')");
+Check(ClaudeEventReducer.QuestionOptions(multiAsk) is [],
+    "claude: multi-question sends no options (phone must not offer tap-to-answer on an ambiguous card)");
+
+claude.Accept(C("PreToolUse", new { tool_name = "AskUserQuestion", tool_input = askInput }), claudeNow.AddSeconds(6));
+Check(Claude().Lifecycle == AgentLifecycle.WaitingAnswer, $"claude: AskUserQuestion -> waitingAnswer (got {Claude().Lifecycle})");
+Check(Claude().LatestStep == "方案", $"claude: question header on third line (got '{Claude().LatestStep}')");
+var questionCard = claude.Projection().PendingRequests.FirstOrDefault(r => r.TaskID == "claude_1");
+Check(questionCard is { Kind: PendingRequestKind.Question, Summary: "选哪个方案？" }, "claude: question card registered");
+
+// 等待态锁：并行工具事件不得把等待态压回 running
+claude.Accept(C("PreToolUse", new { tool_name = "Bash", tool_input = new { command = "echo x" } }), claudeNow.AddSeconds(7));
+Check(Claude().Lifecycle == AgentLifecycle.WaitingAnswer, "claude: parallel tool during waiting ignored");
+claude.Accept(C("PostToolUse", new { tool_name = "AskUserQuestion" }), claudeNow.AddSeconds(8));
+Check(Claude().Lifecycle == AgentLifecycle.Running, "claude: question answered -> running");
+Check(claude.Projection().PendingRequests.Count == 0, "claude: question card cleared after answering");
+
+// AskUserQuestion 是"需要用户交互"的工具，**它同时会发 PermissionRequest**。两条都要收敛到
+// "提问"：不能变成"等待批准 + 允许/拒绝按钮"（选择题用那个答不了），也不能把 QUESTION 卡片顶掉。
+claude.Accept(C("PreToolUse", new { tool_name = "AskUserQuestion", tool_input = askInput }), claudeNow.AddSeconds(50));
+claude.Accept(C("PermissionRequest", new { tool_name = "AskUserQuestion", tool_input = askInput }), claudeNow.AddSeconds(51));
+Check(Claude().Lifecycle == AgentLifecycle.WaitingAnswer, $"claude: question tool's permission request stays waitingAnswer (got {Claude().Lifecycle})");
+var questionAfterPermission = claude.Projection().PendingRequests.First();
+Check(questionAfterPermission.Kind == PendingRequestKind.Question && questionAfterPermission.Summary == "选哪个方案？",
+    "claude: question card survives its own permission request");
+Check(Claude().Capabilities.Contains(TaskCapability.Answer) && !Claude().Capabilities.Contains(TaskCapability.Approve),
+    "claude: question offers Answer only (no approve/deny buttons)");
+Check(Claude().LatestStep == "方案", $"claude: question header kept on the third line (got '{Claude().LatestStep}')");
+claude.Accept(C("PostToolUse", new { tool_name = "AskUserQuestion" }), claudeNow.AddSeconds(52));
+Check(Claude().Lifecycle == AgentLifecycle.Running && claude.Projection().PendingRequests.Count == 0,
+    "claude: question released by its own PostToolUse");
+
+// 反向顺序（PermissionRequest 先到，没有 PreToolUse）同样要进提问态
+claude.Accept(C("PermissionRequest", new { tool_name = "AskUserQuestion", tool_input = askInput }), claudeNow.AddSeconds(53));
+Check(Claude().Lifecycle == AgentLifecycle.WaitingAnswer &&
+      claude.Projection().PendingRequests.First().Kind == PendingRequestKind.Question,
+    "claude: question permission request alone enters waitingAnswer");
+claude.Accept(C("PostToolUse", new { tool_name = "AskUserQuestion" }), claudeNow.AddSeconds(54));
+
+// 普通工具的权限询问仍然是审批卡片（回归守卫）
+claude.Accept(C("PermissionRequest", new { tool_name = "Bash", tool_input = new { command = "rm -rf x" } }), claudeNow.AddSeconds(55));
+Check(Claude().Lifecycle == AgentLifecycle.WaitingApproval &&
+      claude.Projection().PendingRequests.First().Kind == PendingRequestKind.Approval &&
+      Claude().Capabilities.Contains(TaskCapability.Approve),
+    "claude: ordinary tool still gets an approval card");
+claude.Accept(C("PostToolUse", new { tool_name = "Bash" }), claudeNow.AddSeconds(56));
+
+// ---- 权限：唯一双向能力（Capabilities 决定手机按钮）----
+claude.Accept(C("PermissionRequest", new { tool_name = "Bash", tool_input = new { command = "rm -rf build" } }), claudeNow.AddSeconds(9));
+Check(Claude().Lifecycle == AgentLifecycle.WaitingApproval, $"claude: permission request -> waitingApproval (got {Claude().Lifecycle})");
+Check(Claude().Capabilities.Contains(TaskCapability.Approve) && Claude().Capabilities.Contains(TaskCapability.Deny), "claude: approve/deny capabilities");
+Check(claude.Projection().PendingRequests.First().Summary == "rm -rf build", "claude: approval card summary");
+claude.Accept(C("PostToolUse", new { tool_name = "Bash" }), claudeNow.AddSeconds(10));
+Check(Claude().Lifecycle == AgentLifecycle.Running && claude.Projection().PendingRequests.Count == 0, "claude: answered-in-terminal permission released by PostToolUse");
+
+// ---- 终态语义：PermissionDenied 不是回合结束；StopFailure 是（G13/G15）----
+claude.Accept(C("PermissionDenied", new { tool_name = "Bash", tool_input = new { command = "curl x" }, reason = "auto" }), claudeNow.AddSeconds(11));
+Check(Claude().Lifecycle == AgentLifecycle.Running, $"claude: PermissionDenied keeps running (got {Claude().Lifecycle})");
+Check(Claude().LatestStep == "✗ 已拒绝 curl x", $"claude: denial step (got '{Claude().LatestStep}')");
+Check(Claude().CompletedAt is null, "claude: denial does not complete the turn");
+
+claude.Accept(C("StopFailure", new { error = "rate_limit" }), claudeNow.AddSeconds(12));
+Check(Claude().Lifecycle == AgentLifecycle.Interrupted, $"claude: stop failure -> interrupted (got {Claude().Lifecycle})");
+Check(Claude().LatestStep == "✗ rate_limit" && Claude().IsUnread, "claude: stop failure step + unread");
+
+// ---- 守卫：终态不可逆（G14/G16/G17）----
+claude.Accept(C("PreCompact", new { trigger = "auto" }), claudeNow.AddSeconds(13));
+Check(Claude().Lifecycle == AgentLifecycle.Interrupted, "claude: precompact never revives a terminal task");
+claude.Accept(C("PostToolUse", new { tool_name = "Bash" }), claudeNow.AddSeconds(14));
+Check(Claude().Lifecycle == AgentLifecycle.Interrupted, "claude: late tool after terminal does not revive");
+claude.Accept(C("Stop", new { }), claudeNow.AddSeconds(15));
+Check(Claude().Lifecycle == AgentLifecycle.Interrupted, "claude: stop keeps interrupted (esc path)");
+
+// ---- 中断信号：PostToolUseFailure.is_interrupt（G12）----
+var interrupted = ClaudeEventReducer.Reduce(
+    C("PostToolUseFailure", new { tool_name = "Bash", error = "Interrupted", is_interrupt = true }),
+    Claude() with { Lifecycle = AgentLifecycle.Running, CompletedAt = null }, null, claudeNow.AddSeconds(16));
+Check(interrupted.Lifecycle == AgentLifecycle.Interrupted, $"claude: is_interrupt -> interrupted (got {interrupted.Lifecycle})");
+
+var failed = ClaudeEventReducer.Reduce(
+    C("PostToolUseFailure", new { tool_name = "Bash", error = "boom\nat line 2" }),
+    Claude() with { Lifecycle = AgentLifecycle.Running, CompletedAt = null }, null, claudeNow.AddSeconds(17));
+Check(failed.Lifecycle == AgentLifecycle.Running && failed.LatestStep == "✗ boom", $"claude: tool failure keeps running (got {failed.Lifecycle}/{failed.LatestStep})");
+
+// ---- 正文预览的回显守卫（G18）----
+var echoTask = Claude() with
+{
+    Lifecycle = AgentLifecycle.Running,
+    UserPrompt = "帮我把构建脚本修一下",
+    LatestStep = "Bash npm test",
+    CompletedAt = null,
+};
+var echoed = ClaudeEventReducer.Reduce(
+    C("Stop", new { last_assistant_message = "好的，帮我把构建脚本修一下已完成" }), echoTask, null, claudeNow.AddSeconds(18));
+Check(echoed.LatestStep == "Bash npm test", $"claude: prompt echo rejected from preview (got '{echoed.LatestStep}')");
+
+// ---- 子代理：路由进父任务、父任务终态不被复活（G11/G14）----
+var subCatalog = new TaskCatalog();
+var subNow = DateTimeOffset.UtcNow;
+TaskSnapshot SubTask() => subCatalog.Projection().Tasks.First(t => t.Id == "claude_2");
+subCatalog.Accept(C("SessionStart", new { session_id = "claude_2", source = "startup" }), subNow);
+subCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_2", prompt = "调研一下" }), subNow.AddSeconds(1));
+subCatalog.Accept(C("PreToolUse", new { session_id = "claude_2", tool_name = "Bash", tool_input = new { command = "npm test" } }), subNow.AddSeconds(2));
+var parentStep = SubTask().LatestStep;
+Check(parentStep == "Bash npm test", $"claude: parent step before delegating (got '{parentStep}')");
+
+subCatalog.Accept(C("SubagentStart", new { session_id = "claude_2", agent_id = "a1", agent_type = "Explore" }), subNow.AddSeconds(3));
+subCatalog.Accept(C("PreToolUse", new { session_id = "claude_2", agent_id = "a1", agent_type = "Explore", tool_name = "Grep", tool_input = new { pattern = "TODO" } }), subNow.AddSeconds(4));
+Check(SubTask().LatestStep == parentStep, "claude: subagent step never overwrites the parent third line");
+Check(SubTask().Subagents is [{ DisplayName: "Explore" }], "claude: subagent row named by agent_type");
+Check(SubTask().Subagents[0].LatestStep == "Grep TODO", $"claude: subagent row carries its own step (got '{SubTask().Subagents[0].LatestStep}')");
+Check(SubTask().Activity == AgentActivity.Delegating, "claude: parent delegates while subagent runs");
+
+// 项目名**跟随** payload cwd（用户裁定：Claude 的 cwd 随 Bash 的 cd 走，这一行反映"此刻在哪个
+// 目录干活"，是期望行为）。曾经按"另两家用稳定目录"冻结过，被用户撤销——这条断言防止再冻回去。
+var cwdCatalog = new TaskCatalog();
+var cwdNow = DateTimeOffset.UtcNow;
+cwdCatalog.Accept(C("SessionStart", new { session_id = "claude_4", cwd = @"F:\Git\proj-a" }), cwdNow);
+cwdCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_4", cwd = @"F:\Git\proj-a", prompt = "干活" }), cwdNow.AddSeconds(1));
+cwdCatalog.Accept(C("PreToolUse", new { session_id = "claude_4", cwd = @"F:\Git\proj-a\sub\deep", tool_name = "Bash", tool_input = new { command = "ls" } }), cwdNow.AddSeconds(2));
+TaskSnapshot CwdTask() => cwdCatalog.Projection().Tasks.First(x => x.Id == "claude_4");
+Check(CwdTask().ProjectName == "deep", $"claude: project name follows payload cwd (got '{CwdTask().ProjectName}')");
+
+// 没有 Start 的 Stop 不得凭空造幽灵子代理行（实测踩过：手机上突然冒出一行"已完成"的子代理，
+// 那条 Stop 的 agent_type 是空的）
+var ghostCatalog = new TaskCatalog();
+var ghostNow = DateTimeOffset.UtcNow;
+ghostCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_3", prompt = "跑一下" }), ghostNow);
+ghostCatalog.Accept(C("SubagentStop", new { session_id = "claude_3", agent_id = "ghost" }), ghostNow.AddSeconds(1));
+Check(ghostCatalog.Projection().Tasks.First(x => x.Id == "claude_3").Subagents.Count == 0,
+    "claude: lone SubagentStop does not fabricate a ghost row");
+
+subCatalog.Accept(C("Stop", new { session_id = "claude_2", last_assistant_message = "完成了" }), subNow.AddSeconds(5));
+Check(SubTask().Lifecycle == AgentLifecycle.Succeeded, "claude: parent finished while subagent row still open");
+subCatalog.Accept(C("SubagentStop", new { session_id = "claude_2", agent_id = "a1", agent_type = "Explore" }), subNow.AddSeconds(6));
+Check(SubTask().Lifecycle == AgentLifecycle.Succeeded, "claude: subagent stop never revives a finished parent");
+Check(SubTask().Subagents[0].IsTerminal, "claude: subagent row finalized");
+
+// 子代理的权限询问挂父任务（它阻塞的是父任务这一回合，手机要能放行）
+subCatalog.Accept(C("PermissionRequest", new { session_id = "claude_2", agent_id = "a1", agent_type = "Explore", tool_name = "Bash", tool_input = new { command = "rm -rf x" } }), subNow.AddSeconds(7));
+Check(SubTask().Lifecycle == AgentLifecycle.Succeeded, "claude: finished parent is not revived by a subagent permission request");
+Check(subCatalog.Projection().PendingRequests.Count == 0, "claude: no phantom card on a finished parent");
+
+// ---- 排队：转录本 queue-operation（G1'''）----
+var turnStart = DateTimeOffset.UtcNow;
+var queueSnapshot = ReadTranscript(
+[
+    "{\"type\":\"queue-operation\",\"operation\":\"enqueue\",\"timestamp\":\"" + turnStart.AddSeconds(30).ToString("o") + "\",\"content\":\"<task-notification>后台任务完成\"}",
+    "{\"type\":\"queue-operation\",\"operation\":\"enqueue\",\"timestamp\":\"" + turnStart.AddSeconds(40).ToString("o") + "\",\"content\":\"再跑一遍测试\"}",
+]);
+Check(queueSnapshot.QueuedPrompt == "再跑一遍测试" && queueSnapshot.QueuedAt is not null, $"claude: queued user prompt read (got '{queueSnapshot.QueuedPrompt}')");
+
+var queued = ClaudeEventReducer.ApplyTranscript(
+    Claude() with { Lifecycle = AgentLifecycle.Running, StartedAt = turnStart, UserPrompt = "原提示词", PromptQueued = false },
+    queueSnapshot);
+Check(queued.PromptQueued && queued.UserPrompt == "再跑一遍测试", "claude: queued prompt marked + shown on second line");
+
+var drained = ClaudeEventReducer.ApplyTranscript(
+    Claude() with { Lifecycle = AgentLifecycle.Running, StartedAt = turnStart, PromptQueued = true },
+    ReadTranscript(["{\"type\":\"queue-operation\",\"operation\":\"remove\",\"content\":\"再跑一遍测试\"}"]));
+Check(!drained.PromptQueued, "claude: queue drained clears the queued flag");
+
+// 本地斜杠命令不是"用户在排队提交提示词"（实测踩过：/context 只写 enqueue、不写 remove，
+// 按"最后一条操作说了算"会永远停在排队中，并把 /context 顶到第二行）
+var slashSnapshot = ReadTranscript(["{\"type\":\"queue-operation\",\"operation\":\"enqueue\",\"content\":\"/context\"}"]);
+Check(slashSnapshot.QueuedAt is null && slashSnapshot.QueuedPrompt is null, "claude: slash command is not a queued prompt");
+
+// 排空后必须还原成本回合真实输入，不能让排队文本永久冒充提示词
+var restoreSnapshot = ReadTranscript(
+[
+    "{\"type\":\"user\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":\"本轮真正的提示词\"}}",
+    "{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"收到\"}],\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}",
+    "{\"type\":\"queue-operation\",\"operation\":\"remove\",\"content\":\"中途排队的那条\"}",
+]);
+Check(restoreSnapshot.LatestPrompt == "本轮真正的提示词", $"claude: latest prompt read from transcript (got '{restoreSnapshot.LatestPrompt}')");
+var restored = ClaudeEventReducer.ApplyTranscript(
+    Claude() with { Lifecycle = AgentLifecycle.Running, PromptQueued = true, UserPrompt = "中途排队的那条" },
+    restoreSnapshot);
+Check(!restored.PromptQueued && restored.UserPrompt == "本轮真正的提示词",
+    $"claude: drained queue restores the real prompt (got '{restored.UserPrompt}')");
+
+// ---- 离线：10 分钟静默兜底（G23）----
+claude.Accept(C("UserPromptSubmit", new { prompt = "长跑任务" }), claudeNow.AddSeconds(22));
+claude.Maintain(claudeNow.AddMinutes(2));
+Check(Claude().Lifecycle == AgentLifecycle.Running, "claude: still running before the silence window");
+claude.Maintain(claudeNow.AddMinutes(12));
+Check(Claude().Lifecycle == AgentLifecycle.Offline, $"claude: silent task -> offline (got {Claude().Lifecycle})");
+
+// 会话注册表解析（离线正判的来源）
+var registryDir = Path.Combine(Path.GetTempPath(), "ap-verify-claude-reg-" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(registryDir);
+File.WriteAllText(Path.Combine(registryDir, "1234.json"),
+    "{\"pid\":1234,\"sessionId\":\"claude_9\",\"cwd\":\"F:\\\\Git\",\"name\":\"git-90\",\"nameSource\":\"derived\",\"status\":\"busy\",\"startedAt\":1791437904395}");
+var registry = ClaudeSessionRegistry.Scan(registryDir);
+Check(registry.TryGetValue("claude_9", out var entry) && entry.Status == "busy" && entry.NameSource == "derived", "claude: session registry entry parsed");
+Directory.Delete(registryDir, true);
+
+// ===================== 20. Claude Hook 安装器（隔离在临时配置目录，不碰真实 ~/.claude） =====================
+var claudeHome = Path.Combine(Path.GetTempPath(), "ap-verify-claude-home-" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(claudeHome);
+// 预置：用户自己的 hook + 一份**旧形态**托管项（"<exe>" --hook --source claude）
+File.WriteAllText(Path.Combine(claudeHome, "settings.json"),
+    """
+    {"hooks":{"Stop":[{"hooks":[{"type":"command","command":"node \"C:/user/own.js\""}]},{"hooks":[{"type":"command","command":"\"C:/old/AgentPagerBridge.exe\" --hook --source claude","statusMessage":"Managed by AgentPager (Claude Code)"}]}]}}
+    """);
+
+var claudeHooks = new ClaudeHookConfiguration(claudeHome);
+Check(ClaudeHookConfiguration.EmbeddedVersion == 2, $"claude: embedded script version (got {ClaudeHookConfiguration.EmbeddedVersion})");
+Check(!claudeHooks.IsInstalled(), "claude: not installed before install");
+
+var install = claudeHooks.Install();
+Check(install.Changed, "claude: first install reports a change");
+Check(install.BackupPath is not null && File.Exists(install.BackupPath), "claude: settings backed up before rewrite");
+Check(File.Exists(claudeHooks.ScriptPath), "claude: forwarding script deployed");
+Check(claudeHooks.InstalledVersion == ClaudeHookConfiguration.EmbeddedVersion,
+    "claude: deployed script version matches the embedded one");
+Check(claudeHooks.IsInstalled(), "claude: installed state");
+
+var installedSettings = JsonNode.Parse(File.ReadAllText(claudeHooks.SettingsPath))!.AsObject();
+var installedHooks = installedSettings["hooks"]!.AsObject();
+Check(installedHooks["UserPromptSubmit"] is JsonArray, "claude: lifecycle events registered");
+Check(installedHooks["PermissionRequest"]!.AsArray()[0]!["hooks"]!.AsArray()[0]!["timeout"]!.GetValue<int>() == 86_400, "claude: permission hook keeps the long timeout");
+var stopGroups = installedHooks["Stop"]!.AsArray();
+Check(stopGroups.Count == 2, $"claude: user hook preserved alongside ours (got {stopGroups.Count})");
+Check(stopGroups.Any(g => g!["hooks"]!.AsArray().Any(h =>
+        h!["command"]?.GetValue<string>()?.Contains("own.js", StringComparison.Ordinal) == true)),
+    "claude: user's own Stop hook untouched");
+
+var ours = installedHooks["UserPromptSubmit"]!.AsArray()[0]!["hooks"]!.AsArray()[0]!.AsObject();
+Check(ours["command"]!.GetValue<string>() == "node", $"claude: exec form uses bare node (got '{ours["command"]}')");
+Check(ours["args"]!.AsArray()[0]!.GetValue<string>().Replace('\\', '/').EndsWith("agentpager-claude.js", StringComparison.Ordinal),
+    "claude: exec form passes the script path as an argument");
+Check(!installedSettings.ToJsonString().Contains("--hook --source claude", StringComparison.Ordinal),
+    "claude: legacy exe-form hooks replaced");
+
+Check(!claudeHooks.Install().Changed, "claude: install is idempotent");
+
+// 三态：脚本落后于内置版本时必须是"待更新"，而不是"未安装"（bool 表达不了这一态）
+Check(claudeHooks.Status == ClaudeHookStatus.Installed, $"claude: fresh install reads as installed (got {claudeHooks.Status})");
+File.WriteAllText(claudeHooks.ScriptPath, "// agentpager-claude v0\r\n// Managed by AgentPager (Claude Code) - do not edit this file manually.\r\n");
+Check(claudeHooks.Status == ClaudeHookStatus.Outdated, $"claude: stale script reads as outdated (got {claudeHooks.Status})");
+Check(claudeHooks.IsInstalled(), "claude: outdated still counts as installed (hooks are registered)");
+Check(claudeHooks.InstalledVersion == 0, $"claude: installed version read from the script header (got {claudeHooks.InstalledVersion})");
+Check(claudeHooks.Install().Changed, "claude: reinstall repairs the stale script");
+Check(claudeHooks.Status == ClaudeHookStatus.Installed, "claude: repaired back to installed");
+
+var uninstall = claudeHooks.Uninstall();
+Check(uninstall.Changed, "claude: uninstall reports a change");
+Check(!File.Exists(claudeHooks.ScriptPath), "claude: uninstall removes the managed script");
+Check(!claudeHooks.IsInstalled(), "claude: uninstalled state");
+var afterUninstall = JsonNode.Parse(File.ReadAllText(claudeHooks.SettingsPath))!.AsObject()["hooks"]!.AsObject();
+Check(afterUninstall["UserPromptSubmit"] is null, "claude: managed event groups removed");
+Check(afterUninstall["Stop"]!.AsArray().Count == 1, "claude: user hook survives uninstall");
+Directory.Delete(claudeHome, true);
+
+// ===================== 21. 手机作答（PermissionRequest + updatedInput.response） =====================
+// 回包形状是整个机制的关键：必须 behavior=allow、必须整份带回 questions、答案放 response。
+var answerBytes = ClaudeHookOutput.Answer(
+    """{"questions":[{"question":"用哪种实现？","header":"实现","options":[{"label":"A"},{"label":"B"}]}]}""",
+    "就用 A");
+var answerRoot = JsonNode.Parse(System.Text.Encoding.UTF8.GetString(answerBytes).Trim())!.AsObject();
+Check(answerRoot["hookSpecificOutput"]!["hookEventName"]!.GetValue<string>() == "PermissionRequest",
+    "claude answer: hookEventName is PermissionRequest");
+var answerDecision = answerRoot["hookSpecificOutput"]!["decision"]!.AsObject();
+Check(answerDecision["behavior"]!.GetValue<string>() == "allow", "claude answer: behavior is allow");
+var answerUpdated = answerDecision["updatedInput"]!.AsObject();
+Check(answerUpdated["questions"] is JsonArray { Count: 1 }, "claude answer: original questions echoed back whole");
+Check(answerUpdated["questions"]![0]!["question"]!.GetValue<string>() == "用哪种实现？", "claude answer: question text preserved");
+Check(answerUpdated["response"]!.GetValue<string>() == "就用 A", "claude answer: free text rides on response");
+
+// 点选项（手机按钮）→ 结构化 answers{问题全文: label}，不再落 response
+var labelBytes = ClaudeHookOutput.Answer(
+    """{"questions":[{"question":"用哪种实现？","header":"实现","options":[{"label":"A"},{"label":"B"}]}]}""",
+    "B");
+var labelInput = JsonNode.Parse(System.Text.Encoding.UTF8.GetString(labelBytes).Trim())!
+    .AsObject()["hookSpecificOutput"]!["decision"]!["updatedInput"]!.AsObject();
+Check(labelInput["answers"] is JsonObject answers &&
+      answers["用哪种实现？"]!.GetValue<string>() == "B",
+    "claude answer: a tapped option becomes a structured answer keyed by the question text");
+Check(labelInput["response"] is null, "claude answer: a tapped option does not also set response");
+Check(labelInput["questions"] is JsonArray { Count: 1 }, "claude answer: questions still echoed when an option is tapped");
+
+// 端到端：PermissionRequest(提问工具) → 手机作答 → 回填原始入参
+var answerCatalog = new TaskCatalog();
+var answerNow = DateTimeOffset.UtcNow;
+answerCatalog.Accept(C("PermissionRequest", new { session_id = "claude_7", tool_name = "AskUserQuestion", tool_input = askInput }), answerNow);
+TaskSnapshot AnswerTask() => answerCatalog.Projection().Tasks.First(x => x.Id == "claude_7");
+Check(AnswerTask().Capabilities.Contains(TaskCapability.Answer), "claude answer: asking grants the Answer capability");
+Check(!AnswerTask().Capabilities.Contains(TaskCapability.Approve), "claude answer: no approve/deny on a question");
+Check(answerCatalog.Projection().PendingRequests.First().Kind == PendingRequestKind.Question, "claude answer: question card pending");
+
+var recorder = new RecordingResolver();
+var answerAck = answerCatalog.Perform(
+    Guid.NewGuid(), new ControlPayload("claude_7", ControlAction.Answer, "就用 A"), recorder);
+Check(answerAck.Result == ControlResult.Accepted, $"claude answer: phone answer accepted (got {answerAck.Result}/{answerAck.Reason})");
+Check(recorder.AnswerText == "就用 A", "claude answer: the text reaches the resolver");
+Check(JsonNode.Parse(recorder.RawInput!)!["questions"] is JsonArray { Count: 1 }, "claude answer: raw tool input passed back whole");
+Check(AnswerTask().Capabilities.Count == 0 && AnswerTask().Lifecycle == AgentLifecycle.Running,
+    "claude answer: capability cleared and the turn resumes");
+Check(answerCatalog.Projection().PendingRequests.Count == 0, "claude answer: question card cleared");
+
+// 没有原始入参时不给 Answer 能力位（免得 App 画出送不出去的输入框）
+var noInputCatalog = new TaskCatalog();
+noInputCatalog.Accept(C("PermissionRequest", new { session_id = "claude_8", tool_name = "AskUserQuestion" }), answerNow);
+Check(!noInputCatalog.Projection().Tasks.First(x => x.Id == "claude_8").Capabilities.Contains(TaskCapability.Answer),
+    "claude answer: no raw input -> no Answer capability");
+
+// ===================== 22. 中间正文进第三行（B） =====================
+var replyCatalog = new TaskCatalog();
+var replyNow = DateTimeOffset.UtcNow;
+var replyPath = Path.Combine(Path.GetTempPath(), "ap-verify-claude-reply-" + Guid.NewGuid().ToString("N") + ".jsonl");
+File.WriteAllLines(replyPath,
+    ["{\"type\":\"user\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":\"干活\"}}"]);
+replyCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_6", prompt = "干活", transcript_path = replyPath }), replyNow);
+TaskSnapshot ReplyTask() => replyCatalog.Projection().Tasks.First(x => x.Id == "claude_6");
+
+File.AppendAllLines(replyPath,
+    ["{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"先说一句中间的话\"}]}}"]);
+replyCatalog.Maintain(replyNow.AddSeconds(3));
+Check(ReplyTask().LatestStep == "先说一句中间的话", $"claude reply: mid-turn text reaches the third line (got '{ReplyTask().LatestStep}')");
+
+// 工具在跑：新的中间正文不得盖掉工具步
+replyCatalog.Accept(C("PreToolUse", new { session_id = "claude_6", transcript_path = replyPath, tool_name = "Bash", tool_input = new { command = "npm test" } }), replyNow.AddSeconds(4));
+File.AppendAllLines(replyPath,
+    ["{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"工具跑着的时候写的字\"}]}}"]);
+replyCatalog.Maintain(replyNow.AddSeconds(6));
+Check(ReplyTask().LatestStep == "Bash npm test", $"claude reply: tool step survives while a tool runs (got '{ReplyTask().LatestStep}')");
+
+// 工具结束：新的正文可以回来（心跳按转录本 mtime 门控，所以这里要再追加一次）
+replyCatalog.Accept(C("PostToolUse", new { session_id = "claude_6", transcript_path = replyPath, tool_name = "Bash" }), replyNow.AddSeconds(7));
+File.AppendAllLines(replyPath,
+    ["{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"工具跑完之后写的话\"}]}}"]);
+replyCatalog.Maintain(replyNow.AddSeconds(9));
+Check(ReplyTask().LatestStep == "工具跑完之后写的话", $"claude reply: preview resumes after the tool ends (got '{ReplyTask().LatestStep}')");
+
+// 残留守卫：回合刚开始时转录本里还没有新一轮的 user 行，倒序扫到的是**上一回合**的正文，
+// 它早于本轮起点，必须被丢弃（实测踩过：第三行"经常残留上一个 reply"）
+var staleCatalog = new TaskCatalog();
+var staleNow = DateTimeOffset.UtcNow;
+var stalePath = Path.Combine(Path.GetTempPath(), "ap-verify-claude-stale-" + Guid.NewGuid().ToString("N") + ".jsonl");
+File.WriteAllLines(stalePath,
+[
+    "{\"type\":\"user\",\"isSidechain\":false,\"timestamp\":\"2020-01-01T00:00:00.000Z\",\"message\":{\"role\":\"user\",\"content\":\"上一轮的问题\"}}",
+    "{\"type\":\"assistant\",\"isSidechain\":false,\"timestamp\":\"2020-01-01T00:00:05.000Z\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"上一轮的回复\"}]}}",
+]);
+staleCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_10", prompt = "新的一轮", transcript_path = stalePath }), staleNow);
+staleCatalog.Maintain(staleNow.AddSeconds(3));
+Check(staleCatalog.Projection().Tasks.First(x => x.Id == "claude_10").LatestStep is null,
+    $"claude reply: previous turn's reply must not leak in (got '{staleCatalog.Projection().Tasks.First(x => x.Id == "claude_10").LatestStep}')");
+
+// 回合内"最新一步是工具调用"时，不得回退去拿更早的正文
+// （用户实测："laststep 工具调用内容无法覆盖上一个 reply"——心跳把工具步盖成了上一段正文）
+var toolLatest = ReadTranscript(
+[
+    "{\"type\":\"user\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":\"干活\"}}",
+    "{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"先看看代码\"}]}}",
+    "{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\"}]}}",
+]);
+Check(toolLatest.LatestReply is null,
+    $"claude reply: tool-only latest step yields no reply candidate (got '{toolLatest.LatestReply}')");
+
+// 最新一步又是正文时，照常给出候选
+var textLatest = ReadTranscript(
+[
+    "{\"type\":\"user\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":\"干活\"}}",
+    "{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\"}]}}",
+    "{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"跑完了，接着看\"}]}}",
+]);
+Check(textLatest.LatestReply == "跑完了，接着看",
+    $"claude reply: text after a tool still becomes the candidate (got '{textLatest.LatestReply}')");
+
+// 端到端：工具跑完后心跳不得把工具步盖成上一段正文
+var clobberCatalog = new TaskCatalog();
+var clobberNow = DateTimeOffset.UtcNow;
+var clobberPath = Path.Combine(Path.GetTempPath(), "ap-verify-claude-clobber-" + Guid.NewGuid().ToString("N") + ".jsonl");
+File.WriteAllLines(clobberPath,
+[
+    "{\"type\":\"user\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":\"干活\"}}",
+    "{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"先看看代码\"}]}}",
+]);
+clobberCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_11", prompt = "干活", transcript_path = clobberPath }), clobberNow);
+clobberCatalog.Maintain(clobberNow.AddSeconds(3));
+Check(clobberCatalog.Projection().Tasks.First(x => x.Id == "claude_11").LatestStep == "先看看代码",
+    "claude clobber: text shows while the model writes");
+clobberCatalog.Accept(C("PreToolUse", new { session_id = "claude_11", transcript_path = clobberPath, tool_name = "Bash", tool_input = new { command = "ls" } }), clobberNow.AddSeconds(4));
+File.AppendAllLines(clobberPath,
+    ["{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\"}]}}"]);
+clobberCatalog.Accept(C("PostToolUse", new { session_id = "claude_11", transcript_path = clobberPath, tool_name = "Bash" }), clobberNow.AddSeconds(5));
+clobberCatalog.Maintain(clobberNow.AddSeconds(8));
+Check(clobberCatalog.Projection().Tasks.First(x => x.Id == "claude_11").LatestStep == "Bash ls",
+    $"claude clobber: heartbeat must not overwrite the tool step with an older reply (got '{clobberCatalog.Projection().Tasks.First(x => x.Id == "claude_11").LatestStep}')");
+File.Delete(clobberPath);
+
+// 本轮自己的正文（时间晚于本轮起点）照常生效
+File.AppendAllLines(stalePath,
+[
+    "{\"type\":\"user\",\"isSidechain\":false,\"timestamp\":\"" + staleNow.AddSeconds(1).ToString("o") + "\",\"message\":{\"role\":\"user\",\"content\":\"新的一轮\"}}",
+    "{\"type\":\"assistant\",\"isSidechain\":false,\"timestamp\":\"" + staleNow.AddSeconds(2).ToString("o") + "\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"这一轮的回复\"}]}}",
+]);
+staleCatalog.Maintain(staleNow.AddSeconds(6));
+Check(staleCatalog.Projection().Tasks.First(x => x.Id == "claude_10").LatestStep == "这一轮的回复",
+    $"claude reply: current turn's reply still lands (got '{staleCatalog.Projection().Tasks.First(x => x.Id == "claude_10").LatestStep}')");
+File.Delete(stalePath);
+
+// 回显守卫在正文路径同样生效
+var echoCatalog = new TaskCatalog();
+echoCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_9", prompt = "把构建脚本修一下", transcript_path = replyPath }), replyNow);
+File.AppendAllLines(replyPath,
+    ["{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"好，把构建脚本修一下这项工作我这就开始\"}]}}"]);
+echoCatalog.Maintain(replyNow.AddSeconds(3));
+Check(echoCatalog.Projection().Tasks.First(x => x.Id == "claude_9").LatestStep is null,
+    "claude reply: prompt echo rejected on the heartbeat path too");
+File.Delete(replyPath);
+
+// ===================== 23. 控制消息签名：转义必须与 App 端 kotlinx 逐字节一致 =====================
+// 实测踩过：默认 STJ 把非 ASCII 转成 \uXXXX，kotlinx 原样输出 → HMAC 对不上 → 静默 InvalidSignature，
+// 手机作答"点了没反应"。批准/拒绝一直好使，只因为它们 value 是 null、不走这段。
+var signEnvelope = new SignedControlEnvelope(
+    1,
+    Guid.Parse("11111111-2222-3333-4444-555555555555"),
+    "control",
+    1_700_000_000_000,
+    "dev-1",
+    7,
+    "nonce-1",
+    new ControlPayload("ses_1", ControlAction.Answer, "有按钮但点了没反应"),
+    "sig");
+var signingText = System.Text.Encoding.UTF8.GetString(ControlSigner.SigningData(signEnvelope));
+Check(signingText.StartsWith(
+        "1\n11111111-2222-3333-4444-555555555555\n1700000000000\ndev-1\n7\nnonce-1\ncontrol\n",
+        StringComparison.Ordinal),
+    "control signing: envelope fields keep the agreed canonical order");
+Check(signingText.EndsWith(
+        """{"action":"answer","taskID":"ses_1","value":"有按钮但点了没反应"}""",
+        StringComparison.Ordinal),
+    $"control signing: non-ASCII value stays raw, byte-identical to kotlinx (got '{signingText[(signingText.LastIndexOf('{') + 1)..]}')");
+
+var nullValueSigning = System.Text.Encoding.UTF8.GetString(ControlSigner.SigningData(
+    signEnvelope with { Payload = new ControlPayload("ses_1", ControlAction.Approve, null) }));
+Check(nullValueSigning.EndsWith("""{"action":"approve","taskID":"ses_1"}""", StringComparison.Ordinal),
+    "control signing: null value keeps the short canonical form");
+
+// ===================== 24. 复审缺口回归（子代理挂卡撤销 / 撤卡清单 / 离线 / 清理 / 终稿补读） =====================
+var gapNow = DateTimeOffset.UtcNow;
+
+// ── 子代理的权限询问：卡挂父任务，但撤销必须认来源 ──
+var subPerm = new TaskCatalog();
+subPerm.Accept(C("UserPromptSubmit", new { session_id = "claude_20", prompt = "干活" }), gapNow);
+subPerm.Accept(C("SubagentStart", new { session_id = "claude_20", agent_id = "a1", agent_type = "Explore" }), gapNow.AddSeconds(1));
+subPerm.Accept(C("PermissionRequest", new { session_id = "claude_20", agent_id = "a1", agent_type = "Explore", tool_name = "Bash", tool_input = new { command = "rm -rf x" } }), gapNow.AddSeconds(2));
+TaskSnapshot SubPermTask() => subPerm.Projection().Tasks.First(x => x.Id == "claude_20");
+Check(SubPermTask().Lifecycle == AgentLifecycle.WaitingApproval &&
+      SubPermTask().Capabilities.Contains(TaskCapability.Approve),
+    "subagent permission: parent waits with an approval card");
+Check(subPerm.Projection().PendingRequests.Count == 1, "subagent permission: card registered");
+
+subPerm.Accept(C("PostToolUse", new { session_id = "claude_20", agent_id = "a2", agent_type = "Explore", tool_name = "Bash" }), gapNow.AddSeconds(3));
+Check(subPerm.Projection().PendingRequests.Count == 1, "subagent permission: another agent's tool must not release the card");
+
+subPerm.Accept(C("PostToolUse", new { session_id = "claude_20", agent_id = "a1", agent_type = "Explore", tool_name = "Bash" }), gapNow.AddSeconds(4));
+Check(subPerm.Projection().PendingRequests.Count == 0, "subagent permission: its own tool completion releases the card");
+Check(SubPermTask().Lifecycle == AgentLifecycle.Running && SubPermTask().Capabilities.Count == 0,
+    $"subagent permission: parent returns to running (got {SubPermTask().Lifecycle})");
+
+// ── 子代理问问题：卡片类型同样要跟对（不能给允许/拒绝） ──
+var subAsk = new TaskCatalog();
+subAsk.Accept(C("UserPromptSubmit", new { session_id = "claude_21", prompt = "干活" }), gapNow);
+subAsk.Accept(C("SubagentStart", new { session_id = "claude_21", agent_id = "b1", agent_type = "Explore" }), gapNow.AddSeconds(1));
+subAsk.Accept(C("PermissionRequest", new { session_id = "claude_21", agent_id = "b1", agent_type = "Explore", tool_name = "AskUserQuestion", tool_input = askInput }), gapNow.AddSeconds(2));
+var subAskTask = subAsk.Projection().Tasks.First(x => x.Id == "claude_21");
+Check(subAsk.Projection().PendingRequests.First().Kind == PendingRequestKind.Question, "subagent question: question card, not approval");
+Check(subAskTask.Lifecycle == AgentLifecycle.WaitingAnswer && subAskTask.Capabilities.Contains(TaskCapability.Answer),
+    "subagent question: waitingAnswer + Answer capability");
+Check(!subAskTask.Capabilities.Contains(TaskCapability.Approve), "subagent question: no approve/deny buttons");
+
+// ── 撤卡清单：StopFailure 与 PermissionDenied ──
+var stopFail = new TaskCatalog();
+stopFail.Accept(C("PermissionRequest", new { session_id = "claude_22", tool_name = "Bash", tool_input = new { command = "rm x" } }), gapNow);
+Check(stopFail.Projection().PendingRequests.Count == 1, "stop-failure: card registered");
+stopFail.Accept(C("StopFailure", new { session_id = "claude_22", error = "rate_limit" }), gapNow.AddSeconds(1));
+Check(stopFail.Projection().PendingRequests.Count == 0, "stop-failure: an API-failed turn clears the stuck card");
+Check(stopFail.Projection().Tasks.First(x => x.Id == "claude_22").Lifecycle == AgentLifecycle.Interrupted,
+    "stop-failure: turn is interrupted");
+
+// ── 离线清卡 ──
+var offCatalog = new TaskCatalog();
+offCatalog.Accept(C("PermissionRequest", new { session_id = "claude_23", tool_name = "Bash", tool_input = new { command = "rm x" } }), gapNow);
+Check(offCatalog.Projection().PendingRequests.Count == 1, "offline: card registered");
+offCatalog.Maintain(gapNow.AddMinutes(12));
+Check(offCatalog.Projection().Tasks.First(x => x.Id == "claude_23").Lifecycle == AgentLifecycle.Offline, "offline: task goes offline");
+Check(offCatalog.Projection().PendingRequests.Count == 0, "offline: a dead session must not keep a dead card");
+
+// ── 容量裁剪后不留幽灵卡 ──
+var capCatalog = new TaskCatalog(capacity: 1);
+capCatalog.Accept(C("PermissionRequest", new { session_id = "claude_24", tool_name = "Bash", tool_input = new { command = "a" } }), gapNow);
+capCatalog.Accept(C("Stop", new { session_id = "claude_24" }), gapNow.AddSeconds(1));   // 终态 → 可被裁
+capCatalog.Accept(C("PermissionRequest", new { session_id = "claude_25", tool_name = "Bash", tool_input = new { command = "b" } }), gapNow.AddSeconds(2));
+Check(capCatalog.Projection().PendingRequests.All(r => r.TaskID == "claude_25"),
+    "capacity prune: a pruned task leaves no phantom card behind");
+
+// ── Stop 终稿：两路都落空时，Maintain 在限期内补读 ──
+var lateCatalog = new TaskCatalog();
+var latePath = Path.Combine(Path.GetTempPath(), "ap-verify-claude-late-" + Guid.NewGuid().ToString("N") + ".jsonl");
+File.WriteAllLines(latePath,
+    ["{\"type\":\"user\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":\"干活\"}}"]);
+lateCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_26", prompt = "干活", transcript_path = latePath }), gapNow);
+lateCatalog.Accept(C("PreToolUse", new { session_id = "claude_26", transcript_path = latePath, tool_name = "Bash", tool_input = new { command = "ls" } }), gapNow.AddSeconds(1));
+lateCatalog.Accept(C("PostToolUse", new { session_id = "claude_26", transcript_path = latePath, tool_name = "Bash" }), gapNow.AddSeconds(2));
+// 此时第三行是工具步：Stop 不该登记补读（工具步按设计保留）
+lateCatalog.Accept(C("Stop", new { session_id = "claude_26", transcript_path = latePath }), gapNow.AddSeconds(3));
+File.AppendAllLines(latePath,
+    ["{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"迟到的正文\"}]}}"]);
+lateCatalog.Maintain(gapNow.AddSeconds(6));
+Check(lateCatalog.Projection().Tasks.First(x => x.Id == "claude_26").LatestStep == "Bash ls",
+    "late preview: a turn that left a tool step keeps it (no recheck)");
+
+// 第三行整个是空时才登记，并能在限期内补上
+var emptyCatalog = new TaskCatalog();
+var emptyPath = Path.Combine(Path.GetTempPath(), "ap-verify-claude-empty-" + Guid.NewGuid().ToString("N") + ".jsonl");
+File.WriteAllLines(emptyPath,
+    ["{\"type\":\"user\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":\"干活\"}}"]);
+emptyCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_27", prompt = "干活", transcript_path = emptyPath }), gapNow);
+emptyCatalog.Accept(C("Stop", new { session_id = "claude_27", transcript_path = emptyPath }), gapNow.AddSeconds(1));
+Check(emptyCatalog.Projection().Tasks.First(x => x.Id == "claude_27").LatestStep is null, "late preview: nothing landed yet");
+File.AppendAllLines(emptyPath,
+    ["{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"补上的终稿\"}]}}"]);
+emptyCatalog.Maintain(gapNow.AddSeconds(4));
+Check(emptyCatalog.Projection().Tasks.First(x => x.Id == "claude_27").LatestStep == "补上的终稿",
+    $"late preview: maintenance fills in the missed final text (got '{emptyCatalog.Projection().Tasks.First(x => x.Id == "claude_27").LatestStep}')");
+File.Delete(latePath);
+File.Delete(emptyPath);
+
+// ===================== 25. 多题逐题推进（桥端拆题，零协议改动） =====================
+var multiCatalog = new TaskCatalog();
+var multiNow = DateTimeOffset.UtcNow;
+multiCatalog.Accept(C("PermissionRequest", new { session_id = "claude_30", tool_name = "AskUserQuestion", tool_input = multiAsk }), multiNow);
+TaskSnapshot Multi() => multiCatalog.Projection().Tasks.First(x => x.Id == "claude_30");
+
+var firstCard = multiCatalog.Projection().PendingRequests.First();
+Check(firstCard.Summary == "第 1/2 题： 第一题？" && firstCard.Options is ["A", "B"],
+    $"multi advance: only the first question is presented (got '{firstCard.Summary}' / {string.Join(",", firstCard.Options)})");
+Check(Multi().LatestStep == "第 1/2 题： 题一", $"multi advance: third line tracks the current question (got '{Multi().LatestStep}')");
+
+var multiResolver = new RecordingResolver();
+var firstAck = multiCatalog.Perform(Guid.NewGuid(), new ControlPayload("claude_30", ControlAction.Answer, "A"), multiResolver);
+Check(firstAck.Result == ControlResult.Accepted, "multi advance: first answer accepted");
+Check(multiResolver.AnswersWritten is null, "multi advance: nothing is written back until every question is answered");
+
+var secondCard = multiCatalog.Projection().PendingRequests.First();
+Check(secondCard.Summary == "第 2/2 题： 第二题？" && secondCard.Options is ["C", "D"],
+    $"multi advance: the card moves on to the second question (got '{secondCard.Summary}' / {string.Join(",", secondCard.Options)})");
+Check(Multi().Lifecycle == AgentLifecycle.WaitingAnswer && Multi().Capabilities.Contains(TaskCapability.Answer),
+    "multi advance: still waiting and still answerable");
+Check(Multi().LatestStep == "第 2/2 题： 题二", $"multi advance: third line follows along (got '{Multi().LatestStep}')");
+
+var lastAck = multiCatalog.Perform(Guid.NewGuid(), new ControlPayload("claude_30", ControlAction.Answer, "C"), multiResolver);
+Check(lastAck.Result == ControlResult.Accepted, "multi advance: last answer accepted");
+Check(multiResolver.AnswersWritten is { Count: 2 } written &&
+      written["第一题？"] == "A" && written["第二题？"] == "C",
+    "multi advance: every answer is written back as one map");
+Check(multiCatalog.Projection().PendingRequests.Count == 0 && Multi().Lifecycle == AgentLifecycle.Running,
+    "multi advance: the wait ends and the turn resumes");
+
+// 单题不受影响：仍走"点选项→answers / 打字→response"的老路，不进逐题推进
+var singleResolver = new RecordingResolver();
+var singleAdvance = new TaskCatalog();
+singleAdvance.Accept(C("PermissionRequest", new { session_id = "claude_31", tool_name = "AskUserQuestion", tool_input = askInput }), multiNow);
+singleAdvance.Perform(Guid.NewGuid(), new ControlPayload("claude_31", ControlAction.Answer, "就用 A"), singleResolver);
+Check(singleResolver.RawInput is not null && singleResolver.AnswersWritten is null,
+    "multi advance: a single question still uses the plain answer path");
+
+// AnswerMap 的形状：整张 answers 表 + 原样带回 questions
+var mapBytes = ClaudeHookOutput.AnswerMap(
+    """{"questions":[{"question":"q1"},{"question":"q2"}]}""",
+    new Dictionary<string, string> { ["q1"] = "A", ["q2"] = "C" });
+var mapInput = JsonNode.Parse(System.Text.Encoding.UTF8.GetString(mapBytes).Trim())!
+    .AsObject()["hookSpecificOutput"]!["decision"]!["updatedInput"]!.AsObject();
+Check(mapInput["answers"] is JsonObject writtenMap &&
+      writtenMap["q1"]!.GetValue<string>() == "A" && writtenMap["q2"]!.GetValue<string>() == "C",
+    "multi advance: AnswerMap writes the structured answers map");
+Check(mapInput["questions"] is JsonArray { Count: 2 }, "multi advance: AnswerMap still echoes the original questions");
+
+// ===================== 26. 选项注解写在选项框里（`label（注解）`）+ 回传归一化 =====================
+var describedAsk = JsonSerializer.SerializeToElement(new
+{
+    questions = new[]
+    {
+        new
+        {
+            question = "选哪个？",
+            header = "选择",
+            options = new[]
+            {
+                new { label = "A", description = "选 A 会怎样" },
+                new { label = "B", description = "选 B 会怎样" },
+            },
+        },
+    },
+});
+Check(ClaudeEventReducer.QuestionOptions(describedAsk) is ["A（选 A 会怎样）", "B（选 B 会怎样）"],
+    $"option display: the annotation rides inside the option text (got '{string.Join(" | ", ClaudeEventReducer.QuestionOptions(describedAsk))}')");
+
+// 单题：App 回传整串 → 仍要落成结构化 answers{问题: 纯 label}，不能退化成自由文本
+var annotatedBytes = ClaudeHookOutput.Answer(
+    """{"questions":[{"question":"选哪个？","header":"选择","options":[{"label":"A","description":"选 A 会怎样"},{"label":"B","description":"选 B 会怎样"}]}]}""",
+    "A（选 A 会怎样）");
+var annotatedInput = JsonNode.Parse(System.Text.Encoding.UTF8.GetString(annotatedBytes).Trim())!
+    .AsObject()["hookSpecificOutput"]!["decision"]!["updatedInput"]!.AsObject();
+Check(annotatedInput["answers"] is JsonObject annotated && annotated["选哪个？"]!.GetValue<string>() == "A",
+    "option display: an annotated button text still normalises to the bare label");
+Check(annotatedInput["response"] is null, "option display: it does not degrade into a free-text response");
+
+// label 自己就以括号结尾时不能被归一化削掉（先原样对表）
+var parenthesisedBytes = ClaudeHookOutput.Answer(
+    """{"questions":[{"question":"q","options":[{"label":"A（重要）","description":"注解"}]}]}""",
+    "A（重要）");
+var parenthesisedInput = JsonNode.Parse(System.Text.Encoding.UTF8.GetString(parenthesisedBytes).Trim())!
+    .AsObject()["hookSpecificOutput"]!["decision"]!["updatedInput"]!.AsObject();
+Check(parenthesisedInput["answers"]!["q"]!.GetValue<string>() == "A（重要）",
+    "option display: a label that itself ends with parentheses is matched as-is");
+
+// 多题：卡片上当前题的选项同样带注解，回传整串也要还原成纯 label
+var describedMulti = JsonSerializer.SerializeToElement(new
+{
+    questions = new[]
+    {
+        new { question = "第一题？", header = "题一", options = new[] { new { label = "A", description = "注解 A" }, new { label = "B", description = "注解 B" } } },
+        new { question = "第二题？", header = "题二", options = new[] { new { label = "C", description = "注解 C" }, new { label = "D", description = "注解 D" } } },
+    },
+});
+var annotatedCatalog = new TaskCatalog();
+annotatedCatalog.Accept(C("PermissionRequest", new { session_id = "claude_41", tool_name = "AskUserQuestion", tool_input = describedMulti }), multiNow);
+Check(annotatedCatalog.Projection().PendingRequests.First().Options is ["A（注解 A）", "B（注解 B）"],
+    "option display: per-question advancement annotates the current question's options");
+
+var annotatedResolver = new RecordingResolver();
+annotatedCatalog.Perform(Guid.NewGuid(), new ControlPayload("claude_41", ControlAction.Answer, "A（注解 A）"), annotatedResolver);
+annotatedCatalog.Perform(Guid.NewGuid(), new ControlPayload("claude_41", ControlAction.Answer, "C（注解 C）"), annotatedResolver);
+Check(annotatedResolver.AnswersWritten is { Count: 2 } annotatedMap &&
+      annotatedMap["第一题？"] == "A" && annotatedMap["第二题？"] == "C",
+    "option display: multi answers normalise back to bare labels");
+
+// 心跳（A 口径）：工具步粘滞，不被更早的正文盖掉（这条在 C 回退后仍然成立，钉住它防再放宽）
+var heartbeatCatalog = new TaskCatalog();
+var heartbeatPath = Path.Combine(Path.GetTempPath(), "ap-verify-claude-hb-" + Guid.NewGuid().ToString("N") + ".jsonl");
+File.WriteAllLines(heartbeatPath,
+[
+    "{\"type\":\"user\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":\"干活\"}}",
+    "{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"我先说一句再干活\"}]}}",
+    "{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\"}]}}",
+]);
+heartbeatCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_51", prompt = "干活", transcript_path = heartbeatPath }), gapNow);
+heartbeatCatalog.Accept(C("PreToolUse", new { session_id = "claude_51", transcript_path = heartbeatPath, tool_name = "Bash", tool_input = new { command = "ls" } }), gapNow.AddSeconds(1));
+heartbeatCatalog.Accept(C("PostToolUse", new { session_id = "claude_51", transcript_path = heartbeatPath, tool_name = "Bash" }), gapNow.AddSeconds(2));
+heartbeatCatalog.Maintain(gapNow.AddSeconds(5));
+Check(heartbeatCatalog.Projection().Tasks.First(x => x.Id == "claude_51").LatestStep == "Bash ls",
+    $"stop preview: the heartbeat keeps the tool step (A behaviour unchanged) (got '{heartbeatCatalog.Projection().Tasks.First(x => x.Id == "claude_51").LatestStep}')");
+File.Delete(heartbeatPath);
+
 Console.WriteLine();
 Console.WriteLine(failures.Count == 0 ? "ALL CHECKS PASSED" : $"FAILURES: {string.Join(", ", failures)}");
 return failures.Count == 0 ? 0 : 1;
@@ -553,4 +1315,31 @@ return failures.Count == 0 ? 0 : 1;
 sealed class NullResolver : ICodexPermissionResolver
 {
     public bool Resolve(string sessionID, CodexPermissionDecision decision) => false;
+
+    public bool ResolveAnswer(string sessionID, string rawToolInput, string answer) => false;
+
+    public bool ResolveAnswers(string sessionID, string rawToolInput, IReadOnlyDictionary<string, string> answers) => false;
+}
+
+/// <summary>记下作答回填内容的桩：验证"整份带回原始 tool_input + 自由文本 / 多题整张答案表"。</summary>
+sealed class RecordingResolver : ICodexPermissionResolver
+{
+    public string? RawInput;
+    public string? AnswerText;
+    public Dictionary<string, string>? AnswersWritten;
+
+    public bool Resolve(string sessionID, CodexPermissionDecision decision) => true;
+
+    public bool ResolveAnswer(string sessionID, string rawToolInput, string answer)
+    {
+        RawInput = rawToolInput;
+        AnswerText = answer;
+        return true;
+    }
+
+    public bool ResolveAnswers(string sessionID, string rawToolInput, IReadOnlyDictionary<string, string> answers)
+    {
+        AnswersWritten = new Dictionary<string, string>(answers, StringComparer.Ordinal);
+        return true;
+    }
 }

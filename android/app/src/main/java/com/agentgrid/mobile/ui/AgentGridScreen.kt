@@ -890,6 +890,14 @@ private fun TaskDetails(
                     targetPending?.kind == PendingRequestKind.QUESTION &&
                     TaskCapability.ANSWER in task.capabilities
                 ) {
+                    // 选项按钮：桥端只在**只有一题**时下发选项（多题时 options 为空），
+                    // 所以"有选项"就等于"这道题可以点选"——点一下把 label 原样发回去，
+                    // 桥端识别出来就走结构化 answers（而不是自由文本 response）。
+                    targetPending.options.forEach { option ->
+                        PixelButton(option, AgentGridColors.Cyan) {
+                            onControl(task.id, ControlAction.ANSWER, option)
+                        }
+                    }
                     OutlinedTextField(
                         value = answer,
                         onValueChange = { answer = it },

@@ -34,7 +34,13 @@ public partial class MainWindow : Window
         ServiceStatusText.Text = state.ServiceStatus;
         PhoneCountText.Text = state.PhoneCount.ToString();
         HookStatusText.Text = state.HookInstalled ? "已写入" : "未安装";
-        ClaudeHookStatusText.Text = state.ClaudeHookInstalled ? "已写入" : "未安装";
+        ClaudeHookStatusText.Text = state.ClaudeHookText;
+        ClaudeHookStatusText.Foreground = state.ClaudeHookState switch
+        {
+            ClaudeHookStatus.Installed => new SolidColorBrush(System.Windows.Media.Color.FromRgb(0xA7, 0x8B, 0xFA)),
+            ClaudeHookStatus.Outdated => new SolidColorBrush(System.Windows.Media.Color.FromRgb(0xFD, 0xBA, 0x4A)),
+            _ => new SolidColorBrush(System.Windows.Media.Color.FromRgb(0x7F, 0x8A, 0x9A)),
+        };
         OpenCodeStatusText.Text = state.OpenCodePluginText;
         OpenCodeStatusText.Foreground = state.OpenCodePluginState switch
         {

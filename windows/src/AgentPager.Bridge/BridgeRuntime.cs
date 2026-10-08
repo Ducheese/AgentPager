@@ -8,7 +8,8 @@ public sealed record BridgeViewState(
     string ServiceStatus,
     int PhoneCount,
     bool HookInstalled,
-    bool ClaudeHookInstalled,
+    string ClaudeHookText,
+    ClaudeHookStatus ClaudeHookState,
     string OpenCodePluginText,
     OpenCodePluginStatus OpenCodePluginState,
     DateTimeOffset? LastHookAt,
@@ -142,7 +143,7 @@ public sealed class BridgeRuntime : IAsyncDisposable
     {
         try
         {
-            var result = _claudeHookConfiguration.Install(Environment.ProcessPath!);
+            var result = _claudeHookConfiguration.Install();
             _log.Write("INFO", result.Changed ? "Claude Code Hook 已安装。" : "Claude Code Hook 已是最新状态。");
             _lastError = null;
         }
@@ -276,7 +277,7 @@ public sealed class BridgeRuntime : IAsyncDisposable
                         changed = hook.Envelope switch
                         {
                             HookEnvelope.Codex codex => HandleCodexHook(codex.Hook),
-                            HookEnvelope.Claude claude => _catalog.Accept(claude.Hook),
+                            HookEnvelope.Claude claude => AcceptClaudeHook(claude.Hook),
                             HookEnvelope.OpenCode openCode => _catalog.Accept(openCode.Hook),
                             HookEnvelope.Antigravity agy => _catalog.Accept(agy.Hook),
                             _ => false,
@@ -313,6 +314,21 @@ public sealed class BridgeRuntime : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Claude 事件统一入口：处理完后**顺手释放已经用不上的待决连接**。
+    /// 等待若以别的方式结束（用户在终端作答、工具跑完、回合结束），挂住的 hook 就没人管了——
+    /// 实测 Claude Code 不会替我们杀它，那个 node 进程会一直挂到 24 小时超时。
+    /// </summary>
+    private bool AcceptClaudeHook(ClaudeHookPayload hook)
+    {
+        var changed = _catalog.Accept(hook);
+        if (_hookServer is not null &&
+            _hookServer.HasPending(hook.SessionID) &&
+            !_catalog.HasPendingRequest(hook.SessionID))
+            _hookServer.Cancel(hook.SessionID);
+        return changed;
+    }
+
     private bool HandleCodexHook(CodexHookPayload hook)
     {
         _rollout.Include(hook);
@@ -332,8 +348,11 @@ public sealed class BridgeRuntime : IAsyncDisposable
             acknowledgment = _catalog.Perform(request.MessageId, request.Payload,
                 _hookServer ?? throw new InvalidOperationException("Hook 通道尚未就绪"));
         }
-        catch (ProtocolException)
+        catch (ProtocolException error)
         {
+            // 这条以前是静默的：App 那边只看到"没反应"，日志里一点痕迹都没有（实测踩过，
+            // 手机作答因为签名编码不一致被拒，排查全靠猜）。失败原因必须落盘。
+            _log.Write("WARN", $"控制消息被拒（{error.Failure}）：{request.Payload.Action} / 任务 {request.Payload.TaskID}");
             acknowledgment = new(request.MessageId, ControlResult.Rejected, "签名或序号无效");
         }
         var envelope = MessageEnvelope<ControlAckPayload>.Create("control.ack", acknowledgment);
@@ -429,6 +448,17 @@ public sealed class BridgeRuntime : IAsyncDisposable
                 : $"待更新 → v{pluginVersion}",
             _ => $"已写入 v{pluginVersion}",
         };
+        var claudeStatus = _claudeHookConfiguration.Status;
+        var claudeVersion = ClaudeHookConfiguration.EmbeddedVersion;
+        var claudeInstalledVersion = _claudeHookConfiguration.InstalledVersion;
+        var claudeText = claudeStatus switch
+        {
+            ClaudeHookStatus.NotInstalled => "未安装",
+            ClaudeHookStatus.Outdated => claudeInstalledVersion is int installed
+                ? $"待更新 v{installed} → v{claudeVersion}"
+                : $"待更新 → v{claudeVersion}",
+            _ => $"已写入 v{claudeVersion}",
+        };
         var agyStatus = _agyHookConfiguration.Status;
         var agyVersion = AgyHookConfiguration.EmbeddedVersion;
         var agyInstalledVersion = _agyHookConfiguration.InstalledVersion;
@@ -444,7 +474,8 @@ public sealed class BridgeRuntime : IAsyncDisposable
             _serviceStatus,
             _phoneCount,
             _hookConfiguration.IsInstalled(),
-            _claudeHookConfiguration.IsInstalled(),
+            claudeText,
+            claudeStatus,
             pluginText,
             pluginStatus,
             _lastHookAt,

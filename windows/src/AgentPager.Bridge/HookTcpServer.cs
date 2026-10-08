@@ -43,6 +43,85 @@ public sealed class HookTcpServer(Func<HookEnvelope, Task> hookHandler, DailyFil
         catch (IOException) { return false; }
     }
 
+    /// <summary>
+    /// 作答：与 <see cref="Resolve"/> 同一条待决通道，只是回包换成"带答案的放行"。
+    /// 只有 Claude 走这条（其它来源没有"提问即权限询问"这种形态）。
+    /// </summary>
+    public bool ResolveAnswer(string sessionID, string rawToolInput, string answer)
+    {
+        if (!_pending.TryRemove(sessionID, out var entry))
+        {
+            log.Write("WARN", $"[Claude] 作答时没有待决连接：会话 {sessionID}");
+            return false;
+        }
+        try
+        {
+            using (entry.Client)
+            {
+                if (entry.Source != HookSource.Claude)
+                {
+                    log.Write("WARN", $"[Claude] 作答通道来源不是 Claude：{entry.Source}");
+                    return false;
+                }
+                entry.Client.GetStream().Write(ClaudeHookOutput.Answer(rawToolInput, answer));
+            }
+            log.Write("INFO", $"[Claude] 作答已回填（{answer.Length} 字，会话 {sessionID}）");
+            return true;
+        }
+        catch (IOException error)
+        {
+            log.Write("WARN", $"[Claude] 作答回填失败：{error.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>是否还攥着某会话的待决连接（权限/作答等待中）。</summary>
+    public bool HasPending(string sessionID) => _pending.ContainsKey(sessionID);
+
+    /// <summary>
+    /// 释放挂住的连接，**不写任何回复**。
+    ///
+    /// 场景：等待已经以别的方式结束了——用户在终端自己作答、工具跑完、回合结束。
+    /// 实测（2026-10-08）：这种情况下 Claude Code **不会**替我们杀掉 hook 进程，那个 node
+    /// 会一直挂到 `timeout`（提问/权限是 86400 秒）才收场。主动关掉 socket，脚本看到 close
+    /// 即 exit 0，Claude Code 视作"没有输出"——正是我们要的"不干预"。
+    /// </summary>
+    public bool Cancel(string sessionID)
+    {
+        if (!_pending.TryRemove(sessionID, out var entry)) return false;
+        entry.Client.Dispose();
+        log.Write("INFO", $"[Claude] 释放挂起的 hook（等待已在别处结束，会话 {sessionID}）");
+        return true;
+    }
+
+    public bool ResolveAnswers(string sessionID, string rawToolInput, IReadOnlyDictionary<string, string> answers)
+    {
+        if (!_pending.TryRemove(sessionID, out var entry))
+        {
+            log.Write("WARN", $"[Claude] 多题回填时没有待决连接：会话 {sessionID}");
+            return false;
+        }
+        try
+        {
+            using (entry.Client)
+            {
+                if (entry.Source != HookSource.Claude)
+                {
+                    log.Write("WARN", $"[Claude] 作答通道来源不是 Claude：{entry.Source}");
+                    return false;
+                }
+                entry.Client.GetStream().Write(ClaudeHookOutput.AnswerMap(rawToolInput, answers));
+            }
+            log.Write("INFO", $"[Claude] 多题作答已回填（{answers.Count} 题，会话 {sessionID}）");
+            return true;
+        }
+        catch (IOException error)
+        {
+            log.Write("WARN", $"[Claude] 多题回填失败：{error.Message}");
+            return false;
+        }
+    }
+
     private async Task AcceptLoop(CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
@@ -95,6 +174,7 @@ public sealed class HookTcpServer(Func<HookEnvelope, Task> hookHandler, DailyFil
                 var source = envelope is HookEnvelope.Claude ? HookSource.Claude : HookSource.Codex;
                 if (_pending.TryGetValue(sessionID, out var previous)) previous.Client.Dispose();
                 _pending[sessionID] = (client, source);
+                log.Write("INFO", $"[{source}] 挂起等待（会话 {sessionID}）");
                 await hookHandler(envelope);
                 return;
             }

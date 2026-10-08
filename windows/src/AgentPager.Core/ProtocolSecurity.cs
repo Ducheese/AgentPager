@@ -1,5 +1,6 @@
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 
 namespace AgentPager.Core;
@@ -13,6 +14,19 @@ public sealed class ProtocolException(ProtocolFailure failure) : Exception(failu
 
 public static class ControlSigner
 {
+    /// <summary>
+    /// 签名串里的字符串必须与 **App 端 kotlinx.serialization** 的转义**逐字节一致**。
+    ///
+    /// 默认的 <see cref="JsonSerializer"/> 会把非 ASCII 转义成 \uXXXX（还会转 &lt; &gt; &amp; ' 等），
+    /// 而 kotlinx 原样输出——两边算出来的 HMAC 就不同，校验静默失败。
+    /// **实测（2026-10-08）踩过**：手机作答（含中文文本）点了没反应，日志里连 `Perform` 都没进；
+    /// 批准/拒绝一直正常，只因为它们的 `value` 是 null、根本不走这段。
+    /// </summary>
+    private static readonly JsonSerializerOptions Canonical = new()
+    {
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+    };
+
     public static bool Verify(SignedControlEnvelope envelope, byte[] secret)
     {
         byte[] signature;
@@ -25,11 +39,11 @@ public static class ControlSigner
 
     public static byte[] SigningData(SignedControlEnvelope envelope)
     {
-        var action = JsonSerializer.Serialize(WireAction(envelope.Payload.Action));
-        var task = JsonSerializer.Serialize(envelope.Payload.TaskID);
+        var action = JsonSerializer.Serialize(WireAction(envelope.Payload.Action), Canonical);
+        var task = JsonSerializer.Serialize(envelope.Payload.TaskID, Canonical);
         var payload = envelope.Payload.Value is null
             ? $"{{\"action\":{action},\"taskID\":{task}}}"
-            : $"{{\"action\":{action},\"taskID\":{task},\"value\":{JsonSerializer.Serialize(envelope.Payload.Value)}}}";
+            : $"{{\"action\":{action},\"taskID\":{task},\"value\":{JsonSerializer.Serialize(envelope.Payload.Value, Canonical)}}}";
         var text = string.Join('\n',
             envelope.Version.ToString(),
             envelope.MessageId.ToString().ToLowerInvariant(),

@@ -10,6 +10,9 @@
     <EmbeddedResource Include="Resources\agentpager-antigravity.js">
       <LogicalName>AgentPager.Core.Resources.agentpager-antigravity.js</LogicalName>
     </EmbeddedResource>
+    <EmbeddedResource Include="Resources\agentpager-claude.js">
+      <LogicalName>AgentPager.Core.Resources.agentpager-claude.js</LogicalName>
+    </EmbeddedResource>
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite" />

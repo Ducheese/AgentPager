@@ -47,7 +47,7 @@ AgentPager 将 Codex Desktop、Codex CLI 与 Claude Code 的运行状态通过�
 | Agent | 状态同步 | 手机端操作 |
 | --- | --- | --- |
 | Codex Desktop / CLI | 支持 | 支持批准或拒绝权限请求 |
-| Claude Code | 支持 | 暂不支持 |
+| Claude Code | 支持 | 支持批准或拒绝权限请求 |
 | opencode | 支持 | 暂不支持 |
 | Antigravity (agy) | 支持 | 暂不支持 |
 
@@ -154,7 +154,7 @@ That is how AgentPager came to be: putting an idle phone back to work as a genui
 | Agent | Status sync | Phone controls |
 | --- | --- | --- |
 | Codex Desktop / CLI | Supported | Approve or reject permission requests |
-| Claude Code | Supported | Not yet supported |
+| Claude Code | Supported | Approve or deny permission requests |
 | opencode | Supported | Not yet supported |
 | Antigravity (agy) | Supported | Not yet supported |
 
