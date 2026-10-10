@@ -150,15 +150,24 @@ data class TaskSnapshot(
         get() = lifecycle in setOf(
             AgentLifecycle.SUCCEEDED,
             AgentLifecycle.INTERRUPTED,
+            AgentLifecycle.OFFLINE,
+        )
+
+    val isWaiting: Boolean
+        get() = lifecycle in setOf(
+            AgentLifecycle.WAITING_APPROVAL,
+            AgentLifecycle.WAITING_ANSWER,
         )
 
     fun elapsedAt(now: Long): Long {
-        val endAt = if (isTerminal) {
-            requireNotNull(completedAt) { "终态任务必须包含完成时间" }
-        } else {
-            now
+        if (lifecycle == AgentLifecycle.IDLE) return 0L
+
+        val endAt = when {
+            isTerminal -> completedAt ?: updatedAt
+            isWaiting -> updatedAt
+            else -> now
         }
-        return (endAt - startedAt).coerceAtLeast(0)
+        return (endAt - startedAt).coerceAtLeast(0L)
     }
 
     val attentionPriority: Int

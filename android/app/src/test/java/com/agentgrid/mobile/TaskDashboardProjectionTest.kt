@@ -33,6 +33,21 @@ class TaskDashboardProjectionTest {
     }
 
     @Test
+    fun `已完成任务优先级高于离线与空闲任务且等待作答与审批同等最高优先级`() {
+        val offline = task("offline", AgentLifecycle.OFFLINE, 100)
+        val idle = task("idle", AgentLifecycle.IDLE, 90)
+        val succeeded = task("succeeded", AgentLifecycle.SUCCEEDED, 50)
+        val waitingAnswer = task("answer", AgentLifecycle.WAITING_ANSWER, 10)
+        val waitingApproval = task("approval", AgentLifecycle.WAITING_APPROVAL, 20)
+
+        val ordered = project(listOf(offline, idle, succeeded, waitingAnswer, waitingApproval))
+            .orderedTasks.map { it.id }
+
+        // approval (updatedAt 20) > answer (updatedAt 10) > succeeded > offline (updatedAt 100) > idle (updatedAt 90)
+        assertEquals(listOf("approval", "answer", "succeeded", "offline", "idle"), ordered)
+    }
+
+    @Test
     fun `重复 ID 保留更新时间较新且同时间保留最后一个`() {
         val old = task("same", AgentLifecycle.RUNNING, 10)
         val newer = task("same", AgentLifecycle.RUNNING, 20)

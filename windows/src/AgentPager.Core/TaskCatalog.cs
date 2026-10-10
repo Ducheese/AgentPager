@@ -69,6 +69,8 @@ public sealed class TaskCatalog
     // Stop 终稿的竞速补救：转录本与 payload 两路都没拿到正文时登记，交由 Maintain 限期内重读一次
     // （照搬 agy 的 _agyPreviewRecheck；两条路同时落空才会触发）。
     private readonly Dictionary<string, (string Path, DateTimeOffset Deadline)> _claudePreviewRecheck = new(StringComparer.Ordinal);
+    // 等待人类输入/审批的起始时刻：用于时钟顺延补偿，剔除人类作答等待时间
+    private readonly Dictionary<string, DateTimeOffset> _waitingSince = new(StringComparer.Ordinal);
     private readonly int _capacity;
     private ulong _revision;
 
@@ -935,6 +937,8 @@ public sealed class TaskCatalog
                 {
                     Lifecycle = AgentLifecycle.Offline,
                     Activity = null,
+                    UpdatedAt = now,
+                    CompletedAt = task.CompletedAt ?? now,
                     Subagents = SubagentSweep.Finalize(task.Subagents),
                     Capabilities = [],
                 });
@@ -994,6 +998,8 @@ public sealed class TaskCatalog
             {
                 Lifecycle = AgentLifecycle.Offline,
                 Activity = null,
+                UpdatedAt = now,
+                CompletedAt = task.CompletedAt ?? now,
                 Subagents = SubagentSweep.Finalize(task.Subagents),
             };
             changed = true;
@@ -1278,7 +1284,8 @@ public sealed class TaskCatalog
     {
         _tasks.RemoveAll(task =>
             task.Id.StartsWith("agentgrid-", StringComparison.Ordinal) && now - task.UpdatedAt >= TimeSpan.FromMinutes(1) ||
-            task.IsTerminal && task.CompletedAt is not null && now - task.CompletedAt > TimeSpan.FromMinutes(30));
+            task.Lifecycle == AgentLifecycle.Offline && task.UserPrompt is null && task.Subagents.Count == 0 && now - task.UpdatedAt >= TimeSpan.FromMinutes(1) ||
+            task.IsTerminal && now - (task.CompletedAt ?? task.UpdatedAt) > TimeSpan.FromMinutes(30));
         for (var index = 0; index < _tasks.Count; index++)
         {
             var task = _tasks[index];
@@ -1330,6 +1337,7 @@ public sealed class TaskCatalog
         PruneSessionMap(_claudeApprovalSource, live);
         PruneSessionMap(_claudePreviewRecheck, live);
         PruneSessionMap(_requests, live);
+        PruneSessionMap(_waitingSince, live);
 
         static void PruneSessionMap<T>(Dictionary<string, T> map, HashSet<string> live)
         {
@@ -1346,6 +1354,31 @@ public sealed class TaskCatalog
     private void Upsert(TaskSnapshot task)
     {
         var index = _tasks.FindIndex(value => value.Id == task.Id);
+        var existing = index >= 0 ? _tasks[index] : null;
+
+        var wasWaiting = existing is not null &&
+            (existing.Lifecycle is AgentLifecycle.WaitingApproval or AgentLifecycle.WaitingAnswer);
+        var isNowWaiting = task.Lifecycle is AgentLifecycle.WaitingApproval or AgentLifecycle.WaitingAnswer;
+
+        if (isNowWaiting)
+        {
+            // 首次进入等待态：记录挂起点
+            if (!_waitingSince.ContainsKey(task.Id))
+                _waitingSince[task.Id] = task.UpdatedAt;
+        }
+        else if (wasWaiting && _waitingSince.Remove(task.Id, out var waitStart))
+        {
+            // 退出等待态（人类已作答放行）：计算人类等待时长，时钟顺延补偿
+            var pauseDuration = task.UpdatedAt - waitStart;
+            if (pauseDuration > TimeSpan.Zero)
+            {
+                task = task with
+                {
+                    StartedAt = task.StartedAt + pauseDuration
+                };
+            }
+        }
+
         if (index < 0) _tasks.Add(task);
         else _tasks[index] = task;
     }
@@ -1556,7 +1589,7 @@ public static class ClaudeEventReducer
         // 于是这一行反映的是"这个会话此刻在哪个目录干活"。用户实测确认这是期望行为
         // （曾按"另两家都用稳定目录"的理由冻结成首次取值，被用户裁定撤销——别再用直觉改语义）。
         task = ApplyTranscript(
-            task with { ProjectName = hook.ProjectName, UpdatedAt = now, CompletedAt = null },
+            task with { ProjectName = hook.ProjectName, UpdatedAt = now },
             hook, transcript);
 
         switch (hook.HookEventName)
@@ -1691,7 +1724,7 @@ public static class ClaudeEventReducer
                 {
                     Lifecycle = task.IsTerminal ? task.Lifecycle : AgentLifecycle.Offline,
                     Activity = null,
-                    CompletedAt = task.IsTerminal ? task.CompletedAt : null,
+                    CompletedAt = task.IsTerminal ? task.CompletedAt : (task.CompletedAt ?? now),
                     // 进程退出后不会再有子代理事件，未终态的残留行级联扫为 interrupted。
                     Subagents = SubagentSweep.Finalize(task.Subagents),
                     Capabilities = [],
@@ -2107,6 +2140,7 @@ public static class OpenCodeEventReducer
                 {
                     Lifecycle = task.IsTerminal ? task.Lifecycle : AgentLifecycle.Offline,
                     Activity = null,
+                    CompletedAt = task.IsTerminal ? task.CompletedAt : (task.CompletedAt ?? now),
                     // 退出/删除时未终态的子代理不会再有子会话事件（随进程一起消失），
                     // 级联扫为 interrupted，防永久 Running 行残留并落盘（O3）。
                     Subagents = SubagentSweep.Finalize(task.Subagents),
@@ -2175,6 +2209,7 @@ public static class OpenCodeEventReducer
                 {
                     Lifecycle = task.IsTerminal ? task.Lifecycle : AgentLifecycle.Offline,
                     Activity = null,
+                    CompletedAt = task.IsTerminal ? task.CompletedAt : (task.CompletedAt ?? now),
                     Subagents = SubagentSweep.Finalize(task.Subagents),
                     Capabilities = [],
                     PromptQueued = false,

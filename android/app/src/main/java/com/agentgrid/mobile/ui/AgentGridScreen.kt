@@ -752,7 +752,7 @@ private fun TaskMeta(task: TaskSnapshot, alpha: Float) {
         task.updatedAt,
         task.completedAt,
     ) {
-        if (!task.isTerminal) {
+        if (task.lifecycle == AgentLifecycle.RUNNING || task.lifecycle == AgentLifecycle.STARTING) {
             while (true) {
                 value = task.elapsedAt(System.currentTimeMillis())
                 delay(1_000)

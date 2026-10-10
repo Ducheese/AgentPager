@@ -1308,6 +1308,61 @@ Check(heartbeatCatalog.Projection().Tasks.First(x => x.Id == "claude_51").Latest
     $"stop preview: the heartbeat keeps the tool step (A behaviour unchanged) (got '{heartbeatCatalog.Projection().Tasks.First(x => x.Id == "claude_51").LatestStep}')");
 File.Delete(heartbeatPath);
 
+// 等待作答时钟顺延补偿测试：人类等待时间不计入 Agent 净工作耗时
+var clockShiftCatalog = new TaskCatalog();
+var csT0 = DateTimeOffset.UtcNow;
+clockShiftCatalog.Accept(H("chat.message", new { sessionID = "turn_clock", message = "测试耗时" }), csT0);
+var taskRunning = clockShiftCatalog.Projection().Tasks.First(x => x.Id == "turn_clock");
+Check(taskRunning.StartedAt == csT0, "clock: turn started at t0");
+// 10秒后发起提问
+clockShiftCatalog.Accept(H("question.asked", new { sessionID = "turn_clock", questions = new[] { new { question = "选A还是B？" } } }), csT0.AddSeconds(10));
+var taskWaiting = clockShiftCatalog.Projection().Tasks.First(x => x.Id == "turn_clock");
+Check(taskWaiting.Lifecycle == AgentLifecycle.WaitingAnswer, "clock: entered waitingAnswer");
+// 人类等待了 50 秒才作答（总时间经过 60 秒）
+clockShiftCatalog.Accept(H("question.replied", new { sessionID = "turn_clock" }), csT0.AddSeconds(60));
+var taskResumed = clockShiftCatalog.Projection().Tasks.First(x => x.Id == "turn_clock");
+Check(taskResumed.Lifecycle == AgentLifecycle.Running, "clock: resumed to running");
+// 顺延 50 秒后，StartedAt 应为 csT0 + 50s，此时净耗时 = 60s - (csT0 + 50s) = 10s（精确扣除 50s 等待）
+Check(taskResumed.StartedAt == csT0.AddSeconds(50), "clock: startedAt shifted forward by pause duration");
+
+// ── 离线回收与终态保持测试 ──
+// 1) 终态保持：Succeeded 任务收到 SessionEnd 必须保持 Succeeded 和 CompletedAt
+var termCatalog = new TaskCatalog();
+var termT0 = DateTimeOffset.UtcNow;
+termCatalog.Accept(C("UserPromptSubmit", new { session_id = "term_keep", prompt = "测试" }), termT0);
+termCatalog.Accept(C("Stop", new { session_id = "term_keep" }), termT0.AddSeconds(5));
+var termFinished = termCatalog.Projection().Tasks.First(x => x.Id == "term_keep");
+Check(termFinished.Lifecycle == AgentLifecycle.Succeeded && termFinished.CompletedAt == termT0.AddSeconds(5),
+    "terminal keep: task succeeded with completedAt");
+termCatalog.Accept(C("SessionEnd", new { session_id = "term_keep" }), termT0.AddSeconds(10));
+var termAfterEnd = termCatalog.Projection().Tasks.First(x => x.Id == "term_keep");
+Check(termAfterEnd.Lifecycle == AgentLifecycle.Succeeded && termAfterEnd.CompletedAt == termT0.AddSeconds(5),
+    "terminal keep: sessionEnd preserves succeeded state and completedAt");
+
+// 2) 离线超时清理：30 分钟后被 Normalize 移除
+termCatalog.Maintain(termT0.AddMinutes(36));
+Check(termCatalog.Projection().Tasks.All(x => x.Id != "term_keep"),
+    "terminal prune: task purged after 30 minutes");
+
+// 3) 离线任务超容裁剪：离线任务应作为可裁剪对象被容量裁剪清除
+var offCapCatalog = new TaskCatalog(capacity: 1);
+offCapCatalog.Accept(C("SessionStart", new { session_id = "off_1" }), termT0);
+offCapCatalog.Accept(C("SessionEnd", new { session_id = "off_1" }), termT0.AddSeconds(1));
+Check(offCapCatalog.Projection().Tasks.First(x => x.Id == "off_1").Lifecycle == AgentLifecycle.Offline,
+    "offline capacity: first task is offline");
+offCapCatalog.Accept(C("SessionStart", new { session_id = "off_2" }), termT0.AddSeconds(2));
+// off_1 离线可被裁，容量为 1 时被清除
+Check(offCapCatalog.Projection().Tasks.Count == 1 && offCapCatalog.Projection().Tasks.First().Id == "off_2",
+    "offline capacity: offline task is evicted when capacity exceeded");
+
+// 4) 空离线任务 1 分钟快速回收
+var emptyGhostCatalog = new TaskCatalog();
+emptyGhostCatalog.Accept(C("SessionStart", new { session_id = "ghost_1" }), termT0);
+emptyGhostCatalog.Accept(C("SessionEnd", new { session_id = "ghost_1" }), termT0.AddSeconds(1));
+emptyGhostCatalog.Maintain(termT0.AddMinutes(2));
+Check(emptyGhostCatalog.Projection().Tasks.All(x => x.Id != "ghost_1"),
+    "empty offline: ghost task without prompt pruned after 1 minute");
+
 Console.WriteLine();
 Console.WriteLine(failures.Count == 0 ? "ALL CHECKS PASSED" : $"FAILURES: {string.Join(", ", failures)}");
 return failures.Count == 0 ? 0 : 1;

@@ -338,8 +338,9 @@ public static class AgyEventReducer
         }
 
         // 判定是否进入新一轮对话（OpenCode 规范）：
-        // 1) 首次创建任务；2) 上一轮为终态/闲置；3) 用户提示词发生变化；4) 此前处于排队提示词状态
-        var isNewPrompt = existing?.UserPrompt is not null && userPrompt is not null && existing.UserPrompt != userPrompt;
+        // 1) 首次创建任务；2) 上一轮为终态/闲置；3) 用户提示词发生变化（等待态作答退出除外）；4) 此前处于排队提示词状态
+        var wasWaitingBefore = existing?.Lifecycle is AgentLifecycle.WaitingApproval or AgentLifecycle.WaitingAnswer;
+        var isNewPrompt = !wasWaitingBefore && existing?.UserPrompt is not null && userPrompt is not null && existing.UserPrompt != userPrompt;
         var wasQueued = existing?.PromptQueued == true;
         var isTerminalBefore = existing is null || existing.Lifecycle is
             AgentLifecycle.Idle or AgentLifecycle.Succeeded or AgentLifecycle.Interrupted or AgentLifecycle.Offline;
@@ -832,7 +833,7 @@ public sealed class AgyHookConfiguration(string? configDirectory = null)
 
         // 2. 写入 ~/.gemini/config/hooks.json（统一正斜杠路径，杜绝转义与 BOM 问题）
         var normalizedScriptPath = ScriptPath.Replace('\\', '/');
-        var hookCommand = $"node \"{normalizedScriptPath}\"";
+        var hookCommand = $"node {normalizedScriptPath}";
 
         return MutateHooks(root =>
         {

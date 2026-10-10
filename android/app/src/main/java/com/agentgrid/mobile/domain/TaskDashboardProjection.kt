@@ -177,9 +177,11 @@ object TaskDashboardProjector {
 
     private val TaskSnapshot.sortGroup: Int
         get() = when (lifecycle) {
-            AgentLifecycle.WAITING_APPROVAL -> 3
-            AgentLifecycle.RUNNING -> 2
-            AgentLifecycle.SUCCEEDED -> 0
-            else -> 1
+            AgentLifecycle.WAITING_APPROVAL,
+            AgentLifecycle.WAITING_ANSWER -> 4
+            AgentLifecycle.RUNNING -> 3
+            AgentLifecycle.STARTING -> 2
+            AgentLifecycle.SUCCEEDED -> 1
+            else -> 0
         }
 }

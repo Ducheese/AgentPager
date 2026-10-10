@@ -64,7 +64,7 @@ public sealed record TaskSnapshot(
     bool PromptQueued = false)
 {
     [JsonIgnore]
-    public bool IsTerminal => Lifecycle is AgentLifecycle.Succeeded or AgentLifecycle.Interrupted;
+    public bool IsTerminal => Lifecycle is AgentLifecycle.Succeeded or AgentLifecycle.Interrupted or AgentLifecycle.Offline;
 
     [JsonIgnore]
     public int EffectivePriority =>
