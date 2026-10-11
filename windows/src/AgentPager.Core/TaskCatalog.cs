@@ -544,18 +544,21 @@ public sealed class TaskCatalog
 
         // 1. 查询会话元数据（SQLite，mtime 门控缓存，A2）：会话真实标题与父会话 ID
         var dbInfo = LookupAgyConversation(sessionID);
-        var parentSessionID = !string.IsNullOrWhiteSpace(dbInfo?.ParentConversationId) ? dbInfo.ParentConversationId : null;
 
-        // 2. 如果是子代理会话，更新父任务的 Subagents 列表，绝不建立幽灵顶层任务
+        // 2. 解析父会话（内存映射 / 先验派发窗口认领 / 转录本 sender 探测 / SQLite 四重保障）
+        var parentSessionID = ResolveAgyParentSession(hook, now, out var resolvedRole);
+        parentSessionID ??= !string.IsNullOrWhiteSpace(dbInfo?.ParentConversationId) ? dbInfo.ParentConversationId : null;
+
+        // 3. 如果是子代理会话，更新父任务的 Subagents 列表，绝不建立幽灵顶层任务
         if (parentSessionID is not null)
         {
-            // 物理剔除顶层幽灵任务（若此前首包由于 SQLite 时差被误建为顶层任务）
+            // 物理剔除顶层幽灵任务（若此前首包由于时差被误建为顶层任务）
             _tasks.RemoveAll(task => task.Id == sessionID);
 
             var parentTask = _tasks.FirstOrDefault(task => task.Id == parentSessionID);
             if (parentTask is not null)
             {
-                var updatedParent = ApplyAgySubagent(parentTask, hook, dbInfo, now);
+                var updatedParent = ApplyAgySubagent(parentTask, hook, dbInfo, resolvedRole, now);
                 Upsert(updatedParent);
                 Changed();
                 return true;
@@ -563,10 +566,13 @@ public sealed class TaskCatalog
             return true;
         }
 
-        // 3. 顶层主任务状态流转
+        // 4. 顶层主任务状态流转
         var existing = _tasks.FirstOrDefault(task => task.Id == sessionID);
         var updated = AgyEventReducer.Reduce(hook, existing, dbInfo, now);
         Upsert(updated);
+
+        // 侦测父任务调用的 invoke_subagent，记录子代理绑定关系与先验派发窗口
+        InspectInvokeSubagent(hook, now);
 
         // Stop 终稿落盘竞速补救登记（条目 1）：预览缺失时交给 Maintain 限期内重读。
         if (hook.EffectiveEvent == "Stop" && !string.IsNullOrWhiteSpace(hook.TranscriptPath))
@@ -576,7 +582,7 @@ public sealed class TaskCatalog
             else _agyPreviewRecheck.Remove(sessionID);
         }
 
-        // 4. 用户交互问题（ask_question）挂起与移除逻辑
+        // 5. 用户交互问题（ask_question）挂起与移除逻辑
         if (hook.EffectiveEvent == "PreToolUse" &&
             hook.ToolCall?.Name?.Equals("ask_question", StringComparison.OrdinalIgnoreCase) == true)
         {
@@ -608,14 +614,166 @@ public sealed class TaskCatalog
         return true;
     }
 
-    private static TaskSnapshot ApplyAgySubagent(TaskSnapshot parent, AgyHookPayload hook, AgyConversationSummary? dbInfo, DateTimeOffset now)
+    private string? ResolveAgyParentSession(AgyHookPayload hook, DateTimeOffset now, out string? role)
+    {
+        role = null;
+        var sessionID = hook.SessionID;
+        if (string.IsNullOrWhiteSpace(sessionID)) return null;
+
+        // 通道 1：内存映射缓存（此前事件已解析出）
+        if (_agyChildToParent.TryGetValue(sessionID, out var parentId))
+        {
+            _agyChildRoles.TryGetValue(sessionID, out role);
+            return parentId;
+        }
+
+        // 通道 2：先验派发窗口直接认领（彻底消除子代理 PreInvocation 首帧转录本尚未落盘的竞态闪烁）
+        // 若当前会话尚未在顶层建立，且系统内有父任务刚刚调用 invoke_subagent 正在派发，
+        // 则在首帧第一微秒立即认领该子代理，赋予对应 Role，物理杜绝独立幽灵卡片闪现。
+        if (_tasks.All(t => t.Id != sessionID) && _agySpawningParents.Count > 0)
+        {
+            foreach (var (parentCandidate, entry) in _agySpawningParents.ToList())
+            {
+                if (now <= entry.Deadline && entry.Roles.Count > 0)
+                {
+                    role = entry.Roles[0];
+                    entry.Roles.RemoveAt(0);
+                    if (entry.Roles.Count == 0) _agySpawningParents.Remove(parentCandidate);
+                    _agyChildToParent[sessionID] = parentCandidate;
+                    _agyChildRoles[sessionID] = role;
+                    return parentCandidate;
+                }
+            }
+        }
+
+        // 通道 3：转录本首帧 sender 探测（零时差，首毫秒即命中）
+        var transcriptPath = hook.TranscriptPath;
+        if (string.IsNullOrWhiteSpace(transcriptPath))
+        {
+            var defaultPath = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                ".gemini", "antigravity-cli", "brain", sessionID, ".system_generated", "logs", "transcript.jsonl");
+            if (File.Exists(defaultPath)) transcriptPath = defaultPath;
+        }
+
+        if (!string.IsNullOrWhiteSpace(transcriptPath) && File.Exists(transcriptPath))
+        {
+            var detectedParent = AgyTranscriptReader.DetectParentFromTranscript(transcriptPath);
+            if (!string.IsNullOrWhiteSpace(detectedParent))
+            {
+                _agyChildToParent[sessionID] = detectedParent;
+                if (_agyPendingParentRoles.TryGetValue(detectedParent, out var pending) && pending.Count > 0)
+                {
+                    role = pending[0];
+                    pending.RemoveAt(0);
+                    _agyChildRoles[sessionID] = role;
+                }
+                return detectedParent;
+            }
+        }
+
+        // 通道 4：SQLite 元数据查询
+        var dbInfo = LookupAgyConversation(sessionID);
+        if (!string.IsNullOrWhiteSpace(dbInfo?.ParentConversationId))
+        {
+            _agyChildToParent[sessionID] = dbInfo.ParentConversationId;
+            if (!string.IsNullOrWhiteSpace(dbInfo.Title))
+            {
+                role = dbInfo.Title;
+                _agyChildRoles[sessionID] = role;
+            }
+            return dbInfo.ParentConversationId;
+        }
+
+        return null;
+    }
+
+    private void InspectInvokeSubagent(AgyHookPayload hook, DateTimeOffset now)
+    {
+        var sessionID = hook.SessionID;
+        if (string.IsNullOrWhiteSpace(sessionID)) return;
+
+        if (hook.EffectiveEvent == "PreToolUse" &&
+            hook.ToolCall?.Name?.Equals("invoke_subagent", StringComparison.OrdinalIgnoreCase) == true)
+        {
+            var roles = ExtractRolesFromInvokeSubagent(hook.ToolCall?.Args);
+            if (roles.Count == 0) roles.Add("Subagent");
+            if (_agySpawningParents.TryGetValue(sessionID, out var entry))
+            {
+                entry.Roles.AddRange(roles);
+                _agySpawningParents[sessionID] = (entry.Roles, now.AddSeconds(30));
+            }
+            else
+            {
+                _agySpawningParents[sessionID] = (roles, now.AddSeconds(30));
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(hook.TranscriptPath))
+        {
+            var createdSubs = AgyTranscriptReader.DetectCreatedSubagents(hook.TranscriptPath);
+            foreach (var childId in createdSubs)
+            {
+                if (!_agyChildToParent.ContainsKey(childId))
+                {
+                    _agyChildToParent[childId] = sessionID;
+                    if (_agyPendingParentRoles.TryGetValue(sessionID, out var pending) && pending.Count > 0)
+                    {
+                        var role = pending[0];
+                        pending.RemoveAt(0);
+                        _agyChildRoles[childId] = role;
+                    }
+                }
+            }
+        }
+    }
+
+    private static List<string> ExtractRolesFromInvokeSubagent(JsonElement? args)
+    {
+        var result = new List<string>();
+        if (args is null) return result;
+        try
+        {
+            if (args.Value.TryGetProperty("Subagents", out var subsProp))
+            {
+                JsonElement arrayElement;
+                JsonDocument? parsedDoc = null;
+                if (subsProp.ValueKind == JsonValueKind.String)
+                {
+                    parsedDoc = JsonDocument.Parse(subsProp.GetString()!);
+                    arrayElement = parsedDoc.RootElement;
+                }
+                else
+                {
+                    arrayElement = subsProp;
+                }
+
+                if (arrayElement.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var item in arrayElement.EnumerateArray())
+                    {
+                        if (item.TryGetProperty("Role", out var roleProp) && roleProp.GetString() is { Length: > 0 } role)
+                        {
+                            result.Add(role);
+                        }
+                    }
+                }
+                parsedDoc?.Dispose();
+            }
+        }
+        catch { }
+        return result;
+    }
+
+    private static TaskSnapshot ApplyAgySubagent(TaskSnapshot parent, AgyHookPayload hook, AgyConversationSummary? dbInfo, string? customRole, DateTimeOffset now)
     {
         var id = hook.SessionID;
         var existing = parent.Subagents.FirstOrDefault(item => item.Id == id);
         if (existing?.IsTerminal == true && hook.EffectiveEvent != "PostInvocation") return parent;
 
         var agentName = dbInfo?.AgentName ?? "research";
-        var displayName = SubagentDisplayName(agentName, dbInfo?.Title);
+        var role = !string.IsNullOrWhiteSpace(customRole) ? customRole : (!string.IsNullOrWhiteSpace(dbInfo?.Title) ? dbInfo.Title : agentName);
+        var displayName = SubagentDisplayName(role, null);
         var path = existing?.Path ?? ("/" + agentName);
 
         var subagent = existing ?? new SubagentSnapshot(
@@ -712,6 +870,13 @@ public sealed class TaskCatalog
     private readonly Dictionary<string, AgyConversationSummary?> _agyAcceptDbCache = new();
     // Stop 终稿落盘竞速补救（条目 1）：转录本路径 + 重读期限。
     private readonly Dictionary<string, (string TranscriptPath, DateTimeOffset Deadline)> _agyPreviewRecheck = new();
+    // 子代理与父任务映射关系与角色记录（通道 1 转录本 sender 探测 / 通道 2 invoke_subagent / 通道 3 SQLite）
+    private readonly Dictionary<string, string> _agyChildToParent = new();
+    private readonly Dictionary<string, string> _agyChildRoles = new();
+    private readonly Dictionary<string, List<string>> _agyPendingParentRoles = new();
+    // 先验派发窗口：父任务调用 invoke_subagent 时开启，子代理在 PreInvocation 首帧零时差直接认领绑定
+    private readonly Dictionary<string, (List<string> Roles, DateTimeOffset Deadline)> _agySpawningParents = new();
+
 
     public bool Maintain(DateTimeOffset? now = null)
     {
@@ -722,6 +887,8 @@ public sealed class TaskCatalog
         changed = MaintainAgyDatabase(currentTime) || changed;
         changed = CheckClaudePreviewRecheck(currentTime) || changed;
         changed = CheckClaudeRuntime(currentTime) || changed;
+        foreach (var key in _agySpawningParents.Where(p => currentTime > p.Value.Deadline).Select(p => p.Key).ToList())
+            _agySpawningParents.Remove(key);
         var before = _tasks.Count + _tasks.Sum(task => task.Subagents.Count);
         Normalize(currentTime);
         if (changed || before != _tasks.Count + _tasks.Sum(task => task.Subagents.Count))
@@ -738,16 +905,19 @@ public sealed class TaskCatalog
             return false;
 
         var dbPath = AgyConversationDatabase.DefaultDbPath;
-        if (!File.Exists(dbPath)) return false;
-
         try
         {
-            var lastWrite = File.GetLastWriteTimeUtc(dbPath);
-            if (_lastAgyDbModified is not null && lastWrite <= _lastAgyDbModified.Value)
-                return false;
-
-            _lastAgyDbModified = lastWrite;
-            var changed = CheckAgyTitles(now, dbPath);
+            var changed = false;
+            if (File.Exists(dbPath))
+            {
+                var lastWrite = File.GetLastWriteTimeUtc(dbPath);
+                if (_lastAgyDbModified is null || lastWrite > _lastAgyDbModified.Value)
+                {
+                    _lastAgyDbModified = lastWrite;
+                    changed = CheckAgyTitles(now, dbPath) || changed;
+                }
+            }
+            // 扫描幽灵任务：不论 DB 文件是否更新，转录本或已登记映射随时可能命中子代理并清理
             changed = PruneAgyGhostTasks(now, dbPath) || changed;
             return changed;
         }
@@ -765,18 +935,47 @@ public sealed class TaskCatalog
             var task = _tasks[i];
             if (task.Source != AgentSource.Antigravity) continue;
 
-            var dbInfo = AgyConversationDatabase.Query(task.Id, dbPath);
-            if (!string.IsNullOrWhiteSpace(dbInfo?.ParentConversationId))
+            string? parentId = null;
+            string? roleName = null;
+
+            if (_agyChildToParent.TryGetValue(task.Id, out var mappedParent))
             {
-                var parentId = dbInfo.ParentConversationId;
+                parentId = mappedParent;
+                _agyChildRoles.TryGetValue(task.Id, out roleName);
+            }
+
+            AgyConversationSummary? dbInfo = null;
+            if (File.Exists(dbPath))
+            {
+                dbInfo = AgyConversationDatabase.Query(task.Id, dbPath);
+                if (!string.IsNullOrWhiteSpace(dbInfo?.ParentConversationId))
+                {
+                    parentId = dbInfo.ParentConversationId;
+                    if (!string.IsNullOrWhiteSpace(dbInfo.Title)) roleName = dbInfo.Title;
+                }
+            }
+
+            if (parentId is null)
+            {
+                var transcriptPath = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                    ".gemini", "antigravity-cli", "brain", task.Id, ".system_generated", "logs", "transcript.jsonl");
+                if (File.Exists(transcriptPath))
+                {
+                    parentId = AgyTranscriptReader.DetectParentFromTranscript(transcriptPath);
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(parentId))
+            {
                 _tasks.RemoveAt(i);
                 changed = true;
 
                 var parent = _tasks.FirstOrDefault(t => t.Id == parentId);
                 if (parent is not null)
                 {
-                    var agentName = dbInfo.AgentName ?? "research";
-                    var displayName = SubagentDisplayName(agentName, dbInfo.Title);
+                    var agentName = dbInfo?.AgentName ?? "research";
+                    var displayName = SubagentDisplayName(roleName ?? agentName, dbInfo?.Title);
                     var sub = new SubagentSnapshot(
                         task.Id, "/" + agentName, displayName,
                         task.Lifecycle, task.Activity ?? AgentActivity.Thinking,
@@ -845,7 +1044,10 @@ public sealed class TaskCatalog
         }
         if (_agyAcceptDbCache.TryGetValue(sessionID, out var cached)) return cached;
         var value = AgyConversationDatabase.Query(sessionID, dbPath);
-        _agyAcceptDbCache[sessionID] = value;
+        if (value is not null)
+        {
+            _agyAcceptDbCache[sessionID] = value;
+        }
         return value;
     }
 

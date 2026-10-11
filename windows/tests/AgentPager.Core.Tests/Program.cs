@@ -1363,6 +1363,84 @@ emptyGhostCatalog.Maintain(termT0.AddMinutes(2));
 Check(emptyGhostCatalog.Projection().Tasks.All(x => x.Id != "ghost_1"),
     "empty offline: ghost task without prompt pruned after 1 minute");
 
+// ── Antigravity 子代理路由与幽灵卡片防护测试 ──
+var agySubCatalog = new TaskCatalog();
+var subT0 = DateTimeOffset.UtcNow;
+// 1) 父任务创建
+agySubCatalog.Accept(A("PreInvocation", new { conversationId = "parent_agy", workspacePaths = new[] { @"C:\test" } }), subT0);
+var pTask = agySubCatalog.Projection().Tasks.First(x => x.Id == "parent_agy");
+Check(pTask.Lifecycle == AgentLifecycle.Running, "agy sub: parent created as running");
+
+// 2) 父任务发起 invoke_subagent，带 Role
+agySubCatalog.Accept(A("PreToolUse", new
+{
+    conversationId = "parent_agy",
+    toolCall = new
+    {
+        name = "invoke_subagent",
+        args = new
+        {
+            Subagents = new[]
+            {
+                new { Role = "Pro Security Auditor", TypeName = "self" }
+            }
+        }
+    }
+}), subT0.AddSeconds(1));
+
+// 3) 子代理到达 PreInvocation，模拟转录本尚未落盘的极端竞态（无 transcriptPath）
+var subTranscript = Path.Combine(Path.GetTempPath(), $"agy_sub_{Guid.NewGuid():N}.jsonl");
+File.WriteAllLines(subTranscript, new[]
+{
+    "{\"step_index\":0,\"source\":\"SYSTEM\",\"type\":\"SYSTEM_MESSAGE\",\"content\":\"<SYSTEM_MESSAGE>\\n[Message] sender=parent_agy content=测试任务\"}"
+});
+
+agySubCatalog.Accept(A("PreInvocation", new
+{
+    conversationId = "child_agy_1",
+    // 首帧不传 transcriptPath，验证先验派发窗口在转录本未落盘时依然能瞬间认领，彻底消除闪烁
+}), subT0.AddSeconds(2));
+
+// 验证：绝对不生成顶层 child_agy_1 任务！
+Check(agySubCatalog.Projection().Tasks.All(x => x.Id != "child_agy_1"),
+    "agy sub: child task is NEVER created as top-level card");
+
+// 验证：挂入父任务 Subagents，且 Role 为 Pro Security Auditor，父任务处于 Delegating
+var pTaskWithSub = agySubCatalog.Projection().Tasks.First(x => x.Id == "parent_agy");
+Check(pTaskWithSub.Subagents.Count == 1, "agy sub: child mounted into parent subagents");
+Check(pTaskWithSub.Subagents[0].DisplayName == "Pro Security Auditor", "agy sub: child display name uses role");
+Check(pTaskWithSub.Activity == AgentActivity.Delegating, "agy sub: parent activity is delegating");
+
+// 4) 子代理执行工具并在 3 秒后完成
+agySubCatalog.Accept(A("PreToolUse", new
+{
+    conversationId = "child_agy_1",
+    toolCall = new
+    {
+        name = "run_command",
+        args = new { CommandLine = "git status" }
+    },
+    transcriptPath = subTranscript
+}), subT0.AddSeconds(3));
+
+var pTaskTool = agySubCatalog.Projection().Tasks.First(x => x.Id == "parent_agy");
+Check(pTaskTool.Subagents[0].LatestStep?.Contains("git status") == true, "agy sub: tool step captured");
+
+agySubCatalog.Accept(A("Stop", new
+{
+    conversationId = "child_agy_1",
+    transcriptPath = subTranscript
+}), subT0.AddSeconds(4));
+
+var pTaskDone = agySubCatalog.Projection().Tasks.First(x => x.Id == "parent_agy");
+Check(pTaskDone.Subagents[0].Lifecycle == AgentLifecycle.Succeeded, "agy sub: child marked succeeded");
+
+// 5) 4 秒淡出收拢：超过 4 秒后由 Maintain 清理
+agySubCatalog.Maintain(subT0.AddSeconds(9));
+var pTaskPruned = agySubCatalog.Projection().Tasks.First(x => x.Id == "parent_agy");
+Check(pTaskPruned.Subagents.Count == 0, "agy sub: child faded out after 4 seconds");
+File.Delete(subTranscript);
+
 Console.WriteLine();
 Console.WriteLine(failures.Count == 0 ? "ALL CHECKS PASSED" : $"FAILURES: {string.Join(", ", failures)}");
 return failures.Count == 0 ? 0 : 1;

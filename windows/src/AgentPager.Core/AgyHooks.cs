@@ -261,6 +261,80 @@ public static class AgyTranscriptReader
         }
     }
 
+    private static readonly Regex SubagentSenderRegex = new(
+        @"sender=([a-zA-Z0-9_\-]+)",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    private static readonly Regex SubagentCreatedRegex = new(
+        @"""conversationId"":\s*""([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})""",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    /// <summary>
+    /// 从子代理转录本首帧（前 15 行）零延迟探测父会话 ID（来自 SYSTEM_MESSAGE 的 sender 属性）。
+    /// 彻底消除 SQLite 落盘时差造成的幽灵顶层卡片。
+    /// </summary>
+    public static string? DetectParentFromTranscript(string? transcriptPath)
+    {
+        if (string.IsNullOrWhiteSpace(transcriptPath) || !File.Exists(transcriptPath))
+            return null;
+
+        try
+        {
+            using var stream = new FileStream(transcriptPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var reader = new StreamReader(stream, Encoding.UTF8);
+            for (var i = 0; i < 15; i++)
+            {
+                var line = reader.ReadLine();
+                if (line is null) break;
+                var match = SubagentSenderRegex.Match(line);
+                if (match.Success) return match.Groups[1].Value;
+            }
+        }
+        catch
+        {
+            // Fail-open
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// 从父任务转录本尾部（最多 64KB）探测最新派生的子代理 conversationId 列表。
+    /// </summary>
+    public static List<string> DetectCreatedSubagents(string? transcriptPath)
+    {
+        if (string.IsNullOrWhiteSpace(transcriptPath) || !File.Exists(transcriptPath))
+            return [];
+
+        try
+        {
+            var results = new List<string>();
+            var fileInfo = new FileInfo(transcriptPath);
+            var readSize = (int)Math.Min(fileInfo.Length, 64 * 1024);
+            if (readSize <= 0) return results;
+
+            byte[] buffer = new byte[readSize];
+            using (var stream = new FileStream(transcriptPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            {
+                stream.Seek(-readSize, SeekOrigin.End);
+                int bytesRead = stream.Read(buffer, 0, readSize);
+                if (bytesRead <= 0) return results;
+            }
+
+            var text = Encoding.UTF8.GetString(buffer);
+            var matches = SubagentCreatedRegex.Matches(text);
+            foreach (Match m in matches)
+            {
+                if (m.Success) results.Add(m.Groups[1].Value);
+            }
+            return results;
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
     private static string? CleanUserPrompt(string raw)
     {
         var match = UserRequestRegex.Match(raw);
