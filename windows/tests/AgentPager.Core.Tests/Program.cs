@@ -392,21 +392,21 @@ Check(!json.Contains("\"OpenCode\""), "wire has no PascalCase enum leakage");
 var temp = Path.Combine(Path.GetTempPath(), "ap-verify-plugins-" + Guid.NewGuid().ToString("N"));
 var installer = new OpenCodePluginConfiguration(temp);
 Check(installer.Status == OpenCodePluginStatus.NotInstalled, "status: 未安装");
-Check(OpenCodePluginConfiguration.EmbeddedVersion == 8, $"embedded plugin version = 8 (got {OpenCodePluginConfiguration.EmbeddedVersion})");
+Check(OpenCodePluginConfiguration.EmbeddedVersion == 10, $"embedded plugin version = 10 (got {OpenCodePluginConfiguration.EmbeddedVersion})");
 var first = installer.Install();
 Check(first.Changed && File.Exists(Path.Combine(temp, "plugins", "agentpager-opencode.js")), "install writes plugin");
 Check(installer.Status == OpenCodePluginStatus.Installed && installer.IsInstalled(), "status: 已写入（与内置一致）");
-Check(installer.InstalledVersion == 8, "installed version = 8");
+Check(installer.InstalledVersion == 10, "installed version = 10");
 var second = installer.Install();
 Check(!second.Changed, "reinstall is idempotent");
 var pluginPath = Path.Combine(temp, "plugins", "agentpager-opencode.js");
 var content = File.ReadAllText(pluginPath);
 Check(content.Contains("Managed by AgentPager (OpenCode)"), "managed marker present");
-Check(content.Contains("agentpager-opencode v8"), "version header present");
+Check(content.Contains("agentpager-opencode v10"), "version header present");
 Check(content.Contains("hook_source: \"opencode\"") && content.Contains("49361"), "plugin content sane");
 File.WriteAllText(pluginPath, content.Replace("const MAX_TEXT = 1000", "const MAX_TEXT = 500"));
 Check(installer.Status == OpenCodePluginStatus.Outdated, "status: 待更新（内容与内置不一致）");
-Check(installer.InstalledVersion == 8, "outdated file still reports v8");
+Check(installer.InstalledVersion == 10, "outdated file still reports v10");
 var repair = installer.Install();
 Check(repair.Changed && installer.Status == OpenCodePluginStatus.Installed, "repair restores 已写入");
 var uninstalled = installer.Uninstall();
@@ -570,14 +570,26 @@ var claude = new TaskCatalog();
 claude.Accept(C("SessionStart", new { source = "startup" }), claudeNow);
 TaskSnapshot Claude() => claude.Projection().Tasks.First(t => t.Id == "claude_1");
 
-Check(Claude().Lifecycle == AgentLifecycle.Idle, $"claude: session start -> idle (never starting) (got {Claude().Lifecycle})");
-Check(Claude().Title == "demo", $"claude: title starts as project name (got '{Claude().Title}')");
+// 全新会话那条 SessionStart **不建行**（启动幽灵修复）：它由 Claude Code 每次进程启动无条件发出，
+// 而那一刻转录本文件尚未创建、载荷里也没有 session_title —— 标题三条来源全空，建行只能得到一个
+// 顶着 cwd 目录名的"没有 session title 的幽灵任务"（用户实测 100% 复现，探针实测 exists=false）。
+Check(claude.Projection().Tasks.Count == 0, "claude: fresh SessionStart creates no task (no titleless ghost)");
 
 claude.Accept(C("UserPromptSubmit", new { prompt = "  帮我看看   那个登录问题  " }), claudeNow.AddSeconds(1));
 Check(Claude().Lifecycle == AgentLifecycle.Running && Claude().Activity == AgentActivity.Thinking, "claude: prompt -> running/thinking");
 Check(Claude().UserPrompt == "帮我看看 那个登录问题", $"claude: prompt normalized (got '{Claude().UserPrompt}')");
 Check(Claude().StartedAt == claudeNow.AddSeconds(1), "claude: first prompt starts this turn's timer");
 Check(Claude().Title == "demo", $"claude: title still project name, never derived from prompt (got '{Claude().Title}')");
+
+// SessionStart 的语义只对**已经在面板上**的行生效：resume / clear 把会话复位成 idle。
+var resumeCatalog = new TaskCatalog();
+resumeCatalog.Accept(C("UserPromptSubmit", new { session_id = "resume_1", prompt = "第一轮" }), claudeNow);
+resumeCatalog.Accept(C("Stop", new { session_id = "resume_1", last_assistant_message = "完事" }), claudeNow.AddSeconds(1));
+TaskSnapshot Resume() => resumeCatalog.Projection().Tasks.First(t => t.Id == "resume_1");
+Check(Resume().Lifecycle == AgentLifecycle.Succeeded, "claude: resume fixture finished before the second start");
+resumeCatalog.Accept(C("SessionStart", new { session_id = "resume_1", source = "resume" }), claudeNow.AddSeconds(2));
+Check(Resume().Lifecycle == AgentLifecycle.Idle && Resume().CompletedAt is null,
+    $"claude: SessionStart on a known session still resets to idle (got {Resume().Lifecycle})");
 
 var claudeSnapshot = ReadTranscript(
 [
@@ -749,7 +761,6 @@ Check(echoed.LatestStep == "Bash npm test", $"claude: prompt echo rejected from 
 var subCatalog = new TaskCatalog();
 var subNow = DateTimeOffset.UtcNow;
 TaskSnapshot SubTask() => subCatalog.Projection().Tasks.First(t => t.Id == "claude_2");
-subCatalog.Accept(C("SessionStart", new { session_id = "claude_2", source = "startup" }), subNow);
 subCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_2", prompt = "调研一下" }), subNow.AddSeconds(1));
 subCatalog.Accept(C("PreToolUse", new { session_id = "claude_2", tool_name = "Bash", tool_input = new { command = "npm test" } }), subNow.AddSeconds(2));
 var parentStep = SubTask().LatestStep;
@@ -766,7 +777,6 @@ Check(SubTask().Activity == AgentActivity.Delegating, "claude: parent delegates 
 // 目录干活"，是期望行为）。曾经按"另两家用稳定目录"冻结过，被用户撤销——这条断言防止再冻回去。
 var cwdCatalog = new TaskCatalog();
 var cwdNow = DateTimeOffset.UtcNow;
-cwdCatalog.Accept(C("SessionStart", new { session_id = "claude_4", cwd = @"F:\Git\proj-a" }), cwdNow);
 cwdCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_4", cwd = @"F:\Git\proj-a", prompt = "干活" }), cwdNow.AddSeconds(1));
 cwdCatalog.Accept(C("PreToolUse", new { session_id = "claude_4", cwd = @"F:\Git\proj-a\sub\deep", tool_name = "Bash", tool_input = new { command = "ls" } }), cwdNow.AddSeconds(2));
 TaskSnapshot CwdTask() => cwdCatalog.Projection().Tasks.First(x => x.Id == "claude_4");
@@ -1346,18 +1356,20 @@ Check(termCatalog.Projection().Tasks.All(x => x.Id != "term_keep"),
 
 // 3) 离线任务超容裁剪：离线任务应作为可裁剪对象被容量裁剪清除
 var offCapCatalog = new TaskCatalog(capacity: 1);
-offCapCatalog.Accept(C("SessionStart", new { session_id = "off_1" }), termT0);
+offCapCatalog.Accept(C("UserPromptSubmit", new { session_id = "off_1", prompt = "被裁的" }), termT0);
 offCapCatalog.Accept(C("SessionEnd", new { session_id = "off_1" }), termT0.AddSeconds(1));
 Check(offCapCatalog.Projection().Tasks.First(x => x.Id == "off_1").Lifecycle == AgentLifecycle.Offline,
     "offline capacity: first task is offline");
-offCapCatalog.Accept(C("SessionStart", new { session_id = "off_2" }), termT0.AddSeconds(2));
+offCapCatalog.Accept(C("UserPromptSubmit", new { session_id = "off_2", prompt = "留下的" }), termT0.AddSeconds(2));
 // off_1 离线可被裁，容量为 1 时被清除
 Check(offCapCatalog.Projection().Tasks.Count == 1 && offCapCatalog.Projection().Tasks.First().Id == "off_2",
     "offline capacity: offline task is evicted when capacity exceeded");
 
-// 4) 空离线任务 1 分钟快速回收
+// 4) 空离线任务 1 分钟快速回收。夹具改用 PreToolUse 造无提示词的行——SessionStart 已不再建行，
+//    而"桥在会话中途才起来、第一帧就是工具调用"仍是真会造出无提示词行的路径，回收规则必须留着
+//    （opencode 的 session.created 同样会造出无提示词的 idle 行，这条规则对全局生效）。
 var emptyGhostCatalog = new TaskCatalog();
-emptyGhostCatalog.Accept(C("SessionStart", new { session_id = "ghost_1" }), termT0);
+emptyGhostCatalog.Accept(C("PreToolUse", new { session_id = "ghost_1", tool_name = "Bash", tool_input = new { command = "ls" } }), termT0);
 emptyGhostCatalog.Accept(C("SessionEnd", new { session_id = "ghost_1" }), termT0.AddSeconds(1));
 emptyGhostCatalog.Maintain(termT0.AddMinutes(2));
 Check(emptyGhostCatalog.Projection().Tasks.All(x => x.Id != "ghost_1"),
@@ -1440,6 +1452,221 @@ agySubCatalog.Maintain(subT0.AddSeconds(9));
 var pTaskPruned = agySubCatalog.Projection().Tasks.First(x => x.Id == "parent_agy");
 Check(pTaskPruned.Subagents.Count == 0, "agy sub: child faded out after 4 seconds");
 File.Delete(subTranscript);
+
+// ===================== 27. 1a/1c 回归（子代理只进面板 / 掐掉要同步 / agy 主对话不被误删）=====================
+
+// ---- 1c：Claude Code 掐子代理时**不发 SubagentStop**（探针实测），靠 TaskStop 入参收敛 ----
+var killCatalog = new TaskCatalog();
+var killNow = DateTimeOffset.UtcNow;
+killCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_kill", prompt = "跑个子代理" }), killNow);
+killCatalog.Accept(C("PreToolUse", new { session_id = "claude_kill", tool_name = "Bash", tool_input = new { command = "npm run build" } }), killNow.AddSeconds(1));
+killCatalog.Accept(C("SubagentStart", new { session_id = "claude_kill", agent_id = "a_kill", agent_type = "general-purpose" }), killNow.AddSeconds(2));
+TaskSnapshot KillTask() => killCatalog.Projection().Tasks.First(t => t.Id == "claude_kill");
+Check(KillTask().Subagents is [{ Lifecycle: AgentLifecycle.Running }], "kill: subagent row starts running");
+Check(KillTask().Activity == AgentActivity.Delegating, "kill: parent delegates while it runs");
+
+// 掐掉：父级 PreToolUse(TaskStop)，入参 task_id 与 SubagentStart 的 agent_id 逐字相同（实测）
+killCatalog.Accept(C("PreToolUse", new { session_id = "claude_kill", tool_name = "TaskStop", tool_input = new { task_id = "a_kill" } }), killNow.AddSeconds(3));
+Check(KillTask().Subagents is [{ Lifecycle: AgentLifecycle.Interrupted }],
+    $"kill: TaskStop finalizes the subagent as interrupted (got {KillTask().Subagents[0].Lifecycle})");
+Check(KillTask().Subagents[0].LatestStep == "✗ 已被停止", $"kill: killed subagent says so (got '{KillTask().Subagents[0].LatestStep}')");
+Check(KillTask().Activity == AgentActivity.Thinking, "kill: parent stops delegating once the subagent is terminal");
+// TaskStop 这条工具调用不得把父任务第三行冲成光秃秃的 "Task"
+Check(KillTask().LatestStep == "Bash npm run build", $"kill: TaskStop leaves the parent third line alone (got '{KillTask().LatestStep}')");
+
+// 目标不是已知子代理（后台 bash 任务等）→ 静默跳过，不许误伤
+killCatalog.Accept(C("PreToolUse", new { session_id = "claude_kill", tool_name = "TaskStop", tool_input = new { task_id = "bash_42" } }), killNow.AddSeconds(4));
+Check(KillTask().Subagents.Count == 1 && KillTask().Subagents[0].Lifecycle == AgentLifecycle.Interrupted, "kill: unknown task id is ignored");
+
+// 嵌套：子代理内部掐它自己的子代理，同样收敛（agent_id 非空，走子代理路径）
+killCatalog.Accept(C("SubagentStart", new { session_id = "claude_kill", agent_id = "b_nested", agent_type = "Explore" }), killNow.AddSeconds(5));
+killCatalog.Accept(C("PreToolUse", new { session_id = "claude_kill", agent_id = "a_kill", agent_type = "general-purpose", tool_name = "TaskStop", tool_input = new { task_id = "b_nested" } }), killNow.AddSeconds(6));
+Check(KillTask().Subagents.Any(s => s.Id == "b_nested" && s.Lifecycle == AgentLifecycle.Interrupted),
+    "kill: a nested subagent stopped from inside another subagent is finalized too");
+
+// ---- agy：父任务成功结束**不得**收走仍在跑的子代理（2026-10-11 用户报出）----
+// agy 的 invoke_subagent 是**异步**的：父回合先 Stop（实测 16:50:28），子代理还在跑，
+// 10 秒后才回报并 resume 父任务（16:50:38）。旧实现在父 Stop 时无条件把未终态子代理扫成
+// succeeded（succeeded 的子代理行 4 秒后淡出）= 手机上"父任务一完成，子代理卡片就被收起"。
+var agyKeepCatalog = new TaskCatalog();
+var keepT0 = DateTimeOffset.UtcNow;
+TaskSnapshot KeepTask() => agyKeepCatalog.Projection().Tasks.First(t => t.Id == "p_keep");
+agyKeepCatalog.Accept(A("PreInvocation", new { conversationId = "p_keep", workspacePaths = new[] { @"C:\test" } }), keepT0);
+agyKeepCatalog.Accept(A("PreToolUse", new
+{
+    conversationId = "p_keep",
+    toolCall = new { name = "invoke_subagent", args = new { Subagents = new[] { new { Role = "File Lister", TypeName = "research" } } } }
+}), keepT0.AddSeconds(1));
+agyKeepCatalog.Accept(A("PreInvocation", new { conversationId = "c_keep", workspacePaths = new[] { @"C:\test" } }), keepT0.AddSeconds(2));
+Check(KeepTask().Subagents is [{ Lifecycle: AgentLifecycle.Running }], "agy keep: child is running before the parent finishes");
+
+agyKeepCatalog.Accept(A("Stop", new { conversationId = "p_keep" }), keepT0.AddSeconds(3));
+Check(KeepTask().Lifecycle == AgentLifecycle.Succeeded, "agy keep: parent turn finished");
+Check(KeepTask().Subagents is [{ Lifecycle: AgentLifecycle.Running }],
+    $"agy keep: a still-running child is NOT collapsed by the parent's Stop (got {KeepTask().Subagents[0].Lifecycle})");
+agyKeepCatalog.Maintain(keepT0.AddSeconds(5));
+Check(KeepTask().Subagents is [{ Lifecycle: AgentLifecycle.Running }], "agy keep: the heartbeat does not collapse it either");
+
+// 子代理随后自己回报：由它自己的 Stop 收敛
+agyKeepCatalog.Accept(A("Stop", new { conversationId = "c_keep" }), keepT0.AddSeconds(6));
+Check(KeepTask().Subagents is [{ Lifecycle: AgentLifecycle.Succeeded }], "agy keep: child converges on its own Stop");
+
+// 兜底：父已终态而子代理整整 10 分钟没有任何事件 = 真的失联 → interrupted（卡片不能永远转圈）
+var agyLostCatalog = new TaskCatalog();
+var lostT0 = DateTimeOffset.UtcNow;
+agyLostCatalog.Accept(A("PreInvocation", new { conversationId = "p_lost", workspacePaths = new[] { @"C:\test" } }), lostT0);
+agyLostCatalog.Accept(A("PreToolUse", new
+{
+    conversationId = "p_lost",
+    toolCall = new { name = "invoke_subagent", args = new { Subagents = new[] { new { Role = "researcher", TypeName = "research" } } } }
+}), lostT0.AddSeconds(1));
+agyLostCatalog.Accept(A("PreInvocation", new { conversationId = "c_lost", workspacePaths = new[] { @"C:\test" } }), lostT0.AddSeconds(2));
+agyLostCatalog.Accept(A("Stop", new { conversationId = "p_lost" }), lostT0.AddSeconds(3));
+TaskSnapshot LostTask() => agyLostCatalog.Projection().Tasks.First(t => t.Id == "p_lost");
+Check(LostTask().Subagents is [{ Lifecycle: AgentLifecycle.Running }], "agy lost: child still running right after the parent finished");
+agyLostCatalog.Maintain(lostT0.AddMinutes(14));
+Check(LostTask().Subagents is [{ Lifecycle: AgentLifecycle.Interrupted }],
+    $"agy lost: a child silent for 10 minutes is swept as interrupted (got {LostTask().Subagents[0].Lifecycle})");
+
+// 异常终止仍然级联：这一摊确实崩了，未终态子代理跟着扫成 interrupted
+var agyCrashCatalog = new TaskCatalog();
+var crashT0 = DateTimeOffset.UtcNow;
+agyCrashCatalog.Accept(A("PreInvocation", new { conversationId = "p_crash", workspacePaths = new[] { @"C:\test" } }), crashT0);
+agyCrashCatalog.Accept(A("PreToolUse", new
+{
+    conversationId = "p_crash",
+    toolCall = new { name = "invoke_subagent", args = new { Subagents = new[] { new { Role = "researcher", TypeName = "research" } } } }
+}), crashT0.AddSeconds(1));
+agyCrashCatalog.Accept(A("PreInvocation", new { conversationId = "c_crash", workspacePaths = new[] { @"C:\test" } }), crashT0.AddSeconds(2));
+agyCrashCatalog.Accept(A("Stop", new { conversationId = "p_crash", error = "boom" }), crashT0.AddSeconds(3));
+var crashTask = agyCrashCatalog.Projection().Tasks.First(t => t.Id == "p_crash");
+Check(crashTask.Lifecycle == AgentLifecycle.Interrupted, "agy crash: parent is interrupted");
+Check(crashTask.Subagents is [{ Lifecycle: AgentLifecycle.Interrupted }],
+    $"agy crash: children are cascaded to interrupted on an abnormal end (got {crashTask.Subagents[0].Lifecycle})");
+
+// ---- 子代理静默收敛：三家通用、两级阈值、且"正在跑工具的不算静默" ----
+// 场景一：opencode 子代理跑测试命令 → 子代理行也必须是 Testing（蓝），与父任务行同色
+var ocTestCatalog = new TaskCatalog();
+var ocT0 = DateTimeOffset.UtcNow;
+ocTestCatalog.Accept(H("chat.message", new { sessionID = "ses_oc", text = "跑测试" }), ocT0);
+ocTestCatalog.Accept(H("subagent", new { sessionID = "ses_oc", id = "sub_a", phase = "started", agent = "build" }), ocT0.AddSeconds(1));
+ocTestCatalog.Accept(H("subagent", new
+{
+    sessionID = "ses_oc",
+    id = "sub_a",
+    phase = "tool",
+    tool = "bash",
+    title = "npm test",
+    command = "npm test"
+}), ocT0.AddSeconds(2));
+var ocSub = ocTestCatalog.Projection().Tasks.First(t => t.Id == "ses_oc").Subagents[0];
+Check(ocSub.Activity == AgentActivity.Testing,
+    $"opencode subagent: a test command is Testing on the subagent row too (got {ocSub.Activity})");
+
+// 场景二：正在执行工具（activity=Executing）的子代理**不算静默**——一个 15 分钟的构建不该被判死
+var silentCatalog = new TaskCatalog();
+var silentT0 = DateTimeOffset.UtcNow;
+silentCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_silent", prompt = "跑构建" }), silentT0);
+silentCatalog.Accept(C("SubagentStart", new { session_id = "claude_silent", agent_id = "s_busy", agent_type = "general-purpose" }), silentT0.AddSeconds(1));
+silentCatalog.Accept(C("PreToolUse", new { session_id = "claude_silent", agent_id = "s_busy", agent_type = "general-purpose", tool_name = "Bash", tool_input = new { command = "npm run build" } }), silentT0.AddSeconds(2));
+// s_quiet 只发 Start、不再有任何事件：它的活动位停在 Delegating = "没在跑工具"，这才是可判静默的那类
+silentCatalog.Accept(C("SubagentStart", new { session_id = "claude_silent", agent_id = "s_quiet", agent_type = "Explore" }), silentT0.AddSeconds(3));
+TaskSnapshot Silent() => silentCatalog.Projection().Tasks.First(t => t.Id == "claude_silent");
+Check(Silent().Subagents.First(s => s.Id == "s_busy").Activity == AgentActivity.Executing, "silence: the busy subagent is executing (protected)");
+Check(Silent().Subagents.First(s => s.Id == "s_quiet").Activity == AgentActivity.Delegating, "silence: the quiet subagent sits at delegating");
+// 让父任务终态，并把时间推过 10 分钟
+silentCatalog.Accept(C("Stop", new { session_id = "claude_silent", last_assistant_message = "完事" }), silentT0.AddSeconds(5));
+silentCatalog.Maintain(silentT0.AddMinutes(11));
+Check(Silent().Subagents.First(s => s.Id == "s_busy").Lifecycle == AgentLifecycle.Running,
+    "silence: a subagent running a tool is NOT swept even when silent for 10 minutes");
+Check(Silent().Subagents.First(s => s.Id == "s_quiet").Lifecycle == AgentLifecycle.Interrupted,
+    $"silence: an idle-then-silent subagent IS swept (got {Silent().Subagents.First(s => s.Id == "s_quiet").Lifecycle})");
+
+// 场景三：父任务仍在跑时用 30 分钟这档（20 分钟不动它）。
+// 这里必须用 agy 做夹具：Claude 的父任务静默 10 分钟就会被离线规则收走（离线时会顺带扫子代理），
+// 而 agy 的父任务在等子代理时 Activity=Delegating，正好豁免它自己的离线判定，能一直保持 Running。
+var slowCatalog = new TaskCatalog();
+var slowT0 = DateTimeOffset.UtcNow;
+slowCatalog.Accept(A("PreInvocation", new { conversationId = "p_slow", workspacePaths = new[] { @"C:\test" } }), slowT0);
+slowCatalog.Accept(A("PreToolUse", new
+{
+    conversationId = "p_slow",
+    toolCall = new { name = "invoke_subagent", args = new { Subagents = new[] { new { Role = "researcher", TypeName = "research" } } } }
+}), slowT0.AddSeconds(1));
+slowCatalog.Accept(A("PreInvocation", new { conversationId = "c_slow", workspacePaths = new[] { @"C:\test" } }), slowT0.AddSeconds(2));
+TaskSnapshot SlowTask() => slowCatalog.Projection().Tasks.First(t => t.Id == "p_slow");
+Check(SlowTask().Lifecycle == AgentLifecycle.Running && SlowTask().Activity == AgentActivity.Delegating,
+    "silence: the agy parent stays running (delegating exempts it from the offline rule)");
+slowCatalog.Maintain(slowT0.AddMinutes(20));
+Check(SlowTask().Subagents is [{ Lifecycle: AgentLifecycle.Running }],
+    $"silence: while the parent is still running, 20 minutes is not enough to sweep (got {SlowTask().Subagents[0].Lifecycle})");
+slowCatalog.Maintain(slowT0.AddMinutes(31));
+Check(SlowTask().Subagents is [{ Lifecycle: AgentLifecycle.Interrupted }],
+    $"silence: while the parent is still running, 31 minutes is enough (got {SlowTask().Subagents[0].Lifecycle})");
+
+// ---- 1a：agy 主对话的转录本里出现 `sender=<子代理>` 不得把它判成子会话（2026-10-11 实测事故）----
+// 场景复刻：主对话 badb2e69 的转录本前 15 行里有一行是"子代理回报"的系统消息（sender=子代理id），
+// 旧实现的转录本启发式把**自己的子代理**当成了父 → 主对话被判成子会话 → 顶层行被物理删除。
+var agyBrain = Path.Combine(Path.GetTempPath(), "ap-agy-brain-" + Guid.NewGuid().ToString("N"));
+var agyDb = Path.Combine(Path.GetTempPath(), "ap-agy-db-" + Guid.NewGuid().ToString("N") + ".db");
+var previousBrainRoot = AgyTranscriptReader.BrainRoot;
+var previousDbOverride = AgyConversationDatabase.DatabasePathOverride;
+AgyTranscriptReader.BrainRoot = agyBrain;
+AgyConversationDatabase.DatabasePathOverride = agyDb;
+try
+{
+    using (var db = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={agyDb}"))
+    {
+        db.Open();
+        using (var create = db.CreateCommand())
+        {
+            create.CommandText =
+                "CREATE TABLE conversation_summaries (conversation_id TEXT, title TEXT, " +
+                "parent_conversation_id TEXT, agent_name TEXT, status TEXT, nesting_depth INTEGER)";
+            create.ExecuteNonQuery();
+        }
+        using var insert = db.CreateCommand();
+        insert.CommandText =
+            "INSERT INTO conversation_summaries VALUES " +
+            "('root_agy', '文件读取与派发', '', '', 'CASCADE_RUN_STATUS_IDLE', 0), " +
+            "('child_agy', '', 'root_agy', 'research', 'CASCADE_RUN_STATUS_IDLE', 1)";
+        insert.ExecuteNonQuery();
+    }
+
+    // 主对话转录本：前 15 行里就有一行 `sender=<子代理>`（那行是子代理回报被转述进主对话的系统消息）
+    var rootTranscript = AgyTranscriptReader.TranscriptPathFor("root_agy");
+    Directory.CreateDirectory(Path.GetDirectoryName(rootTranscript)!);
+    File.WriteAllLines(rootTranscript,
+    [
+        "{\"step_index\":0,\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>读文件</USER_REQUEST>\"}",
+        "{\"step_index\":7,\"type\":\"SYSTEM_MESSAGE\",\"content\":\"[Message] timestamp=2026-10-11T16:50:38Z sender=child_agy\"}",
+    ]);
+    Check(AgyTranscriptReader.DetectParentFromTranscript(rootTranscript) == "child_agy",
+        "agy: the transcript heuristic really does read a child's id as the parent (the trap this test covers)");
+
+    var agyCatalog2 = new TaskCatalog();
+    var pruneNow = DateTimeOffset.UtcNow;
+    agyCatalog2.Accept(A("PreInvocation", new { conversationId = "root_agy", workspacePaths = new[] { @"C:\test" } }), pruneNow);
+    Check(agyCatalog2.Projection().Tasks.Any(t => t.Id == "root_agy"),
+        "agy: root conversation is created top-level (DB says parent is empty)");
+    agyCatalog2.Maintain(pruneNow.AddSeconds(5));
+    Check(agyCatalog2.Projection().Tasks.Any(t => t.Id == "root_agy"),
+        "agy: root conversation survives the ghost prune (regression: it used to be deleted as a child)");
+
+    // 真子会话仍然按老路子挂进父任务的子代理行（证明这套机制没被改坏）
+    agyCatalog2.Accept(A("PreInvocation", new { conversationId = "child_agy", workspacePaths = new[] { @"C:\test" } }), pruneNow.AddSeconds(1));
+    Check(agyCatalog2.Projection().Tasks.All(t => t.Id != "child_agy"), "agy: a real child never becomes a top-level card");
+    var rootAfter = agyCatalog2.Projection().Tasks.First(t => t.Id == "root_agy");
+    Check(rootAfter.Subagents.Count == 1 && rootAfter.Subagents[0].Id == "child_agy",
+        $"agy: real child is mounted into the parent subagents (got {rootAfter.Subagents.Count})");
+}
+finally
+{
+    AgyTranscriptReader.BrainRoot = previousBrainRoot;
+    AgyConversationDatabase.DatabasePathOverride = previousDbOverride;
+    try { Directory.Delete(agyBrain, true); } catch { /* 清理失败不影响断言 */ }
+    try { File.Delete(agyDb); } catch { /* 同上 */ }
+}
 
 Console.WriteLine();
 Console.WriteLine(failures.Count == 0 ? "ALL CHECKS PASSED" : $"FAILURES: {string.Join(", ", failures)}");

@@ -94,6 +94,17 @@
    → **结论**：生命周期处于 `WaitingAnswer` 期间，忽略普通工具更新与流式变动。
 8. **2026-10-08 终稿丢失实锤与两道修复**：transcript 里终稿存在（1816 字纯文本）但桥端 `succeeded` 时第三行空前空——实锤两个机制：① `Stop` 钩子读转录本与终稿落盘存在竞速（`Stop` 是唯一写预览的时机，读早一拍即永久丢）→ 修复：预览缺失时登记，`Maintain` 每 3 秒重读一次、1 分钟窗口，任务仍终态时补写（`AgyEventReducer.TryApplyLatePreview`）；② 胶水脚本 1 秒安全兜底在负载下可能抢在转发前杀进程导致事件丢失（该轮工具 step 也未落）→ 修复：开始转发后兜底不再生效，退出交给 socket 事件闭环（脚本 v2）；另叠加 A4 静默 10 分钟离线，杜绝事件全丢后的永久 running。
 
+9. **2026-10-11 子代理是异步的——父任务完成不得收走还在跑的子代理卡**（用户报出"主 task 完成任务后，哪怕 subagent 没完成，都会因为主任务已完成而收起 subagent 卡片"）：旧实现按"invoke_subagent 是同步回合语义"在**父任务 `Stop` 时无条件把未终态子代理扫成 `succeeded`**（`AgyHooks.cs` 的 Stop 分支），`Normalize` 里那条 agy 专属级联同样按"父终态 → 子终态"扫。**但前提不成立**：实测（2026-10-11 16:50）父回合 `Stop` 在 16:50:28，子代理 16:50:38 才回报并 resume 父任务——**父先结束、子还在跑是常态**；被扫成 succeeded 的子代理行 4 秒后淡出，手机上就是卡片被"收起"。
+   → **修法**：① 成功 `Stop` **不动**子代理（各自由自己的会话 `Stop` 收敛），只有**异常终止**才级联成 `interrupted`；② `Normalize` 的 agy 级联同样只在父为 `Interrupted` 时执行；③ 补一条**三家通用**的静默兜底（`CheckSubagentSilence`）：**只收"没在跑工具"的子代理**（activity 为 null / thinking / delegating——正在执行工具的长任务不该被判死，与任务级离线判定同一思路），**父已终态 10 分钟 / 父仍在跑 30 分钟**两档 → 扫成 `interrupted`（"✗ 失去联系"）。实测：`87cdb47a`（被掐后彻底静默的 agy 子代理）在最后事件后 10 分 05 秒被收掉 ✓。
+   → **别改回去**：`AgyEventReducer` 里那段"若未来 agy 支持跨轮次的独立异步守护子代理，则需改为由子代理独立会话的 Stop 钩子进行收敛"的预判**已经是现实**，已按它落地。
+
+10. **2026-10-11 转录本启发式不得覆盖 SQLite：主对话被误判成子会话、顶层行被物理删除**（实测事故：一轮派发过子代理的 agy 回合结束后 3 秒，顶层行凭空消失，连 `tasks.json` 里也没了）：`DetectParentFromTranscript` 的设计前提是"拿**子代理的**转录本探父"（前 15 行里第一个 `sender=`），却被告知用在**所有** agy 任务上；主对话自己的转录本里，"子代理回报被转述进来"的那行带着 `sender=<子代理id>`（实测第 8 行）→ **父子方向整个颠倒** → 主对话被判成子会话 → `_tasks.RemoveAll`/`_tasks.RemoveAt` 物理删除，而"父"（子代理 id）不是任务 → 搬无可搬 → 整行无损消失。同一份 SQLite 里 `nesting_depth=0`、`parent_conversation_id=''` **明明写着它是根**，代码却信了启发式。
+   → **修法**：① 转录本启发式**只在 DB 没有这一行时**才允许开口（它的存在意义只是覆盖落库时差）；② 兜底防线——认定下来的"父"**必须是已知任务**才允许搬移（宁可留一行可见的顶层行，也不许无声消失）。
+   → **测试**：`windows/tests` 用真 SQLite 临时库 + 注入的 brain 根复刻了事故现场（`BrainRoot` / `DatabasePathOverride` 两个注入点就是为此加的）。
+
+11. **2026-10-11 被掐掉的子代理没有任何信号可用**（用户追问"agy subagent 被 kill 的状态是不是无法同步"）：实测确认**同步不了**——① 掐掉时 agy **一个 hook 事件都不发**（注册的只有 `PreToolUse/PostToolUse/PreInvocation/PostInvocation/Stop`，没有"会话被取消"这类事件）；② agy 会话库里**没有 cancelled/aborted 状态**（205 条会话只有 `CASCADE_RUN_STATUS_IDLE` 与空串两种）；③ 被掐的子会话**仍留在库里**（`status=CASCADE_RUN_STATUS_IDLE`），所以也不能用"会话消失"判死；④ 它的转录本停在最后一个正常步骤上，没有终止标记。
+   → **结论**：agy 侧无信号可用，只能靠桥端的静默兜底收敛（判例 9 的第 ③ 条）。**Claude 不同**：它掐子代理虽也不发 `SubagentStop`，但 `TaskStop` 的入参带着目标 id，能秒级收敛（claude-code notes 的 G47）。
+
 ---
 
 ## 六、一句话的验收模板（交付时照抄）

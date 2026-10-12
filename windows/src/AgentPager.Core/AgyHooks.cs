@@ -48,7 +48,10 @@ public sealed record AgyConversationSummary(
 
 public static class AgyConversationDatabase
 {
-    public static string DefaultDbPath => Path.Combine(
+    /// <summary>会话数据库路径的注入点（测试用；null = 真实路径）。</summary>
+    public static string? DatabasePathOverride { get; set; }
+
+    public static string DefaultDbPath => DatabasePathOverride ?? Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
         ".gemini", "antigravity-cli", "conversation_summaries.db");
 
@@ -158,6 +161,18 @@ public static class AgyHistoryReader
 
 public static class AgyTranscriptReader
 {
+    /// <summary>
+    /// agy 会话目录（<c>~/.gemini/antigravity-cli/brain</c>）的根。可注入，供测试构造
+    /// "某个会话的转录本长什么样"的场景（真实路径在用户目录下，测试不该往里写东西）。
+    /// </summary>
+    public static string BrainRoot { get; set; } = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".gemini", "antigravity-cli", "brain");
+
+    /// <summary>某个会话的转录本路径（<c>&lt;brain&gt;/&lt;会话id&gt;/.system_generated/logs/transcript.jsonl</c>）。</summary>
+    public static string TranscriptPathFor(string conversationId) =>
+        Path.Combine(BrainRoot, conversationId, ".system_generated", "logs", "transcript.jsonl");
+
     private static readonly Regex UserRequestRegex = new(
         @"<USER_REQUEST>([\s\S]*?)</USER_REQUEST>",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
@@ -567,15 +582,21 @@ public static class AgyEventReducer
             case "Stop":
             {
                 var isError = hook.TerminationReason == "error" || !string.IsNullOrWhiteSpace(hook.Error);
-                // 前提说明：此处的子代理随父任务终态化建立在 Antigravity 当前 invoke_subagent 为同步回合语义
-                // （子代理生命周期随父任务回合结束而收敛）的前提下。若未来 agy 支持跨轮次的独立异步守护子代理，
-                // 则需改为由子代理独立会话的 Stop 钩子进行收敛。
-                var finalizedSubagents = task.Subagents.Select(s => s.IsTerminal ? s : s with
-                {
-                    Lifecycle = isError ? AgentLifecycle.Interrupted : AgentLifecycle.Succeeded,
-                    Activity = null,
-                    UpdatedAt = now,
-                }).ToList();
+                // **子代理不再随父任务终态化**（2026-10-11 实测修正，用户报出"主任务完成后子代理卡片被收起"）。
+                // 旧实现的前提是"invoke_subagent 为同步回合语义"，但实测这前提**不成立**：agy 的子代理是
+                // **异步**的——父回合先 Stop（实测 16:50:28），子代理还在跑，10 秒后才回报并 resume 父任务
+                // （16:50:38 的 PreInvocation）。旧代码在父 Stop 时无条件把未终态子代理扫成 succeeded，
+                // 手机上就是"父任务一完成，还没跑完的子代理卡片就被收走"（succeeded 的子代理行 4 秒后淡出）。
+                // 现在：成功 Stop **不动**子代理——每条子代理有自己的会话，由它自己的 Stop 收敛；
+                // 只有**异常终止**才说明这一摊确实崩了，才级联扫成 interrupted。
+                var finalizedSubagents = isError
+                    ? task.Subagents.Select(s => s.IsTerminal ? s : s with
+                    {
+                        Lifecycle = AgentLifecycle.Interrupted,
+                        Activity = null,
+                        UpdatedAt = now,
+                    }).ToList()
+                    : task.Subagents;
 
                 if (isError)
                 {

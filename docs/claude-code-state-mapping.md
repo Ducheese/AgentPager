@@ -136,7 +136,7 @@ Elicitation  ElicitationResult  SessionEnd
 
 | # | 事件 | 触发时机 | Lifecycle | Activity | 附带字段与请求 | 旧实现差异（本轮已按左列改动） |
 |---|---|---|---|---|---|---|
-| 1 | `SessionStart`（startup/resume/clear/compact/fork） | 会话开始或恢复 | `idle`（从 offline 恢复同此） | 无 | `Title` 取 `session_title`（自定义标题，可缺）；`Source` 记 `startup/resume/...` | ✅ 现为 `Starting`；**应对齐 opencode 的论证：不置 Starting**（空会话误报）——G4 |
+| 1 | `SessionStart`（startup/resume/clear/compact/fork） | 会话开始或恢复 | `idle`（从 offline 恢复同此） | 无 | `Title` 取 `session_title`（自定义标题，可缺）；`Source` 记 `startup/resume/...`。**全新会话的那条 `SessionStart` 不建行**（它到达时转录本尚未创建、载荷也没有 `session_title`，建行只能得到一个顶着 cwd 目录名的无名幽灵）——见 G46 | ✅ 已按左列：不置 `Starting`（G4）；并由"无条件建行"改为"**只复位已知会话**"（G46） |
 | 2 | `UserPromptSubmit` | 用户提交提示词（含 Claude 自启的轮次） | `running` | `thinking` | `UserPrompt`=prompt；**本轮计时起点**（仅上一状态为 idle/offline/succeeded/interrupted 时 `StartedAt=now`）；清空第三行与 `CompletedAt`；`PromptQueued=false`；`Title` 若 `session_title` 变化则同步 | ⚠ 现不重置计时、不清第三行、不认 `session_title`——G5/G6 |
 | 3 | `PreToolUse`（`agent_id` 为空） | 工具即将执行（同步门禁） | `running` | 工具映射 | `LatestStep`=统一 `工具名 内容`（`ToolStep.Compose`）；**命令类必须带命令文本判测试** | ⚠ 现用工具名子串判 Activity，`Bash npm test` 落 Executing——G8 |
 | 4 | `PreToolUse`（`tool_name=AskUserQuestion`） | 模型提问、等用户选择 | `waitingAnswer` | `thinking` | 入参 `questions[].{question, header, options[].label, multiSelect}`（实测 schema，1-4 题）→ `PendingRequest(question, 首题 question, 各题 option label)`、第三行=`header ?? question`、置顶+提示音 | ❌ 现无此分支，提问期间显示为普通 running+工具步——G7 |

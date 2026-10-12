@@ -67,7 +67,33 @@ await emit("message.part.delta", { sessionID: "ses_t", messageID: "msg_1", partI
 await flush()
 check(events("reply").length === 1 && events("reply")[0].payload.properties.text === "新正文", "fresh preview forwarded after text resumed")
 
-// 5. dispose 只列自有会话
+// 5. 子会话被删除必须先补终态（v9）：旧实现只删映射不发信号，桥上那条子代理行会永远 running
+await emit("session.created", { info: { id: "ses_child", parentID: "ses_t", title: "explore (@explore subagent)" } })
+await flush()
+check(
+  events("subagent").some((i) => i.payload.properties.id === "ses_child" && i.payload.properties.phase === "started"),
+  "child session registered as a subagent row"
+)
+await emit("session.deleted", { info: { id: "ses_child", parentID: "ses_t" } })
+await flush()
+const childPhases = events("subagent").filter((i) => i.payload.properties.id === "ses_child").map((i) => i.payload.properties.phase)
+check(childPhases.includes("failed"), `deleted child session sends a terminal phase (got ${JSON.stringify(childPhases)})`)
+check(
+  events("subagent").every((i) => i.payload.properties.sessionID === "ses_t"),
+  "subagent frames always address the parent session"
+)
+
+// 6. 子代理的工具事件必须带命令文本（v10）：桥靠它判"是不是测试命令"，不带就会把 `npm test`
+//    在子代理行上显示成"执行"而不是"测试"
+await emit("session.created", { info: { id: "ses_child2", parentID: "ses_t", title: "build (@build subagent)" } })
+await emit("message.part.updated", {
+  part: { id: "prt_child_tool", sessionID: "ses_child2", type: "tool", tool: "bash", state: { status: "running", title: "npm test", input: { command: "npm test" } } },
+})
+await flush()
+const childTool = events("subagent").filter((i) => i.payload.properties.id === "ses_child2" && i.payload.properties.phase === "tool").at(-1)
+check(childTool?.payload.properties.command === "npm test", `child tool frame carries the command (got ${JSON.stringify(childTool?.payload.properties.command)})`)
+
+// 6. dispose 只列自有会话
 await plugin.dispose()
 await flush()
 check(events("plugin.dispose").some((item) => item.payload.properties.sessionID === "ses_t"), "dispose lists own session")

@@ -127,8 +127,19 @@ public sealed class TaskCatalog
         var existing = _tasks.FirstOrDefault(task => task.Id == hook.SessionID);
 
         // 不造幽灵任务：这些事件只会"结束/推进"一个已知会话，不该凭空建行。
+        //
+        // **SessionStart 也在列**，理由不是"它不推进会话"，而是"它出生时不可能有标题"：
+        // 它由 Claude Code **每次进程启动**无条件发出（实测载荷只有 session_id / transcript_path /
+        // cwd / hook_event_name / source，**连 session_title 字段都没有**），而此刻转录本文件
+        // **尚未创建**（探针实测 exists=false）——标题的三条来源（转录本 ai-title/custom-title、
+        // 载荷 session_title、注册表 name）一条都拿不到，于是新行只能顶着 cwd 目录名出生
+        // （ClaudeTitle 在无标题时返回项目名）。用户看到的就是"每次启动 100% 冒出一个
+        // 没有 session title 的幽灵任务"。行为对齐 agy：它的事件表里根本没有"会话创建"事件，
+        // 行随第一个回合（PreInvocation）与提示词一起诞生。
+        //
+        // 对**已存在**的行，SessionStart 的语义原样保留（resume/clear 把它复位成 Idle）。
         if (existing is null && hook.HookEventName is
-            "SessionEnd" or "PreCompact" or "Stop" or "StopFailure" or "PermissionDenied"
+            "SessionStart" or "SessionEnd" or "PreCompact" or "Stop" or "StopFailure" or "PermissionDenied"
             or "PostToolUse" or "PostToolUseFailure")
             return false;
 
@@ -158,6 +169,12 @@ public sealed class TaskCatalog
 
         switch (hook.HookEventName)
         {
+            case "PreToolUse" when ClaudeEventReducer.IsTaskStopTool(hook.ToolName):
+                // Claude Code 掐子代理时**不发 SubagentStop**（探针实测：一次掐掉只看到
+                // SubagentStart + 主会话自己的 Stop），桥上就永远收不到终态。但 TaskStop 的入参
+                // 带着目标 id，且与 SubagentStart 的 agent_id 逐字相同 —— 用这条把子代理行收敛掉。
+                StopClaudeSubagent(hook.SessionID, ClaudeEventReducer.TaskStopTarget(hook.ToolInput), now);
+                break;
             case "PreToolUse" when ClaudeEventReducer.IsQuestionTool(hook.ToolName):
                 _requests[hook.SessionID] = new(
                     hook.SessionID,
@@ -230,6 +247,37 @@ public sealed class TaskCatalog
 
         Changed();
         return true;
+    }
+
+    /// <summary>
+    /// 把被 <c>TaskStop</c> 掐掉的子代理行收敛成 <c>interrupted</c>。
+    ///
+    /// 为什么需要它：Claude Code 在子代理被掐掉时**不发 `SubagentStop`**（本机 2.1.236 探针实测，
+    /// 2026-10-11：一次"起子代理→TaskStop"的完整回合里，SubagentStop 钩子一次都没触发，
+    /// 只有 SubagentStart 与主会话自己的 Stop）——没有这条补丁，那条子代理行会永远停在 running，
+    /// 父任务也永远显示 delegating。目标不是子代理（例如后台 bash 任务）时静默跳过。
+    /// </summary>
+    private void StopClaudeSubagent(string sessionID, string? targetID, DateTimeOffset now)
+    {
+        if (string.IsNullOrWhiteSpace(targetID)) return;
+        var parent = _tasks.FirstOrDefault(task => task.Id == sessionID);
+        if (parent is null) return;
+
+        var index = parent.Subagents.FindIndex(value => value.Id == targetID);
+        if (index < 0 || parent.Subagents[index].IsTerminal) return;
+
+        var subagents = parent.Subagents.ToList();
+        subagents[index] = subagents[index] with
+        {
+            // 被掐掉 = 中断，不是完成（与 opencode 的 failed、agy 的 TerminationReason=error 同一口径）
+            Lifecycle = AgentLifecycle.Interrupted,
+            Activity = null,
+            LatestStep = "✗ 已被停止",
+            UpdatedAt = now,
+        };
+        // 父任务的活动位不用在这里算：Accept 结尾的 Changed() → Normalize 会按"还有没有非终态子代理"
+        // 自动把 delegating 收回 thinking。
+        Upsert(parent with { Subagents = subagents, UpdatedAt = now });
     }
 
     /// <summary>
@@ -371,6 +419,15 @@ public sealed class TaskCatalog
                 Capabilities = capabilities,
                 UpdatedAt = now,
             });
+            Changed();
+            return true;
+        }
+
+        // 子代理内部再掐它自己的子代理（嵌套 TaskStop）：入参里的 task_id 同样是子代理 id，
+        // 而所有子代理行都挂在同一个父任务下，所以用同一个收敛函数即可（目标行不在就静默跳过）。
+        if (hook.HookEventName == "PreToolUse" && ClaudeEventReducer.IsTaskStopTool(hook.ToolName))
+        {
+            StopClaudeSubagent(parent.Id, ClaudeEventReducer.TaskStopTarget(hook.ToolInput), now);
             Changed();
             return true;
         }
@@ -646,13 +703,21 @@ public sealed class TaskCatalog
             }
         }
 
-        // 通道 3：转录本首帧 sender 探测（零时差，首毫秒即命中）
+        // **通道 3 的前置门：DB 有行时以 DB 为准。**（2026-10-11 实测踩到的误判）
+        // DB 里 `parent_conversation_id` 为空 = 这是根会话；此时**绝不能**再拿转录本启发式认父：
+        // 根会话的转录本前 15 行里会出现"子代理回报"的系统消息（形如
+        // `[Message] timestamp=… sender=<子代理id>`），启发式会把**自己的子代理**当成它的父，
+        // 父子方向整个颠倒 —— 后果是根会话被当子会话、顶层行被物理删除（同款门见 PruneAgyGhostTasks）。
+        var dbInfo = LookupAgyConversation(sessionID);
+        if (dbInfo is not null && string.IsNullOrWhiteSpace(dbInfo.ParentConversationId))
+            return null;
+
+        // 通道 3：转录本首帧 sender 探测（零时差，首毫秒即命中）。只在**DB 还没有这一行**时使用
+        // ——它的存在意义就是覆盖 SQLite 落盘时差，DB 一旦有行，权威性高于 `sender=` 一行文本。
         var transcriptPath = hook.TranscriptPath;
         if (string.IsNullOrWhiteSpace(transcriptPath))
         {
-            var defaultPath = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                ".gemini", "antigravity-cli", "brain", sessionID, ".system_generated", "logs", "transcript.jsonl");
+            var defaultPath = AgyTranscriptReader.TranscriptPathFor(sessionID);
             if (File.Exists(defaultPath)) transcriptPath = defaultPath;
         }
 
@@ -672,8 +737,7 @@ public sealed class TaskCatalog
             }
         }
 
-        // 通道 4：SQLite 元数据查询
-        var dbInfo = LookupAgyConversation(sessionID);
+        // 通道 4：SQLite 元数据查询（dbInfo 已在前置门处取过）
         if (!string.IsNullOrWhiteSpace(dbInfo?.ParentConversationId))
         {
             _agyChildToParent[sessionID] = dbInfo.ParentConversationId;
@@ -883,6 +947,7 @@ public sealed class TaskCatalog
         var currentTime = now ?? DateTimeOffset.UtcNow;
         var changed = CheckAgyQueuedPrompts(currentTime);
         changed = CheckAgyOffline(currentTime) || changed;
+        changed = CheckSubagentSilence(currentTime) || changed;
         changed = CheckAgyPreviewRecheck(currentTime) || changed;
         changed = MaintainAgyDatabase(currentTime) || changed;
         changed = CheckClaudePreviewRecheck(currentTime) || changed;
@@ -955,16 +1020,24 @@ public sealed class TaskCatalog
                 }
             }
 
-            if (parentId is null)
+            // 转录本启发式**只在 DB 没有这一行时**才允许开口（它存在的意义就是覆盖落盘时差）。
+            // 2026-10-11 实测事故：主对话自己的转录本前 15 行里有子代理回报的系统消息
+            // （`sender=<子代理id>`），启发式把**自己的子代理**当成了父 → 主对话被判成子会话 →
+            // 顶层行被这里物理删除、又因为"父"（子代理 id）不是任务而无处可挂 → 整行凭空消失。
+            // 同一份 DB 里 `nesting_depth=0`、`parent_conversation_id=''` 明明写着它是根。
+            if (parentId is null && dbInfo is null)
             {
-                var transcriptPath = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                    ".gemini", "antigravity-cli", "brain", task.Id, ".system_generated", "logs", "transcript.jsonl");
+                var transcriptPath = AgyTranscriptReader.TranscriptPathFor(task.Id);
                 if (File.Exists(transcriptPath))
                 {
                     parentId = AgyTranscriptReader.DetectParentFromTranscript(transcriptPath);
                 }
             }
+
+            // 兜底防线：确认下来的"父"**必须是一个已知任务**才允许搬移——否则搬无可搬，
+            // 删掉就是纯粹的数据丢失（宁可留一行可见的顶层行，也不要让它无声消失）。
+            if (!string.IsNullOrWhiteSpace(parentId) && _tasks.All(t => t.Id != parentId))
+                parentId = null;
 
             if (!string.IsNullOrWhiteSpace(parentId))
             {
@@ -1206,7 +1279,54 @@ public sealed class TaskCatalog
             };
             changed = true;
         }
+
         return changed;
+    }
+
+    // 子代理静默收敛的两级阈值：父任务已终态是强旁证（回合都结束了它还没回来），10 分钟就收；
+    // 父还在跑时它可能正被等着，放宽到 30 分钟。
+    private static readonly TimeSpan SubagentSilenceAfterTerminal = TimeSpan.FromMinutes(10);
+    private static readonly TimeSpan SubagentSilenceWhileRunning = TimeSpan.FromMinutes(30);
+
+    /// <summary>
+    /// 子代理行的静默收敛（三家通用）。**为什么需要**：三条来源都有"子代理死了却不发终态"的路径——
+    /// Claude 用 TaskStop 之外的方式掐、opencode 的子会话被删而插件没来得及跑、agy 被掐时**彻底静默**
+    /// （它的会话库里连"被取消"这个状态都没有，实测只有 IDLE/空串两种）。没有这条兜底，卡片会一直转圈。
+    ///
+    /// **判据刻意保守**：① 只收"没在跑工具"的子代理（activity 为 null / thinking / delegating）——
+    /// 正在执行工具的子代理本来就可能长时间没有新事件（一个 15 分钟的构建），拿它判死会误伤，
+    /// 这条守卫与任务级离线判定的 `Activity is null or Thinking` 同一思路；
+    /// ② 父任务已终态 10 分钟 / 父仍在跑 30 分钟（见上面两个阈值）。
+    /// 万一真的误伤，各来源的终态事件随后到达时会把行改回正确状态（子代理的 Stopped/Done 分支不设终态守卫）。
+    /// </summary>
+    private bool CheckSubagentSilence(DateTimeOffset now)
+    {
+        var changed = false;
+        for (var i = 0; i < _tasks.Count; i++)
+        {
+            var task = _tasks[i];
+            if (!task.Subagents.Any(s => IsSilent(s, task))) continue;
+            _tasks[i] = task with
+            {
+                Subagents = task.Subagents.Select(s => IsSilent(s, task)
+                    ? s with
+                    {
+                        Lifecycle = AgentLifecycle.Interrupted,
+                        Activity = null,
+                        LatestStep = "✗ 失去联系",
+                        UpdatedAt = now,
+                    }
+                    : s).ToList(),
+                UpdatedAt = now,
+            };
+            changed = true;
+        }
+        return changed;
+
+        bool IsSilent(SubagentSnapshot subagent, TaskSnapshot parent) =>
+            !subagent.IsTerminal &&
+            subagent.Activity is null or AgentActivity.Thinking or AgentActivity.Delegating &&
+            now - subagent.UpdatedAt > (parent.IsTerminal ? SubagentSilenceAfterTerminal : SubagentSilenceWhileRunning);
     }
 
     /// <summary>该任务此刻是否还挂着待处理请求（权限/作答）。桥用它决定要不要释放挂住的 hook。</summary>
@@ -1492,12 +1612,16 @@ public sealed class TaskCatalog
         {
             var task = _tasks[index];
             var subs = task.Subagents;
-            // 仅对 Antigravity 来源执行终态级联，杜绝跨来源误杀 Claude / OpenCode 正常运行中的子代理
-            if (task.Source == AgentSource.Antigravity && task.IsTerminal && subs.Any(s => !s.IsTerminal))
+            // 仅对 Antigravity 来源执行终态级联，杜绝跨来源误杀 Claude / OpenCode 正常运行中的子代理。
+            // **且只在父任务"中断"时级联**（2026-10-11 修正）：agy 的子代理是异步的，父回合成功结束后
+            // 子代理可能仍在跑（随后回报并 resume 父任务）——那时把子代理扫成 succeeded 就是
+            // "父任务一完成，未跑完的子代理卡片被收起"。成功终态下子代理各自用自己的 Stop 收敛，
+            // 真的失联则由 CheckAgyOffline 的静默收敛兜底。
+            if (task.Source == AgentSource.Antigravity && task.Lifecycle == AgentLifecycle.Interrupted && subs.Any(s => !s.IsTerminal))
             {
                 subs = subs.Select(s => s.IsTerminal ? s : s with
                 {
-                    Lifecycle = task.Lifecycle == AgentLifecycle.Interrupted ? AgentLifecycle.Interrupted : AgentLifecycle.Succeeded,
+                    Lifecycle = AgentLifecycle.Interrupted,
                     Activity = null,
                     UpdatedAt = now,
                 }).ToList();
@@ -1797,6 +1921,9 @@ public static class ClaudeEventReducer
         switch (hook.HookEventName)
         {
             case "SessionStart":
+                // 只会走到这里的是**已存在的行**（resume / clear / compact / fork 把会话复位成 idle）；
+                // 全新会话的那条 SessionStart 在 Accept 里就被挡掉了——它在转录本尚未创建时到达，
+                // 那时候建行只能得到一个顶着 cwd 目录名的无名幽灵（详见 Accept 里的注释）。
                 return task with
                 {
                     Lifecycle = AgentLifecycle.Idle,
@@ -1808,6 +1935,11 @@ public static class ClaudeEventReducer
                 };
             case "UserPromptSubmit":
                 return UserPrompt(task, hook.Prompt, now);
+            case "PreToolUse" when IsTaskStopTool(hook.ToolName):
+                // 掐子代理（TaskStop）这条调用**不动父任务**：入参只有 `{"task_id":"…"}`，白名单取不到摘要，
+                // 走通用分支会让第三行退化成光秃秃的 "Task" 并且粘住（PostToolUse 不清 step）。
+                // 真正的动作是"把被掐的子代理行收敛掉"，那件事在 Accept 里做（reducer 拿不到 _tasks）。
+                return task;
             case "PreToolUse" when IsQuestionTool(hook.ToolName):
                 // 模型主动提问：这是"在等用户作答"的精确信号，不必靠 Notification 类型去猜。
                 if (!CanAdvance(task)) return task;
@@ -2094,6 +2226,20 @@ public static class ClaudeEventReducer
     /// <summary>模型主动提问的工具（提问态用工具名判，不用通知类型猜）。</summary>
     public static bool IsQuestionTool(string? toolName) =>
         toolName is not null && toolName.Equals("AskUserQuestion", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>掐掉后台任务/子代理的工具（实测工具名 <c>TaskStop</c>）。</summary>
+    public static bool IsTaskStopTool(string? toolName) =>
+        toolName is not null && toolName.Equals("TaskStop", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// TaskStop 的目标 id。实测入参是 <c>{"task_id":"a2bb7464c16c26320"}</c>，与 SubagentStart 的
+    /// <c>agent_id</c> **逐字相同**——掐子代理时桥靠这个把对应子代理行收敛掉。
+    /// </summary>
+    public static string? TaskStopTarget(JsonElement? toolInput) =>
+        toolInput is { ValueKind: JsonValueKind.Object } value &&
+        value.TryGetProperty("task_id", out var id) && id.ValueKind == JsonValueKind.String
+            ? id.GetString()
+            : null;
 
     /// <summary>
     /// 提问卡片正文。一次提问可带 1-4 题（实测 schema），而手机端只渲染**一行** summary，
@@ -2653,7 +2799,13 @@ public static class OpenCodeEventReducer
                     : toolTitle is not null ? ToolStep.Compose(tool, toolTitle)
                     : Text(value, "step");
                 if (step is not null && !EchoesPrompt(task, step)) subagent = subagent with { LatestStep = Clamp(step, 220) };
-                subagent = subagent with { Lifecycle = AgentLifecycle.Running, Activity = ActivityFor(tool, null) };
+                // 命令文本由插件单独带过来（子代理事件没有完整 state）：不带就判不出"测试"，
+                // 同一个 `npm test` 会让父任务行显蓝、子代理行显橙。
+                subagent = subagent with
+                {
+                    Lifecycle = AgentLifecycle.Running,
+                    Activity = ActivityFor(tool, ShellTestRun.Matches(Text(value, "command"))),
+                };
                 break;
             case "tokens":
                 if (TokenUsageFrom(value) is { } usage) subagent = subagent with { TokenUsage = usage };
@@ -2763,7 +2915,14 @@ public static class OpenCodeEventReducer
         return milliseconds <= 0 ? null : DateTimeOffset.FromUnixTimeMilliseconds((long)Math.Round(milliseconds));
     }
 
-    private static AgentActivity ActivityFor(string? tool, JsonElement? state)
+    private static AgentActivity ActivityFor(string? tool, JsonElement? state) =>
+        ActivityFor(tool, IsTestCommand(state));
+
+    /// <summary>
+    /// 判据与父任务行完全相同，只有"是不是测试命令"这一位由调用方给出——
+    /// 子代理事件里没有完整的 state（插件只带 command 字段），不能走 state 版本。
+    /// </summary>
+    private static AgentActivity ActivityFor(string? tool, bool isTest)
     {
         var name = tool?.ToLowerInvariant() ?? "";
         if (name.Length == 0) return AgentActivity.Executing;
@@ -2776,7 +2935,7 @@ public static class OpenCodeEventReducer
         if (name.Contains("edit") || name.Contains("write") || name.Contains("patch")) return AgentActivity.Editing;
         if (name.Contains("skill") || name.Contains("lsp")) return AgentActivity.Reading;
         if (name.Contains("bash") || name.Contains("shell") || name.Contains("terminal"))
-            return IsTestCommand(state) ? AgentActivity.Testing : AgentActivity.Executing;
+            return isTest ? AgentActivity.Testing : AgentActivity.Executing;
         if (name.Contains("test")) return AgentActivity.Testing;
         return AgentActivity.Executing;
     }
