@@ -22,6 +22,9 @@ function check(condition, name) {
 }
 
 const received = []
+// hold 帧（插件挂住等手机的那种）由假桥回一行 JSON；普通帧回裸换行（即发即走）。
+let replyDecision = "allow"
+const holds = () => received.filter((i) => i.payload?.hold)
 const server = net.createServer((socket) => {
   let buffer = ""
   socket.on("data", (chunk) => {
@@ -30,14 +33,27 @@ const server = net.createServer((socket) => {
     while ((index = buffer.indexOf("\n")) >= 0) {
       const line = buffer.slice(0, index)
       buffer = buffer.slice(index + 1)
-      if (line.trim()) received.push(JSON.parse(line))
-      socket.write("\n")
+      if (line.trim()) {
+        const envelope = JSON.parse(line)
+        received.push(envelope)
+        if (envelope.payload?.hold) socket.write(JSON.stringify({ decision: replyDecision }) + "\n")
+        else socket.write("\n")
+      }
     }
   })
 })
 await new Promise((resolve) => server.listen(TEST_PORT, "127.0.0.1", resolve))
 
-const plugin = await AgentPagerOpenCode()
+const clientCalls = []
+// 装好的 1.18.35 给插件的是 SDK 生成的那版客户端：方法名 postSessionIdPermissionsPermissionId。
+// （新版封装是 permission.reply —— 插件按"运行时可用的那个"挑，两条路各测一次。）
+const fakeClient = {
+  postSessionIdPermissionsPermissionId: async (args) => {
+    clientCalls.push(args)
+    if (process.env.AP_TEST_REPLY_THROWS === "1") throw new Error("模板未替换：/session/{sessionID}/...")
+  },
+}
+const plugin = await AgentPagerOpenCode({ client: fakeClient, directory: "F:/Git/demo" })
 const emit = (type, properties) => plugin.event({ event: { type, properties } })
 const flush = () => new Promise((resolve) => setTimeout(resolve, 150))
 const events = (name) => received.filter((item) => item.payload?.event === name)
@@ -113,7 +129,49 @@ await flush()
 const childTool = events("subagent").filter((i) => i.payload.properties.id === "ses_child2" && i.payload.properties.phase === "tool").at(-1)
 check(childTool?.payload.properties.command === "npm test", `child tool frame carries the command (got ${JSON.stringify(childTool?.payload.properties.command)})`)
 
-// 6. dispose 只列自有会话
+// 5. 远程审批（v13）：权限询问事件 → 插件另挂一条连接给桥 → 桥上的决策 → 用 opencode 接口回复
+replyDecision = "allow"
+const beforeApproval = received.length
+await emit("permission.asked", { sessionID: "ses_t", id: "per_1", permission: "bash", patterns: ["rm -rf build"] })
+await flush()
+// **只许发一帧**（实测踩过）：再照旧补一条普通 permission.asked 的话，两帧走两条连接、
+// 谁后到谁说了算 —— 普通帧后到会把刚给上的能力位冲成空 ✗，手机上就只剩卡片没有按钮。
+const approvalFrames = received.slice(beforeApproval).filter((i) => i.payload?.event === "permission.asked")
+check(approvalFrames.length === 1 && approvalFrames[0].payload?.hold === "approval",
+  `a permission sends exactly one frame, and it is the hold (got ${JSON.stringify(approvalFrames.map((i) => i.payload?.hold ?? "plain"))})`)
+check(holds().some((h) => h.payload?.properties?.id === "per_1" && h.payload?.hold === "approval"),
+  "permission.asked also arms a hold for the phone")
+check(clientCalls.at(-1)?.body?.response === "once",
+  `bridge allow is handed back as response=once (got ${JSON.stringify(clientCalls.at(-1)?.body)})`)
+// 两个键都给：这条路由的 path 参数名各家版本不同（装好的 1.18.35 是 {sessionID}，新版是 {id}）
+check(clientCalls.at(-1)?.path?.sessionID === "ses_t" && clientCalls.at(-1)?.path?.id === "ses_t" &&
+  clientCalls.at(-1)?.path?.permissionID === "per_1",
+  `both path key spellings are sent (got ${JSON.stringify(clientCalls.at(-1)?.path)})`)
+
+replyDecision = "deny"
+await emit("permission.asked", { sessionID: "ses_t", id: "per_2", permission: "edit" })
+await flush()
+check(clientCalls.at(-1)?.body?.response === "reject",
+  `bridge deny is handed back as response=reject (got ${JSON.stringify(clientCalls.at(-1)?.body)})`)
+
+// 5b. 回复失败要把原因**报回桥日志**（真机踩过"手机上点了没反应、却查不到任何痕迹"的亏 ✗）
+process.env.AP_TEST_REPLY_THROWS = "1"
+const beforeNote = received.length
+await emit("permission.asked", { sessionID: "ses_t", id: "per_3", permission: "bash" })
+await flush()
+delete process.env.AP_TEST_REPLY_THROWS
+const noteFrame = received.slice(beforeNote).map((i) => i.payload).find((p) => p?.event === "plugin.note")
+check(typeof noteFrame?.properties?.note === "string" && noteFrame.properties.note.includes("权限回复失败"),
+  `a failed reply is reported back through the bridge (got ${JSON.stringify(noteFrame?.properties?.note)})`)
+
+// 6. 子会话的询问不上报、也不挂起
+const beforeChild = holds().length
+await emit("session.created", { info: { id: "ses_child3", parentID: "ses_t", title: "x (@x subagent)" } })
+await emit("permission.asked", { sessionID: "ses_child3", id: "per_child", permission: "bash" })
+await flush()
+check(holds().length === beforeChild, "child session permissions are never held")
+
+// 7. dispose 只列自有会话
 await plugin.dispose()
 await flush()
 check(events("plugin.dispose").some((item) => item.payload.properties.sessionID === "ses_t"), "dispose lists own session")

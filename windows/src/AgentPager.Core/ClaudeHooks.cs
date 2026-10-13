@@ -259,7 +259,7 @@ public sealed class ClaudeHookConfiguration(string? claudeConfigDir = null)
         ("SubagentStop", null, null),
         ("Notification", "*", null),
         ("PreToolUse", "*", null),
-        ("PermissionRequest", "*", 86_400),
+        ("PermissionRequest", "*", 600),
         ("PostToolUse", "*", null),
         ("PostToolUseFailure", "*", null),
         ("PermissionDenied", "*", null),

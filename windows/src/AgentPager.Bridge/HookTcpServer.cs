@@ -26,16 +26,27 @@ public sealed class HookTcpServer(Func<HookEnvelope, Task> hookHandler, DailyFil
 
     public bool Resolve(string sessionID, CodexPermissionDecision decision)
     {
-        if (!_pending.TryRemove(sessionID, out var entry)) return false;
+        if (!_pending.TryRemove(sessionID, out var entry))
+        {
+            // 手机上点了"允许/拒绝"却没有待决连接 = 这条审批早就被撤了（等待在别处结束了，
+            // 或并行工具的事件把卡片撤走、连带把 hook 也撤了）。以前这里一声不吭 ✗ ——
+            // 用户只看到"点了没反应"，日志里查不到任何痕迹（2026-10-11 实测踩到）。必须落盘。
+            log.Write("WARN", $"[审批] 没有待决连接（会话 {sessionID}）：审批回填失败");
+            return false;
+        }
         try
         {
             using (entry.Client)
             {
-                var response = entry.Source == HookSource.Claude
-                    ? ClaudeHookOutput.Permission(decision == CodexPermissionDecision.Allow
+                var response = entry.Source switch
+                {
+                    HookSource.Claude => ClaudeHookOutput.Permission(decision == CodexPermissionDecision.Allow
                         ? ClaudePermissionDecision.Allow
-                        : ClaudePermissionDecision.Deny)
-                    : CodexHookOutput.Permission(decision);
+                        : ClaudePermissionDecision.Deny),
+                    HookSource.OpenCode => OpenCodeHookOutput.Decision(decision == CodexPermissionDecision.Allow),
+                    _ => CodexHookOutput.Permission(decision),
+                };
+                log.Write("INFO", $"[{entry.Source}] 审批已回填（{(decision == CodexPermissionDecision.Allow ? "allow" : "deny")}，会话 {sessionID}）");
                 entry.Client.GetStream().Write(response);
             }
             return true;
@@ -58,6 +69,13 @@ public sealed class HookTcpServer(Func<HookEnvelope, Task> hookHandler, DailyFil
         {
             using (entry.Client)
             {
+                if (entry.Source == HookSource.OpenCode)
+                {
+                    // opencode 的答复是"每题一个已选 label 数组"：现在只走单题单选形态。
+                    entry.Client.GetStream().Write(OpenCodeHookOutput.Answers([answer]));
+                    log.Write("INFO", $"[OpenCode] 作答已回填（{answer.Length} 字，会话 {sessionID}）");
+                    return true;
+                }
                 if (entry.Source != HookSource.Claude)
                 {
                     log.Write("WARN", $"[Claude] 作答通道来源不是 Claude：{entry.Source}");
@@ -83,7 +101,7 @@ public sealed class HookTcpServer(Func<HookEnvelope, Task> hookHandler, DailyFil
     ///
     /// 场景：等待已经以别的方式结束了——用户在终端自己作答、工具跑完、回合结束。
     /// 实测（2026-10-08）：这种情况下 Claude Code **不会**替我们杀掉 hook 进程，那个 node
-    /// 会一直挂到 `timeout`（提问/权限是 86400 秒）才收场。主动关掉 socket，脚本看到 close
+    /// 会一直挂到 `timeout`（提问/权限是 600 秒）才收场。主动关掉 socket，脚本看到 close
     /// 即 exit 0，Claude Code 视作"没有输出"——正是我们要的"不干预"。
     /// </summary>
     public bool Cancel(string sessionID)
@@ -153,10 +171,14 @@ public sealed class HookTcpServer(Func<HookEnvelope, Task> hookHandler, DailyFil
             }
             if (envelope is null) { client.Dispose(); return; }
 
+            // "要不要挂住这条连接等手机" —— 三家形态不同，意思相同：
+            //   · Codex/Claude：权限询问事件（Claude 的提问工具也走这条，回包带 updatedInput）
+            //   · opencode：插件显式带 hold 标记的帧（权限询问与提问都用它挂住，插件 v13 起）
             var isPermission = envelope switch
             {
                 HookEnvelope.Codex codex => codex.Hook.HookEventName == CodexHookEventName.PermissionRequest,
                 HookEnvelope.Claude claude => claude.Hook.HookEventName == "PermissionRequest",
+                HookEnvelope.OpenCode openCode => openCode.Hook.Hold is { Length: > 0 },
                 _ => false,
             };
             var sessionID = envelope switch
@@ -171,7 +193,12 @@ public sealed class HookTcpServer(Func<HookEnvelope, Task> hookHandler, DailyFil
 
             if (isPermission)
             {
-                var source = envelope is HookEnvelope.Claude ? HookSource.Claude : HookSource.Codex;
+                var source = envelope switch
+                {
+                    HookEnvelope.Claude => HookSource.Claude,
+                    HookEnvelope.OpenCode => HookSource.OpenCode,
+                    _ => HookSource.Codex,
+                };
                 if (_pending.TryGetValue(sessionID, out var previous)) previous.Client.Dispose();
                 _pending[sessionID] = (client, source);
                 log.Write("INFO", $"[{source}] 挂起等待（会话 {sessionID}）");

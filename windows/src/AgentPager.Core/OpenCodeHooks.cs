@@ -1,4 +1,6 @@
+using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 
@@ -10,7 +12,37 @@ namespace AgentPager.Core;
 /// </summary>
 public sealed record OpenCodeHookPayload(
     [property: JsonPropertyName("event")] string Event,
-    [property: JsonPropertyName("properties")] JsonElement? Properties);
+    [property: JsonPropertyName("properties")] JsonElement? Properties,
+    /// <summary>
+    /// "挂住等手机"的帧（2026-10-11 起）：插件在收到权限询问/提问时，除了照常转发展示，
+    /// 还会**再挂一条连接**给桥 —— 桥攥着它直到手机作答，回包走这条连接。
+    /// 非空即为挂起帧（"approval" / "question"）。
+    /// </summary>
+    [property: JsonPropertyName("hold")] string? Hold = null,
+    /// <summary>提问的 requestID（opencode 的作答端点按它定位；审批用 properties.id）。</summary>
+    [property: JsonPropertyName("request_id")] string? RequestID = null);
+
+/// <summary>
+/// 写回 opencode 插件的应答（走挂住的那条连接，一行 JSON）。
+/// 形状由插件自己消费，与 Claude 那套 hook stdout 协议无关。
+/// </summary>
+public static class OpenCodeHookOutput
+{
+    public static byte[] Decision(bool allow) =>
+        Encoding.UTF8.GetBytes($"{{\"decision\":\"{(allow ? "allow" : "deny")}\"}}\n");
+
+    /// <summary>
+    /// 作答：opencode 的答复是"每题一个已选 label 数组"（源码 routes/question.ts 原文：
+    /// "User answers in order of questions (each answer is an array of selected labels)"）。
+    /// 现在只走单题单选的形态 → 一个数组包一个 label；多选题以后再扩。
+    /// </summary>
+    public static byte[] Answers(IReadOnlyList<string> labels)
+    {
+        var array = new JsonArray(labels.Select(label => (JsonNode)JsonValue.Create(label)!).ToArray());
+        var root = new JsonObject { ["answers"] = new JsonArray(array) };
+        return Encoding.UTF8.GetBytes(root.ToJsonString() + "\n");
+    }
+}
 
 public enum OpenCodePluginStatus { NotInstalled, Installed, Outdated }
 

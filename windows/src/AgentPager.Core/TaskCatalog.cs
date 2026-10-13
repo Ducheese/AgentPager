@@ -601,6 +601,16 @@ public sealed class TaskCatalog
                     OpenCodeEventReducer.PermissionSummary(hook.Properties),
                     []);
                 break;
+            // 挂住等手机的提问：只有"我们攥着回话通道"时才给作答能力位 ——
+            // 否则手机上会画出一个发不出去的输入框（Claude 侧踩过同一个坑）。
+            case "question.asked" when hook.Hold is { Length: > 0 }:
+                _requests[sessionID] = new(
+                    sessionID,
+                    PendingRequestKind.Question,
+                    OpenCodeEventReducer.QuestionText(hook.Properties),
+                    OpenCodeEventReducer.QuestionOptions(hook.Properties));
+                Upsert(_tasks.First(task => task.Id == sessionID) with { Capabilities = [TaskCapability.Answer] });
+                break;
             case "question.asked":
                 _requests[sessionID] = new(
                     sessionID,
@@ -1375,6 +1385,46 @@ public sealed class TaskCatalog
     public bool HasPendingRequest(string taskID) => _requests.ContainsKey(taskID);
 
     /// <summary>
+    /// 挂起超时：等待人类答复（审批/提问）超过 <paramref name="limit"/> 的行**交回给代理**——
+    /// 撤卡 + 清能力位 + 回到 running/thinking，**不判死也不判离线** ✓。
+    ///
+    /// 为什么不是"判离线"：用户可能在**终端**上作答 ✗（Claude 没有"权限已作答"这类 hook，
+    /// 只能靠后续事件间接同步 ✓），若此时把行判死，手机上就会显示一个**与事实相反**的状态 ✗。
+    /// 交回 running 之后：代理其实活着 → 它自己的事件继续更新 ✓；真的死了 → 10 分钟的
+    /// 静默离线规则自然接管（它认的就是 running + thinking ✓）。
+    ///
+    /// 返回需要释放回话连接的会话 id（桥据此关掉挂住的那条 socket）。
+    /// </summary>
+    public IReadOnlyList<string> ExpireStaleWaits(TimeSpan limit, DateTimeOffset? now = null)
+    {
+        var currentTime = now ?? DateTimeOffset.UtcNow;
+        var expired = new List<string>();
+        for (var index = 0; index < _tasks.Count; index++)
+        {
+            var task = _tasks[index];
+            if (task.Lifecycle is not (AgentLifecycle.WaitingApproval or AgentLifecycle.WaitingAnswer)) continue;
+            if (!_waitingSince.TryGetValue(task.Id, out var since)) continue;
+            if (currentTime - since < limit) continue;
+
+            DropClaudeRequest(task.Id);
+            _claudePreviewRecheck.Remove(task.Id);
+            // 走 Upsert：离开等待态时它会自动做时钟顺延补偿（等待那段不计入净耗时），
+            // 这里不需要自己动 StartedAt ✓。
+            Upsert(task with
+            {
+                Lifecycle = AgentLifecycle.Running,
+                Activity = AgentActivity.Thinking,
+                CompletedAt = null,
+                Capabilities = [],
+                UpdatedAt = currentTime,
+            });
+            expired.Add(task.Id);
+        }
+        if (expired.Count > 0) Changed();
+        return expired;
+    }
+
+    /// <summary>
     /// Stop 终稿的竞速补救（照搬 agy 的 <c>_agyPreviewRecheck</c>）：转录本与 payload 两路同时落空时，
     /// 在 1 分钟窗口内重读转录本，拿到正文就补写第三行。
     /// </summary>
@@ -1488,15 +1538,20 @@ public sealed class TaskCatalog
                         return new(requestID, ControlResult.Rejected, "Hook 审批通道已失效");
                     _requests.Remove(task.Id);
                     var now = DateTimeOffset.UtcNow;
+                    // 拒绝 = **拒绝这一次调用**，不是把整个任务判死（2026-10-11 用户实测报出：
+                    // "拒绝后 task 直接变离线状态了" ✗）。三家被拒之后都会把"用户拒绝了"回报给模型、
+                    // **回合继续**（实测 Claude 拒绝后模型还在继续回话 ✓，快照里那行的第三行就是它被拒后的回复）。
+                    // 所以拒绝也回到 running，终态交给代理自己的结束信号（Stop / session.idle / StopFailure）。
+                    // 第三行写一句"✗ 已拒绝 …"让拒绝这件事在手机上看得到（与 PermissionDenied 同一措辞）。
                     Upsert(task with
                     {
-                        Lifecycle = decision == CodexPermissionDecision.Allow
-                            ? AgentLifecycle.Running
-                            : AgentLifecycle.Interrupted,
-                        Activity = decision == CodexPermissionDecision.Allow ? AgentActivity.Thinking : null,
+                        Lifecycle = AgentLifecycle.Running,
+                        Activity = AgentActivity.Thinking,
+                        LatestStep = decision == CodexPermissionDecision.Allow
+                            ? task.LatestStep
+                            : $"✗ 已拒绝 {request.Summary}".TrimEnd(),
                         UpdatedAt = now,
-                        CompletedAt = decision == CodexPermissionDecision.Allow ? null : now,
-                        IsUnread = decision == CodexPermissionDecision.Deny || task.IsUnread,
+                        CompletedAt = null,
                         Capabilities = [],
                     });
                     Changed();
@@ -2660,7 +2715,16 @@ public static class OpenCodeEventReducer
                     Lifecycle = AgentLifecycle.WaitingApproval,
                     Activity = AgentActivity.Executing,
                     CompletedAt = null,
-                    Capabilities = [],
+                    // 能力位只认"桥确实攥着回话通道"（插件挂住的那条 hold 连接）——
+                    // 没有它，手机上的允许/拒绝是发不出去的假按钮（插件 v13 之前 opencode 正是这个状态）。
+                    //
+                    // **只升不降**：已经在等审批的行不许被后续的普通询问把能力位冲空。
+                    // 实测踩过：插件同时发了普通帧与 hold 帧、两帧走两条连接谁后到谁说了算，
+                    // 普通帧后到就把刚给上的 Approve/Deny 清掉 ✗ —— 手机上只剩卡片没有按钮。
+                    // 插件侧已改成只发一帧（根因），这里是桥侧的兜底。
+                    Capabilities = hook.Hold is { Length: > 0 }
+                        ? [TaskCapability.Approve, TaskCapability.Deny]
+                        : task.Lifecycle == AgentLifecycle.WaitingApproval ? task.Capabilities : [],
                 };
             case "permission.replied":
                 return PermissionReply(task, hook.Properties, now);

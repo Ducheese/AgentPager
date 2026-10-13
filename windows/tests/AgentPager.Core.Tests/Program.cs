@@ -393,21 +393,21 @@ Check(!json.Contains("\"OpenCode\""), "wire has no PascalCase enum leakage");
 var temp = Path.Combine(Path.GetTempPath(), "ap-verify-plugins-" + Guid.NewGuid().ToString("N"));
 var installer = new OpenCodePluginConfiguration(temp);
 Check(installer.Status == OpenCodePluginStatus.NotInstalled, "status: 未安装");
-Check(OpenCodePluginConfiguration.EmbeddedVersion == 11, $"embedded plugin version = 11 (got {OpenCodePluginConfiguration.EmbeddedVersion})");
+Check(OpenCodePluginConfiguration.EmbeddedVersion == 15, $"embedded plugin version = 15 (got {OpenCodePluginConfiguration.EmbeddedVersion})");
 var first = installer.Install();
 Check(first.Changed && File.Exists(Path.Combine(temp, "plugins", "agentpager-opencode.js")), "install writes plugin");
 Check(installer.Status == OpenCodePluginStatus.Installed && installer.IsInstalled(), "status: 已写入（与内置一致）");
-Check(installer.InstalledVersion == 11, "installed version = 11");
+Check(installer.InstalledVersion == 15, "installed version = 15");
 var second = installer.Install();
 Check(!second.Changed, "reinstall is idempotent");
 var pluginPath = Path.Combine(temp, "plugins", "agentpager-opencode.js");
 var content = File.ReadAllText(pluginPath);
 Check(content.Contains("Managed by AgentPager (OpenCode)"), "managed marker present");
-Check(content.Contains("agentpager-opencode v11"), "version header present");
+Check(content.Contains("agentpager-opencode v15"), "version header present");
 Check(content.Contains("hook_source: \"opencode\"") && content.Contains("49361"), "plugin content sane");
 File.WriteAllText(pluginPath, content.Replace("const MAX_TEXT = 1000", "const MAX_TEXT = 500"));
 Check(installer.Status == OpenCodePluginStatus.Outdated, "status: 待更新（内容与内置不一致）");
-Check(installer.InstalledVersion == 11, "outdated file still reports v11");
+Check(installer.InstalledVersion == 15, "outdated file still reports v15");
 var repair = installer.Install();
 Check(repair.Changed && installer.Status == OpenCodePluginStatus.Installed, "repair restores 已写入");
 var uninstalled = installer.Uninstall();
@@ -894,7 +894,10 @@ Check(claudeHooks.IsInstalled(), "claude: installed state");
 var installedSettings = JsonNode.Parse(File.ReadAllText(claudeHooks.SettingsPath))!.AsObject();
 var installedHooks = installedSettings["hooks"]!.AsObject();
 Check(installedHooks["UserPromptSubmit"] is JsonArray, "claude: lifecycle events registered");
-Check(installedHooks["PermissionRequest"]!.AsArray()[0]!["hooks"]!.AsArray()[0]!["timeout"]!.GetValue<int>() == 86_400, "claude: permission hook keeps the long timeout");
+// 挂起上限三家统一为 10 分钟（桥侧 HoldLimit 同值 + opencode 插件的 HOLD_TIMEOUT_MS 同值）：
+// 到点把询问交回终端，不再让 hook 挂满 24 小时 ✗。
+Check(installedHooks["PermissionRequest"]!.AsArray()[0]!["hooks"]!.AsArray()[0]!["timeout"]!.GetValue<int>() == 600,
+    "claude: permission hook times out with the shared 10-minute hold limit");
 var stopGroups = installedHooks["Stop"]!.AsArray();
 Check(stopGroups.Count == 2, $"claude: user hook preserved alongside ours (got {stopGroups.Count})");
 Check(stopGroups.Any(g => g!["hooks"]!.AsArray().Any(h =>
@@ -1908,9 +1911,118 @@ finally
     PathDisplay.HomeRootOverride = previousHomeRoot;
 }
 
+// ---- 拒绝 = 拒绝这一次调用，不是把任务判死（2026-10-11 用户实测报出"拒绝后直接变离线"）----
+// 三家被拒之后都会把"用户拒绝了"回报给模型、回合继续；终态交给代理自己的结束信号。
+var denyCatalog = new TaskCatalog();
+var denyT0 = DateTimeOffset.UtcNow;
+denyCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_deny", prompt = "删一下" }), denyT0);
+denyCatalog.Accept(C("PermissionRequest", new { session_id = "claude_deny", tool_name = "Bash", tool_input = new { command = "rm -rf build" } }), denyT0.AddSeconds(1));
+TaskSnapshot DenyTask() => denyCatalog.Projection().Tasks.First(t => t.Id == "claude_deny");
+Check(DenyTask().Lifecycle == AgentLifecycle.WaitingApproval, "deny: fixture is waiting for approval");
+var denyAck = denyCatalog.Perform(Guid.NewGuid(), new ControlPayload("claude_deny", ControlAction.Deny, null), new AllowResolver());
+Check(denyAck.Result == ControlResult.Accepted, $"deny: accepted (got {denyAck.Result})");
+Check(DenyTask().Lifecycle == AgentLifecycle.Running, $"deny: the task keeps running, it is not killed (got {DenyTask().Lifecycle})");
+Check(DenyTask().Activity == AgentActivity.Thinking, "deny: back to thinking");
+Check(DenyTask().LatestStep == "✗ 已拒绝 rm -rf build", $"deny: the refusal shows on the third line (got '{DenyTask().LatestStep}')");
+Check(!DenyTask().Capabilities.Any(), "deny: capabilities cleared");
+// 之后代理自己结束 → 才是终态（不会被前面的拒绝卡在"已中断"）
+denyCatalog.Accept(C("Stop", new { session_id = "claude_deny", last_assistant_message = "那我不删了" }), denyT0.AddSeconds(3));
+Check(DenyTask().Lifecycle == AgentLifecycle.Succeeded, $"deny: the agent's own end signal decides the terminal state (got {DenyTask().Lifecycle})");
+
+// ---- 挂起超时（三家统一）：等手机超过 10 分钟没人答 → **交回终端**，不判死、不判离线 ----
+// 用户可能在终端上作答 ✓，而 Claude 没有"权限已作答"这类 hook ✗（只能靠后续事件间接同步 ✓），
+// 此时若把行判死，手机上就会显示与事实相反的状态 ✗。交回 running 之后：代理活着 → 它自己的
+// 事件继续更新 ✓；真的死了 → 静默离线规则自然接管（它认的就是 running + thinking ✓）。
+var holdTimeoutCatalog = new TaskCatalog();
+var holdT0 = DateTimeOffset.UtcNow;
+holdTimeoutCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_timeout", prompt = "干个敏感活" }), holdT0);
+holdTimeoutCatalog.Accept(C("PermissionRequest", new { session_id = "claude_timeout", tool_name = "Bash", tool_input = new { command = "rm -rf build" } }), holdT0.AddSeconds(1));
+TaskSnapshot TimeoutTask() => holdTimeoutCatalog.Projection().Tasks.First(t => t.Id == "claude_timeout");
+Check(TimeoutTask().Lifecycle == AgentLifecycle.WaitingApproval && TimeoutTask().Capabilities.Contains(TaskCapability.Approve),
+    "hold timeout: fixture is waiting with capabilities");
+
+// 9 分钟：还不到点，不许动
+Check(holdTimeoutCatalog.ExpireStaleWaits(TimeSpan.FromMinutes(10), holdT0.AddMinutes(9)).Count == 0,
+    "hold timeout: nothing expires before the limit");
+Check(TimeoutTask().Lifecycle == AgentLifecycle.WaitingApproval, "hold timeout: still waiting at 9 minutes");
+
+// 超过 10 分钟 → 交回终端
+var expired = holdTimeoutCatalog.ExpireStaleWaits(TimeSpan.FromMinutes(10), holdT0.AddMinutes(11));
+Check(expired.Count == 1 && expired[0] == "claude_timeout", $"hold timeout: the stale wait is handed back (got {expired.Count})");
+Check(TimeoutTask().Lifecycle == AgentLifecycle.Running && TimeoutTask().Activity == AgentActivity.Thinking,
+    $"hold timeout: back to running/thinking, not dead (got {TimeoutTask().Lifecycle}/{TimeoutTask().Activity})");
+Check(!TimeoutTask().Capabilities.Any(), "hold timeout: capabilities cleared");
+Check(!holdTimeoutCatalog.Projection().PendingRequests.Any(r => r.TaskID == "claude_timeout"), "hold timeout: the card is dropped");
+// 计时顺延：等待的 10 分钟不计入净耗时（离开等待态时 Upsert 自动补偿）
+Check(TimeoutTask().StartedAt >= holdT0.AddMinutes(10), $"hold timeout: the wait is excluded from the clock (got {TimeoutTask().StartedAt:HH:mm:ss})");
+
+// 提问同样适用（审批与提问同一口径）
+var holdQuestionCatalog = new TaskCatalog();
+var hqT0 = DateTimeOffset.UtcNow;
+holdQuestionCatalog.Accept(H("chat.message", new { sessionID = "ses_hq", text = "问一下" }), hqT0);
+holdQuestionCatalog.Accept(new OpenCodeHookPayload("question.asked", JsonSerializer.SerializeToElement(new { sessionID = "ses_hq", id = "q_x", questions = new[] { new { question = "选哪个？", options = new[] { "A", "B" } } } }, WireJson.Options), "question"), hqT0.AddSeconds(1));
+Check(holdQuestionCatalog.ExpireStaleWaits(TimeSpan.FromMinutes(10), hqT0.AddMinutes(12)).Count == 1,
+    "hold timeout: questions expire on the same rule");
+Check(holdQuestionCatalog.Projection().Tasks.First(t => t.Id == "ses_hq").Lifecycle == AgentLifecycle.Running,
+    "hold timeout: an expired question goes back to running too");
+
+// ===================== 29. opencode 远程审批 / 作答（插件 v13）=====================
+// 通道：插件看到权限询问事件 → 另挂一条连接给桥（带 hold 标记）→ 桥攥住 → 手机允许/拒绝
+// → 桥回 {"decision":…} → 插件用 opencode 自己的接口替它答复。
+// 桥侧要做的两件事：① 认出 hold 帧并挂住连接 ② 给这张卡补上能力位（否则手机上是点不动的假按钮）。
+var ocHoldCatalog = new TaskCatalog();
+var ocHoldT0 = DateTimeOffset.UtcNow;
+ocHoldCatalog.Accept(H("chat.message", new { sessionID = "ses_hold", text = "删点东西" }), ocHoldT0);
+TaskSnapshot OcHold() => ocHoldCatalog.Projection().Tasks.First(t => t.Id == "ses_hold");
+
+// 普通 permission.asked（桥没攥着回话通道）→ 不给能力位
+ocHoldCatalog.Accept(H("permission.asked", new { sessionID = "ses_hold", id = "per_a", permission = "bash", patterns = new[] { "rm -rf build" } }), ocHoldT0.AddSeconds(1));
+Check(OcHold().Lifecycle == AgentLifecycle.WaitingApproval, "opencode hold: permission.asked goes waitingApproval");
+Check(OcHold().Capabilities.Count == 0, $"opencode hold: a plain ask grants no approve capability (got {OcHold().Capabilities.Count})");
+
+// hold 帧 → 给 Approve/Deny，手机才点得动
+ocHoldCatalog.Accept(new OpenCodeHookPayload("permission.asked", JsonSerializer.SerializeToElement(new { sessionID = "ses_hold", id = "per_b", permission = "bash", patterns = new[] { "rm -rf build" } }, WireJson.Options), "approval"), ocHoldT0.AddSeconds(2));
+Check(OcHold().Capabilities.Contains(TaskCapability.Approve) && OcHold().Capabilities.Contains(TaskCapability.Deny),
+    "opencode hold: a held ask grants approve/deny");
+
+// **只升不降**（实测踩过的坑）：hold 帧给上能力位之后，再来一条普通询问不许把它冲空 ——
+// 插件当时同时发了两帧、谁后到谁说了算，"普通帧后到"就等于手机上只剩卡片没有按钮 ✗。
+ocHoldCatalog.Accept(H("permission.asked", new { sessionID = "ses_hold", id = "per_c", permission = "bash", patterns = new[] { "rm -rf build" } }), ocHoldT0.AddSeconds(2).AddMilliseconds(500));
+Check(OcHold().Capabilities.Contains(TaskCapability.Approve),
+    $"opencode hold: a trailing plain ask must not clear the capabilities (got {OcHold().Capabilities.Count})");
+
+// 提问：带 hold 才给作答能力位
+ocHoldCatalog.Accept(H("question.asked", new { sessionID = "ses_hold", id = "q_1", questions = new[] { new { question = "选哪个？", options = new[] { "A", "B" } } } }), ocHoldT0.AddSeconds(3));
+Check(!OcHold().Capabilities.Contains(TaskCapability.Answer), "opencode hold: a plain question has no answer capability");
+ocHoldCatalog.Accept(new OpenCodeHookPayload("question.asked", JsonSerializer.SerializeToElement(new { sessionID = "ses_hold", id = "q_2", questions = new[] { new { question = "选哪个？", options = new[] { "A", "B" } } } }, WireJson.Options), "question"), ocHoldT0.AddSeconds(4));
+Check(OcHold().Capabilities.Contains(TaskCapability.Answer), "opencode hold: a held question grants the answer capability");
+
+// 回包编码：插件按这个解析
+Check(System.Text.Encoding.UTF8.GetString(OpenCodeHookOutput.Decision(true)).Trim() == "{\"decision\":\"allow\"}",
+    "opencode reply: allow encodes as expected");
+Check(System.Text.Encoding.UTF8.GetString(OpenCodeHookOutput.Decision(false)).Trim() == "{\"decision\":\"deny\"}",
+    "opencode reply: deny encodes as expected");
+Check(System.Text.Encoding.UTF8.GetString(OpenCodeHookOutput.Answers(["B"])).Trim() == "{\"answers\":[[\"B\"]]}",
+    $"opencode reply: answers are per-question arrays (got {System.Text.Encoding.UTF8.GetString(OpenCodeHookOutput.Answers(["B"])).Trim()})");
+
+// 载荷解析：hold / request_id 两个字段
+var holdPayload = JsonSerializer.Deserialize<OpenCodeHookPayload>(
+    "{\"event\":\"permission.asked\",\"hold\":\"approval\",\"request_id\":\"req_9\",\"properties\":{}}", WireJson.Options)!;
+Check(holdPayload.Hold == "approval" && holdPayload.RequestID == "req_9", "opencode hold: payload carries hold + request_id");
+
 Console.WriteLine();
 Console.WriteLine(failures.Count == 0 ? "ALL CHECKS PASSED" : $"FAILURES: {string.Join(", ", failures)}");
 return failures.Count == 0 ? 0 : 1;
+
+/// <summary>啥都放行的桩：用来测"手机上点了之后桥该怎么写状态"。</summary>
+sealed class AllowResolver : ICodexPermissionResolver
+{
+    public bool Resolve(string sessionID, CodexPermissionDecision decision) => true;
+
+    public bool ResolveAnswer(string sessionID, string rawToolInput, string answer) => true;
+
+    public bool ResolveAnswers(string sessionID, string rawToolInput, IReadOnlyDictionary<string, string> answers) => true;
+}
 
 sealed class NullResolver : ICodexPermissionResolver
 {

@@ -77,6 +77,18 @@
    → 测试两条钉住正反两面：`a text that ended AFTER the tool started is forwarded` / `a text that ended BEFORE the tool started is still dropped`。
    → **未复现的部分**：我自己那轮实测第三行是**正常生长**的（`工作` 2 字 → 102 字 → 120 字，走的是有增量 deltas 的路径，与守卫无关）。用户遇到的是"没有后续增量、只有结束帧"的路径（很可能是该 provider/model 不逐字流式），这条只能靠用户在重启后再验一次。
 
+10. **2026-10-11 opencode 远程审批打通（插件 v13 + 桥 v68）**：opencode 的权限询问可以在手机上答复，落地形态与最初设想**不同**，两次踩坑都记在这里。
+    → **坑一：`permission.ask` 插件钩子在 1.18.35 上根本不触发**。它的**类型**早在 2026-08-24 就进了 SDK（`(input: Permission, output: {status:"ask"|"deny"|"allow"}) => Promise<void>`），但它只存在于**更新的版本**里 —— 实测：插件注册了、真机一次没触发（桥日志零 `[OpenCode] 挂起等待`），安装版二进制里也**没有** `trigger("permission.ask")`（对照：`trigger("tool.execute.before")` / `trigger("shell.env")` 都在）。**结论：不要据 clone 的 HEAD 写代码**——clone 比用户装的版本新。
+    → **坑二：`permission.asked` 是事件，不是可挂住的钩子**。所以通道反过来：插件在**事件回调里**（不能 await ✗，会把事件总线按分钟级卡住）`void holdApproval(...)` **游离地**另挂一条连接给桥（`hold:"approval"`）→ 桥攥住 → 手机允许/拒绝 → 桥回 `{"decision":"allow"|"deny"}` → 插件**用 opencode 自己的接口替它答复**。
+    → **答复接口**（这是本条的真正关键）：`POST /session/{sessionID}/permissions/{permissionID}`，body `{ response: "once" | "always" | "reject" }` —— **opencode 自己的 TUI 在 auto 模式下就是这么答复的**，所以这条路必然能关掉终端那个对话框（Claude 那边做不到，见 claude-code notes G55 第 2 条）。SDK 生成的方法是 `postSessionIdPermissionsPermissionId`（v1 SDK 里就有 ✓）；新版封装叫 `permission.reply({requestID, reply})` —— 插件**运行时可用的那个**优先，两个都没有就 console.log 出 client 上的相关键（不猜）。
+    → **桥侧**：带 `hold` 的帧按"挂住"处理（`_pending[sessionID] = (client, HookSource.OpenCode)` ✓），`Resolve` 回 `OpenCodeHookOutput.Decision(...)`；**能力位只在攥着回话通道时才给**（`permission.asked` 带 hold → `Approve/Deny`，否则空）—— 没有它手机上就是一对点不动的假按钮（今天之前 opencode 正是这个状态 ✗）。另加 `AcceptOpenCodeHook` 包装：等待若在终端那边结束了，就放掉挂住的连接（与 Claude 的 `AcceptClaudeHook` 同一个目的）。
+    → **超时 10 分钟**（与桥的挂起上限、Claude 的 hook timeout 三家同值 ✓，见 claude-code notes G58）：挂住期间 opencode 就停在这次询问上，超时必须把询问交回终端（桥侧同时撤卡 + 放连接 ✓），绝不把它卡死。
+    → **坑三（真机踩到）：两帧打架把能力位冲空**。第一版是"照旧 enqueue 普通事件 + 另发 hold 帧"——两帧走**两条连接**，谁后到谁说了算 ✗；而 `enqueue` 走的是排队链（会被前面积压的事件拖后 ✗）、hold 走新连接（快 ✓）→ "hold 先到、普通帧后到"成了常态 ✗ → 普通帧把刚给上的 `Approve/Deny` 清成空 ✗ = **手机上只剩卡片没有按钮**（用户实测报出）。**修法两层**：① 根因——插件**只发 hold 一帧**（它自带卡片所需的 sessionID/id/permission/patterns，桥侧单收它就建卡 + 给能力位 ✓）；② 桥侧兜底——`permission.asked` 的能力位**只升不降**（已在等审批的行不许被后续普通询问冲空）。<br>**复现手法（复用处）**：直接往桥的 49361 打合成帧就能验桥这半，不必启动 opencode —— 先普通后 hold → `["approve","deny"]` ✓；先 hold 后普通 → `[]` ✗（两组一跑，坑就现形 ✓）。
+    → **坑四（真机踩到）：回复接口的 path 参数名各家版本不同 → URL 坏掉 → "点了没反应"**。按钮出来之后用户反馈"点了没反应" ✗：插件调的是 `postSessionIdPermissionsPermissionId`，而**参数键**在装好的 1.18.35 里是 **`{sessionID}`**（`url:"/session/{sessionID}/permissions/{permissionID}"`，params `key:"sessionID"`）、在更新的那版里是 **`{id}`** —— 我照 clone（=更新的那版）写了 `path:{id:…}` ✗ → 装好的那版模板**不被替换** → URL 直接坏掉 → 404 ✓✓。**修法：两个键都给**（生成器只读它声明过的那个 ✓，多余键被忽略 ✓）。<br>**教训**：这套 SDK 是**按生成的**，同一个方法在相邻版本里参数名就能变 ✗ —— 一律以**装好的那份二进制里的生成代码**为准（`grep -aoE 'url:"/session/\{[a-zA-Z]+\}/permissions' 装好的exe` 一句话就能看出来 ✓）。
+    → **配套：插件自诊断回桥**。这次"点了没反应"一开始**查不到任何痕迹** ✗（插件 console.log 在 opencode 里看不到 ✗）。现在插件出错会发一条 `plugin.note` 事件 → 桥记 `[OpenCode] 插件报告：…` ✓（`AcceptOpenCodeHook` 里短路 → **不进 catalog**，否则会凭空建一行任务 ✗）。
+    → **验证**：插件测试 8 条（**一次权限只发一帧且必是 hold** ✓ allow→`response=once` / deny→`response=reject` ✓ **两个 path 键都发** ✓ **回复失败会发 plugin.note** ✓ 子会话不上报不挂起 ✓）；Core 断言 10 条（能力位有/无 hold 两态、**只升不降**、提问两态、回包字节形状、新载荷字段）。真机侧：合成 hold 帧在手机上确认过**卡片 + 可用按钮** ✓。
+    → **待真机确认**：① 手机上出现"允许/拒绝"并能真的放行 ✓ ② **opencode 自己的 TUI 会不会因此不再弹它自己的对话框**（这条决定了手机审批能否真正替掉终端 ✗）。
+
 ## 六、一句话的验收模板（交付时照抄）
 
 > 产物：bridge `dist\opencode-main-baseline-vN\AgentPagerBridge.exe`；插件 vN（需要的话给"待更新"提示）；APK 已拷 `…\AgentPager-debug.apk`（SHA 一致）。

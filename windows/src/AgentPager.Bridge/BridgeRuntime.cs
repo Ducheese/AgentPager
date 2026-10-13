@@ -31,6 +31,13 @@ public sealed class BridgeRuntime : IAsyncDisposable
     private sealed record UsageEvent(UsageSnapshot? Usage) : BridgeEvent;
     private sealed record MaintenanceEvent : BridgeEvent;
 
+    /// <summary>
+    /// 人类等待答复的上限（审批与提问同一口径，三家共用）：到点就把这次询问交回终端。
+    /// 与离线判定的 10 分钟取同一个数 —— 超时交回后若代理真的没了，静默离线规则正好接上 ✓。
+    /// 插件侧（opencode 的 HOLD_TIMEOUT_MS）与 Claude 的 hook timeout 都按这个值对齐。
+    /// </summary>
+    private static readonly TimeSpan HoldLimit = TimeSpan.FromMinutes(10);
+
     private readonly DailyFileLog _log = new();
     private readonly Channel<BridgeEvent> _events = Channel.CreateUnbounded<BridgeEvent>(
         new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
@@ -278,7 +285,7 @@ public sealed class BridgeRuntime : IAsyncDisposable
                         {
                             HookEnvelope.Codex codex => HandleCodexHook(codex.Hook),
                             HookEnvelope.Claude claude => AcceptClaudeHook(claude.Hook),
-                            HookEnvelope.OpenCode openCode => _catalog.Accept(openCode.Hook),
+                            HookEnvelope.OpenCode openCode => AcceptOpenCodeHook(openCode.Hook),
                             HookEnvelope.Antigravity agy => _catalog.Accept(agy.Hook),
                             _ => false,
                         };
@@ -300,6 +307,14 @@ public sealed class BridgeRuntime : IAsyncDisposable
                     case MaintenanceEvent:
                         changed = _catalog.Maintain();
                         changed = _catalog.ApplyTitles(_titleReader.Load()) || changed;
+                        // 挂起超时（三家统一）：等手机答复超过 HoldLimit 就把这次询问**交回终端** ——
+                        // 撤卡 + 释放挂住的连接 + 回 running。用户可能在终端上作答 ✓，判死/判离线
+                        // 会造出与事实相反的显示 ✗（见 ExpireStaleWaits 的说明）。
+                        foreach (var stuck in _catalog.ExpireStaleWaits(HoldLimit))
+                        {
+                            _hookServer?.Cancel(stuck);
+                            _log.Write("INFO", $"挂起超时（{HoldLimit.TotalMinutes:0} 分钟无人答复）：已交回终端（会话 {stuck}）");
+                        }
                         break;
                 }
                 if (!changed) continue;
@@ -329,6 +344,40 @@ public sealed class BridgeRuntime : IAsyncDisposable
         return changed;
     }
 
+    /// <summary>
+    /// opencode 事件统一入口：与 <see cref="AcceptClaudeHook"/> 同一个目的——
+    /// 等待若已以别的方式结束（用户直接在终端里答复了权限），那条挂住的连接就该放掉：
+    /// 不放的话插件那边的 socket 会一直悬到它自己的超时（10 分钟），而且手机再点一次
+    /// 就是对着一个已经作废的询问答复 ✗。
+    /// </summary>
+    private bool AcceptOpenCodeHook(OpenCodeHookPayload hook)
+    {
+        // 插件的自诊断（插件侧 console.log 在 opencode 里看不到 ✗，真机踩过"点了没反应却查不到痕迹"的亏）：
+        // 只落日志，**不进 catalog**（否则会凭空建出一行任务 ✗）。
+        if (hook.Event == "plugin.note")
+        {
+            var note = hook.Properties is { } props && props.ValueKind == JsonValueKind.Object &&
+                       props.TryGetProperty("note", out var value) && value.ValueKind == JsonValueKind.String
+                ? value.GetString()
+                : null;
+            if (!string.IsNullOrWhiteSpace(note)) _log.Write("WARN", $"[OpenCode] 插件报告：{note}");
+            return false;
+        }
+
+        var changed = _catalog.Accept(hook);
+
+        // 释放挂住的连接**只认"等待真的结束了"的事件**，不能按"这一刻 catalog 里没有挂起项"来判 ✗：
+        // opencode 的事件流很密（工具 part / status 成串来），任何一个把生命周期从等待态推走的事件
+        // 都会让挂起项消失一瞬间，于是**刚挂上就被撤** —— 实测日志：挂起 3 毫秒后就被
+        // "等待已在别处结束"撤掉，手机上点允许自然没反应 ✗。
+        var sessionID = OpenCodeEventReducer.SessionID(hook);
+        if (_hookServer is not null && sessionID is not null && _hookServer.HasPending(sessionID) &&
+            hook.Event is "permission.replied" or "question.replied" or "question.rejected"
+                or "plugin.dispose" or "session.deleted" or "session.idle" or "session.error")
+            _hookServer.Cancel(sessionID);
+        return changed;
+    }
+
     private bool HandleCodexHook(CodexHookPayload hook)
     {
         _rollout.Include(hook);
@@ -355,6 +404,10 @@ public sealed class BridgeRuntime : IAsyncDisposable
             _log.Write("WARN", $"控制消息被拒（{error.Failure}）：{request.Payload.Action} / 任务 {request.Payload.TaskID}");
             acknowledgment = new(request.MessageId, ControlResult.Rejected, "签名或序号无效");
         }
+        // 未被接受的控制也要落盘（原因：签名之外，最常见的是"能力位不在/没有挂起卡"与
+        // "Hook 审批通道已失效"）。这批以前全是静默的 ✗ —— App 上只看到"点了没反应"。
+        if (acknowledgment.Result != ControlResult.Accepted)
+            _log.Write("WARN", $"控制未被接受（{acknowledgment.Result}）：{request.Payload.Action} / 任务 {request.Payload.TaskID} / {acknowledgment.Reason}");
         var envelope = MessageEnvelope<ControlAckPayload>.Create("control.ack", acknowledgment);
         if (_lanServer is not null)
             await _lanServer.BroadcastAsync(JsonSerializer.Serialize(envelope, WireJson.Options));
