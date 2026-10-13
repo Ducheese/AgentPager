@@ -61,11 +61,31 @@ await emit("message.part.updated", { part: { id: "prt_text_old", sessionID: "ses
 await flush()
 check(events("reply").length === 0, "stale end frame after tool is dropped (v8 guard)")
 
-// 4. 新正文恢复流动（增量清除标记）后，预览正常转发
+// 3b. **v11 关键回归**：正文写完接着调工具是常规时序，它的结束帧晚到但内容**是新的**，必须收下。
+//     旧实现按到达顺序一律丢弃 → 手机上那行只剩流式期节流发出的开头两三个字，后面整段不更新。
+await emit("message.part.updated", {
+  part: { id: "prt_tool_ts", sessionID: "ses_t", type: "tool", tool: "bash", state: { status: "running", title: "ls", input: { command: "ls" }, time: { start: 5_000 } } },
+})
+await emit("message.part.updated", { part: { id: "prt_text_fresh", sessionID: "ses_t", messageID: "msg_1", type: "text", text: "工具之后写完的完整一段话", time: { end: 9_000 } } })
+await flush()
+const freshReplies = events("reply").filter((i) => i.payload.properties.text === "工具之后写完的完整一段话")
+check(freshReplies.length === 1, `a text that ended AFTER the tool started is forwarded (got ${events("reply").length} replies)`)
+
+// 3c. 同一判据的反面：结束帧确实早于工具开始 → 仍是残帧
+await emit("message.part.updated", {
+  part: { id: "prt_tool_ts2", sessionID: "ses_t", type: "tool", tool: "bash", state: { status: "running", title: "pwd", input: { command: "pwd" }, time: { start: 20_000 } } },
+})
+await emit("message.part.updated", { part: { id: "prt_text_stale2", sessionID: "ses_t", messageID: "msg_1", type: "text", text: "工具之前那段", time: { end: 19_000 } } })
+await flush()
+check(!events("reply").some((i) => i.payload.properties.text === "工具之前那段"), "a text that ended BEFORE the tool started is still dropped")
+
+// 4. 新正文恢复流动后，预览正常转发（按增量断言，不吃前面用例的 reply 计数）
+const repliesBeforeResume = events("reply").length
 await emit("message.part.updated", { part: { id: "prt_text_new", sessionID: "ses_t", messageID: "msg_1", type: "text", text: "" } })
 await emit("message.part.delta", { sessionID: "ses_t", messageID: "msg_1", partID: "prt_text_new", field: "text", delta: "新正文" })
 await flush()
-check(events("reply").length === 1 && events("reply")[0].payload.properties.text === "新正文", "fresh preview forwarded after text resumed")
+const resumed = events("reply").slice(repliesBeforeResume)
+check(resumed.length === 1 && resumed[0].payload.properties.text === "新正文", `fresh preview forwarded after text resumed (got ${JSON.stringify(resumed.map((i) => i.payload.properties.text))})`)
 
 // 5. 子会话被删除必须先补终态（v9）：旧实现只删映射不发信号，桥上那条子代理行会永远 running
 await emit("session.created", { info: { id: "ses_child", parentID: "ses_t", title: "explore (@explore subagent)" } })

@@ -25,18 +25,17 @@ long created = t0.ToUnixTimeMilliseconds();
 
 TaskSnapshot Task() => catalog.Projection().Tasks.First(t => t.Id == "ses_1");
 
-// 1. session.created
+// 1. session.created **不建行**（2026-10-11 修 opencode 启动幽灵）：会话一建就发这条，
+//    而那一刻还没有标题——建出来的行只能顶着项目目录名（实测 `opencode run` 启动即冒幽灵）。
+//    这条事件现在只用来登记会话目录。
 catalog.Accept(H("session.created", new
 {
     sessionID = "ses_1",
     info = new { id = "ses_1", directory = @"F:\Git\demo", title = "New session - 2026-10-06T00:00:00.000Z", time = new { created, updated = created } },
 }));
-Check(Task().Source == AgentSource.OpenCode, "source=opencode");
-Check(Task().Lifecycle == AgentLifecycle.Idle, "session.created -> idle");
-Check(Task().ProjectName == "demo", "project name from directory");
-Check(Task().StartedAt == DateTimeOffset.FromUnixTimeMilliseconds(created), "startedAt from session.created");
+Check(catalog.Projection().Tasks.Count == 0, "opencode: session.created alone creates no task (no boot ghost)");
 
-// 2. chat.message
+// 2. chat.message 才建行；项目名回退到会话记住的目录（chat.message 不带目录）
 Thread.Sleep(15);
 catalog.Accept(H("chat.message", new
 {
@@ -44,6 +43,8 @@ catalog.Accept(H("chat.message", new
     model = new { providerID = "ccproxy", modelID = "deepseek/deepseek-v4.1-flash" },
     text = "修复登录问题\n并补充测试",
 }));
+Check(Task().Source == AgentSource.OpenCode, "source=opencode");
+Check(Task().ProjectName == "demo", "project name falls back to the remembered session directory");
 Check(Task().Lifecycle == AgentLifecycle.Running, "chat.message -> running");
 Check(Task().Activity == AgentActivity.Thinking, "chat.message -> thinking");
 Check(Task().UserPrompt == "修复登录问题 并补充测试", "prompt normalized");
@@ -392,21 +393,21 @@ Check(!json.Contains("\"OpenCode\""), "wire has no PascalCase enum leakage");
 var temp = Path.Combine(Path.GetTempPath(), "ap-verify-plugins-" + Guid.NewGuid().ToString("N"));
 var installer = new OpenCodePluginConfiguration(temp);
 Check(installer.Status == OpenCodePluginStatus.NotInstalled, "status: 未安装");
-Check(OpenCodePluginConfiguration.EmbeddedVersion == 10, $"embedded plugin version = 10 (got {OpenCodePluginConfiguration.EmbeddedVersion})");
+Check(OpenCodePluginConfiguration.EmbeddedVersion == 11, $"embedded plugin version = 11 (got {OpenCodePluginConfiguration.EmbeddedVersion})");
 var first = installer.Install();
 Check(first.Changed && File.Exists(Path.Combine(temp, "plugins", "agentpager-opencode.js")), "install writes plugin");
 Check(installer.Status == OpenCodePluginStatus.Installed && installer.IsInstalled(), "status: 已写入（与内置一致）");
-Check(installer.InstalledVersion == 10, "installed version = 10");
+Check(installer.InstalledVersion == 11, "installed version = 11");
 var second = installer.Install();
 Check(!second.Changed, "reinstall is idempotent");
 var pluginPath = Path.Combine(temp, "plugins", "agentpager-opencode.js");
 var content = File.ReadAllText(pluginPath);
 Check(content.Contains("Managed by AgentPager (OpenCode)"), "managed marker present");
-Check(content.Contains("agentpager-opencode v10"), "version header present");
+Check(content.Contains("agentpager-opencode v11"), "version header present");
 Check(content.Contains("hook_source: \"opencode\"") && content.Contains("49361"), "plugin content sane");
 File.WriteAllText(pluginPath, content.Replace("const MAX_TEXT = 1000", "const MAX_TEXT = 500"));
 Check(installer.Status == OpenCodePluginStatus.Outdated, "status: 待更新（内容与内置不一致）");
-Check(installer.InstalledVersion == 10, "outdated file still reports v10");
+Check(installer.InstalledVersion == 11, "outdated file still reports v11");
 var repair = installer.Install();
 Check(repair.Changed && installer.Status == OpenCodePluginStatus.Installed, "repair restores 已写入");
 var uninstalled = installer.Uninstall();
@@ -581,15 +582,28 @@ Check(Claude().UserPrompt == "帮我看看 那个登录问题", $"claude: prompt
 Check(Claude().StartedAt == claudeNow.AddSeconds(1), "claude: first prompt starts this turn's timer");
 Check(Claude().Title == "demo", $"claude: title still project name, never derived from prompt (got '{Claude().Title}')");
 
-// SessionStart 的语义只对**已经在面板上**的行生效：resume / clear 把会话复位成 idle。
+// SessionStart 的语义只对**已经在面板上**的行生效；且**终态受保护**（2026-10-11 修，对齐 opencode）：
+// 已完成的任务被 resume/clear 打回 idle 会掉优先级（300→100）并丢未读高亮——用户实测报出过
+// "app 重连后原本 succeeded 的任务变成 idle"。
 var resumeCatalog = new TaskCatalog();
 resumeCatalog.Accept(C("UserPromptSubmit", new { session_id = "resume_1", prompt = "第一轮" }), claudeNow);
 resumeCatalog.Accept(C("Stop", new { session_id = "resume_1", last_assistant_message = "完事" }), claudeNow.AddSeconds(1));
 TaskSnapshot Resume() => resumeCatalog.Projection().Tasks.First(t => t.Id == "resume_1");
 Check(Resume().Lifecycle == AgentLifecycle.Succeeded, "claude: resume fixture finished before the second start");
+var resumeCompletedAt = Resume().CompletedAt;
 resumeCatalog.Accept(C("SessionStart", new { session_id = "resume_1", source = "resume" }), claudeNow.AddSeconds(2));
-Check(Resume().Lifecycle == AgentLifecycle.Idle && Resume().CompletedAt is null,
-    $"claude: SessionStart on a known session still resets to idle (got {Resume().Lifecycle})");
+Check(Resume().Lifecycle == AgentLifecycle.Succeeded && Resume().CompletedAt == resumeCompletedAt,
+    $"claude: SessionStart must not revive a finished task (got {Resume().Lifecycle})");
+// 优先级 = succeeded 300 + 未读 50；打回 idle 的话只剩 100（用户看到的就是"完成的任务掉下去了"）
+Check(Resume().EffectivePriority == 350, $"claude: a finished task keeps its priority across resume (got {Resume().EffectivePriority})");
+
+// 非终态的行走老规矩：resume / clear 把它复位成 idle
+var idleResumeCatalog = new TaskCatalog();
+idleResumeCatalog.Accept(C("UserPromptSubmit", new { session_id = "resume_2", prompt = "干着活" }), claudeNow);
+Check(idleResumeCatalog.Projection().Tasks.First(t => t.Id == "resume_2").Lifecycle == AgentLifecycle.Running, "claude: resume fixture is running");
+idleResumeCatalog.Accept(C("SessionStart", new { session_id = "resume_2", source = "clear" }), claudeNow.AddSeconds(1));
+Check(idleResumeCatalog.Projection().Tasks.First(t => t.Id == "resume_2").Lifecycle == AgentLifecycle.Idle,
+    "claude: SessionStart still resets a live session to idle");
 
 var claudeSnapshot = ReadTranscript(
 [
@@ -1604,6 +1618,165 @@ slowCatalog.Maintain(slowT0.AddMinutes(31));
 Check(SlowTask().Subagents is [{ Lifecycle: AgentLifecycle.Interrupted }],
     $"silence: while the parent is still running, 31 minutes is enough (got {SlowTask().Subagents[0].Lifecycle})");
 
+// ---- agy 计时：异步子代理唤醒父任务时，生命周期照实翻 running，但计时与第三行不许动 ----
+// 实测（2026-10-11 16:50）：父回合 16:50:28 Stop → 子代理 16:50:38 回报 → 父又连续发起模型调用。
+// 那**不是**用户的新回合（同一个请求还在继续），按 isNewRound 归零会让手机上"已完成的任务重新计时"。
+var agyTimerPath = Path.Combine(Path.GetTempPath(), $"agy_timer_{Guid.NewGuid():N}.jsonl");
+File.WriteAllLines(agyTimerPath, new[]
+{
+    "{\"step_index\":0,\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>读三个文件</USER_REQUEST>\"}",
+});
+var agyTimerCatalog = new TaskCatalog();
+var timerT0 = DateTimeOffset.UtcNow;
+TaskSnapshot TimerTask() => agyTimerCatalog.Projection().Tasks.First(t => t.Id == "p_timer");
+agyTimerCatalog.Accept(A("PreInvocation", new { conversationId = "p_timer", workspacePaths = new[] { @"C:\test" }, transcriptPath = agyTimerPath }), timerT0);
+agyTimerCatalog.Accept(A("PreToolUse", new
+{
+    conversationId = "p_timer",
+    transcriptPath = agyTimerPath,
+    toolCall = new { name = "view_file", args = new { AbsolutePath = @"C:\test\a.md" } }
+}), timerT0.AddSeconds(1));
+var timerStartedAt = TimerTask().StartedAt;
+var timerStep = TimerTask().LatestStep;
+Check(timerStep is not null, "agy timer: the fixture has a step before finishing");
+agyTimerCatalog.Accept(A("Stop", new { conversationId = "p_timer", transcriptPath = agyTimerPath }), timerT0.AddSeconds(2));
+Check(TimerTask().Lifecycle == AgentLifecycle.Succeeded, "agy timer: turn finished");
+
+// 子代理回报后父任务被唤醒续跑：同一条提示词、没有排队
+agyTimerCatalog.Accept(A("PreInvocation", new { conversationId = "p_timer", workspacePaths = new[] { @"C:\test" }, transcriptPath = agyTimerPath }), timerT0.AddSeconds(12));
+Check(TimerTask().Lifecycle == AgentLifecycle.Running, $"agy timer: a woken parent is honestly shown as running (got {TimerTask().Lifecycle})");
+Check(TimerTask().StartedAt == timerStartedAt, "agy timer: a woken parent does NOT restart the turn timer");
+Check(TimerTask().LatestStep == timerStep, $"agy timer: a woken parent keeps its third line (got '{TimerTask().LatestStep}')");
+
+// 真的换了提示词 → 仍然是新回合，该重置就重置。
+// 时序要照实：先按**旧**转录本收掉这一轮，用户才开始打字（提示词在 PreInvocation 之前落盘）。
+agyTimerCatalog.Accept(A("Stop", new { conversationId = "p_timer", transcriptPath = agyTimerPath }), timerT0.AddSeconds(20));
+File.WriteAllLines(agyTimerPath, new[]
+{
+    "{\"step_index\":0,\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>读三个文件</USER_REQUEST>\"}",
+    "{\"step_index\":1,\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>再看看日志</USER_REQUEST>\"}",
+});
+agyTimerCatalog.Accept(A("PreInvocation", new { conversationId = "p_timer", workspacePaths = new[] { @"C:\test" }, transcriptPath = agyTimerPath }), timerT0.AddSeconds(21));
+Check(TimerTask().StartedAt == timerT0.AddSeconds(21), $"agy timer: a genuinely new prompt still resets the timer (got {TimerTask().StartedAt:HH:mm:ss})");
+Check(TimerTask().LatestStep is null, "agy timer: a genuinely new prompt clears the third line");
+File.Delete(agyTimerPath);
+
+// ---- Claude：排队消息被投递**不重置计时**（用户裁定：计时只在一轮完了之后重新开始才重置）----
+// 时序取证（用户转录本里 9 次真实 dequeue）：每一次投递都在上一条 assistant 消息之后 130~200ms、
+// 随后 10~30ms 就是新的用户消息 —— 即"上一轮刚结束就被投递"，单看生命周期（已是 succeeded）
+// 必然误判成新回合 ✗。守卫：Accept 事先把"曾显示为排队中"的文本记下来，投递时对表。
+var claudeQueuePath = Path.Combine(Path.GetTempPath(), $"ap_claude_queue_{Guid.NewGuid():N}.jsonl");
+var claudeQueueCatalog = new TaskCatalog();
+var claudeQueueT0 = DateTimeOffset.UtcNow;
+TaskSnapshot ClaudeQueueTask() => claudeQueueCatalog.Projection().Tasks.First(t => t.Id == "claude_queue");
+// 转录本时间戳必须**晚于本轮开始**才会被判成"排队中"（判据是 queuedAt > StartedAt）→ 一律按 t0 生成
+string Stamp(int seconds) => claudeQueueT0.AddSeconds(seconds).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ");
+var firstUserLine = $"{{\"type\":\"user\",\"isSidechain\":false,\"timestamp\":\"{Stamp(0)}\",\"message\":{{\"role\":\"user\",\"content\":\"第一轮那句\"}}}}";
+var enqueueLine = $"{{\"type\":\"queue-operation\",\"operation\":\"enqueue\",\"timestamp\":\"{Stamp(5)}\",\"content\":\"排队那句\"}}";
+var dequeueLine = $"{{\"type\":\"queue-operation\",\"operation\":\"dequeue\",\"timestamp\":\"{Stamp(6)}\"}}";
+var deliveredLine = $"{{\"type\":\"user\",\"isSidechain\":false,\"timestamp\":\"{Stamp(6)}\",\"message\":{{\"role\":\"user\",\"content\":\"排队那句\"}}}}";
+try
+{
+    File.WriteAllLines(claudeQueuePath, new[] { firstUserLine });
+    claudeQueueCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_queue", prompt = "第一轮那句", transcript_path = claudeQueuePath }), claudeQueueT0);
+    claudeQueueCatalog.Accept(C("PreToolUse", new { session_id = "claude_queue", transcript_path = claudeQueuePath, tool_name = "Bash", tool_input = new { command = "npm run build" } }), claudeQueueT0.AddSeconds(1));
+    var claudeQueueStart = ClaudeQueueTask().StartedAt;
+
+    // 用户中途又打了一句 → 转录本出现 enqueue。真实世界里这个"排队中"标记是**心跳**采到的
+    // （Maintain 约 3 秒一拍、mtime 门控地重读转录本）——不是靠某个工具事件，所以这里也走心跳。
+    File.WriteAllLines(claudeQueuePath, new[] { firstUserLine, enqueueLine });
+    claudeQueueCatalog.Maintain(claudeQueueT0.AddSeconds(5));
+    Check(ClaudeQueueTask().PromptQueued && ClaudeQueueTask().UserPrompt == "排队那句",
+        $"claude queue: the inserted prompt is shown as queued (queued={ClaudeQueueTask().PromptQueued} / '{ClaudeQueueTask().UserPrompt}')");
+
+    // 上一轮结束（投递发生在这之后 130~200ms —— 实测时序）
+    claudeQueueCatalog.Accept(C("Stop", new { session_id = "claude_queue", transcript_path = claudeQueuePath, last_assistant_message = "第一轮完事" }), claudeQueueT0.AddSeconds(6));
+    Check(ClaudeQueueTask().Lifecycle == AgentLifecycle.Succeeded, "claude queue: turn finished before delivery");
+    var claudeQueueStep = ClaudeQueueTask().LatestStep;
+
+    // 投递（dequeue 后变成一条新的用户消息）
+    File.WriteAllLines(claudeQueuePath, new[] { firstUserLine, enqueueLine, dequeueLine, deliveredLine });
+    claudeQueueCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_queue", prompt = "排队那句", transcript_path = claudeQueuePath }), claudeQueueT0.AddSeconds(7));
+    Check(ClaudeQueueTask().Lifecycle == AgentLifecycle.Running, "claude queue: delivery goes running");
+    Check(ClaudeQueueTask().UserPrompt == "排队那句", "claude queue: delivery updates the second line");
+    Check(ClaudeQueueTask().StartedAt == claudeQueueStart, "claude queue: delivery must NOT restart the turn timer");
+    Check(ClaudeQueueTask().LatestStep == claudeQueueStep, $"claude queue: delivery keeps the third line (got '{ClaudeQueueTask().LatestStep}')");
+
+    // 这一轮也结束，用户**之后**才重新开口 → 该重置就重置
+    claudeQueueCatalog.Accept(C("Stop", new { session_id = "claude_queue", transcript_path = claudeQueuePath, last_assistant_message = "第二轮完事" }), claudeQueueT0.AddSeconds(9));
+    claudeQueueCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_queue", prompt = "真正的新一句", transcript_path = claudeQueuePath }), claudeQueueT0.AddSeconds(20));
+    Check(ClaudeQueueTask().StartedAt == claudeQueueT0.AddSeconds(20), $"claude queue: a genuinely new prompt still resets (got {ClaudeQueueTask().StartedAt:HH:mm:ss.fff} expected {claudeQueueT0.AddSeconds(20):HH:mm:ss.fff})");
+}
+finally
+{
+    try { File.Delete(claudeQueuePath); } catch { /* 清理失败不影响断言 */ }
+}
+
+// ---- agy 排队被接单**不重置计时**（用户裁定：中途插入属于同一个 burst，计量不该归零）----
+// 这条还顺手钉住一个坑：排队时 CheckAgyQueuedPrompts 会把排队文本先写进 task.UserPrompt
+// （转录本尚未落盘），所以接单那一下 isNewPrompt 会假阳性命中 —— 判据必须是 `isNewPrompt && !wasQueued`。
+var agyQueuePath = Path.Combine(Path.GetTempPath(), $"agy_queue_{Guid.NewGuid():N}.jsonl");
+var previousHistoryPath = AgyHistoryReader.HistoryPathOverride;
+AgyHistoryReader.HistoryPathOverride = agyQueuePath;
+try
+{
+    var queueCatalog = new TaskCatalog();
+    var queueT0 = DateTimeOffset.UtcNow;
+    TaskSnapshot QueueTask() => queueCatalog.Projection().Tasks.First(t => t.Id == "p_queue");
+    queueCatalog.Accept(A("PreInvocation", new { conversationId = "p_queue", workspacePaths = new[] { @"C:\test" } }), queueT0);
+    queueCatalog.Accept(A("PreToolUse", new
+    {
+        conversationId = "p_queue",
+        toolCall = new { name = "view_file", args = new { AbsolutePath = @"C:\test\a.md" } }
+    }), queueT0.AddSeconds(1));
+    var queueStartedAt = QueueTask().StartedAt;
+    var queueStep = QueueTask().LatestStep;
+
+    // 中途插入：history.jsonl 里出现一条更晚的用户输入，Maintain 扫到后置排队标记
+    File.WriteAllLines(agyQueuePath, new[]
+    {
+        $"{{\"conversationId\":\"p_queue\",\"display\":\"插一句：顺便看看日志\",\"timestamp\":{queueT0.AddSeconds(5).ToUnixTimeMilliseconds()}}}",
+    });
+    queueCatalog.Maintain(queueT0.AddSeconds(6));
+    Check(QueueTask().PromptQueued && QueueTask().UserPrompt == "插一句：顺便看看日志",
+        $"agy queue: the inserted prompt is marked as queued (got queued={QueueTask().PromptQueued} / '{QueueTask().UserPrompt}')");
+
+    // 接单：PreInvocation
+    queueCatalog.Accept(A("PreInvocation", new { conversationId = "p_queue", workspacePaths = new[] { @"C:\test" } }), queueT0.AddSeconds(8));
+    Check(!QueueTask().PromptQueued, "agy queue: pickup clears the queued flag");
+    Check(QueueTask().Lifecycle == AgentLifecycle.Running, "agy queue: pickup goes running");
+    Check(QueueTask().StartedAt == queueStartedAt, "agy queue: pickup must NOT restart the turn timer (same burst)");
+    Check(QueueTask().LatestStep == queueStep, $"agy queue: pickup keeps the third line (got '{QueueTask().LatestStep}')");
+}
+finally
+{
+    AgyHistoryReader.HistoryPathOverride = previousHistoryPath;
+    try { File.Delete(agyQueuePath); } catch { /* 清理失败不影响断言 */ }
+}
+
+// ---- opencode 离线兜底：与 agy 同一口径（10 分钟无更新 + 没在跑工具）----
+var ocOfflineCatalog = new TaskCatalog();
+var ocOfflineT0 = DateTimeOffset.UtcNow;
+ocOfflineCatalog.Accept(H("chat.message", new { sessionID = "ses_off", text = "跑着" }), ocOfflineT0);
+TaskSnapshot OcOffline() => ocOfflineCatalog.Projection().Tasks.First(t => t.Id == "ses_off");
+Check(OcOffline().Lifecycle == AgentLifecycle.Running, "opencode offline: fixture is running");
+ocOfflineCatalog.Maintain(ocOfflineT0.AddMinutes(11));
+Check(OcOffline().Lifecycle == AgentLifecycle.Offline,
+    $"opencode offline: a silent session goes offline after 10 minutes (got {OcOffline().Lifecycle})");
+
+// 正在跑工具的不算静默：一个长命令不该被判离线
+var ocBusyCatalog = new TaskCatalog();
+var ocBusyT0 = DateTimeOffset.UtcNow;
+ocBusyCatalog.Accept(H("chat.message", new { sessionID = "ses_busy", text = "跑构建" }), ocBusyT0);
+ocBusyCatalog.Accept(H("message.part.updated", new
+{
+    sessionID = "ses_busy",
+    part = new { id = "prt_busy", sessionID = "ses_busy", type = "tool", tool = "bash", state = new { status = "running", input = new { command = "npm run build" } } }
+}), ocBusyT0.AddSeconds(1));
+ocBusyCatalog.Maintain(ocBusyT0.AddMinutes(11));
+Check(ocBusyCatalog.Projection().Tasks.First(t => t.Id == "ses_busy").Lifecycle == AgentLifecycle.Running,
+    "opencode offline: a session running a tool is NOT marked offline");
+
 // ---- 1a：agy 主对话的转录本里出现 `sender=<子代理>` 不得把它判成子会话（2026-10-11 实测事故）----
 // 场景复刻：主对话 badb2e69 的转录本前 15 行里有一行是"子代理回报"的系统消息（sender=子代理id），
 // 旧实现的转录本启发式把**自己的子代理**当成了父 → 主对话被判成子会话 → 顶层行被物理删除。
@@ -1666,6 +1839,73 @@ finally
     AgyConversationDatabase.DatabasePathOverride = previousDbOverride;
     try { Directory.Delete(agyBrain, true); } catch { /* 清理失败不影响断言 */ }
     try { File.Delete(agyDb); } catch { /* 同上 */ }
+}
+
+// ===================== 28. 工具路径缩写（三家共用：工作区相对 / 家目录 ~/ / 其它全路径）=====================
+var previousHomeRoot = PathDisplay.HomeRootOverride;
+PathDisplay.HomeRootOverride = @"C:\Users\tester";
+try
+{
+    Check(PathDisplay.Shorten(@"F:\Git\proj\src\app.ts", @"F:\Git\proj") == "src/app.ts",
+        $"path: in-workspace becomes relative (got {PathDisplay.Shorten(@"F:\Git\proj\src\app.ts", @"F:\Git\proj")})");
+    Check(PathDisplay.Shorten(@"C:\Users\tester\.claude\x.json", @"F:\Git\proj") == "~/.claude/x.json",
+        $"path: under the home directory becomes ~/… (got {PathDisplay.Shorten(@"C:\Users\tester\.claude\x.json", @"F:\Git\proj")})");
+    Check(PathDisplay.Shorten(@"C:\Windows\win.ini", @"F:\Git\proj") == "C:/Windows/win.ini",
+        $"path: outside stays a full path (got {PathDisplay.Shorten(@"C:\Windows\win.ini", @"F:\Git\proj")})");
+    Check(PathDisplay.Shorten(@"F:\GitHub\a.ts", @"F:\Git") == "F:/GitHub/a.ts",
+        "path: the workspace root must match on a directory boundary (F:\\Git must not swallow F:\\GitHub)");
+    Check(PathDisplay.Shorten(@"F:\Git\proj", @"F:\Git\proj") == "proj",
+        "path: the workspace root itself degrades to its leaf");
+
+    // Claude：file_path 走缩写，command 里的路径一个字都不许动
+    var pathCatalog = new TaskCatalog();
+    var pathT0 = DateTimeOffset.UtcNow;
+    pathCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_path", cwd = @"F:\Git\proj", prompt = "看代码" }), pathT0);
+    pathCatalog.Accept(C("PreToolUse", new { session_id = "claude_path", cwd = @"F:\Git\proj", tool_name = "Read", tool_input = new { file_path = @"F:\Git\proj\src\app.ts" } }), pathT0.AddSeconds(1));
+    TaskSnapshot PathTask() => pathCatalog.Projection().Tasks.First(t => t.Id == "claude_path");
+    Check(PathTask().LatestStep == "Read src/app.ts", $"claude path: file_path shortened (got '{PathTask().LatestStep}')");
+    pathCatalog.Accept(C("PreToolUse", new { session_id = "claude_path", cwd = @"F:\Git\proj", tool_name = "Read", tool_input = new { file_path = @"C:\Users\tester\.claude\settings.json" } }), pathT0.AddSeconds(2));
+    Check(PathTask().LatestStep == "Read ~/.claude/settings.json", $"claude path: home becomes ~/… (got '{PathTask().LatestStep}')");
+    pathCatalog.Accept(C("PreToolUse", new { session_id = "claude_path", cwd = @"F:\Git\proj", tool_name = "Bash", tool_input = new { command = @"cat F:\Git\proj\src\app.ts" } }), pathT0.AddSeconds(3));
+    Check(PathTask().LatestStep == @"Bash cat F:\Git\proj\src\app.ts",
+        $"claude path: a command string is never rewritten (got '{PathTask().LatestStep}')");
+
+    // agy：工作区内相对；工作区外**全路径**（旧实现只留文件名，目录整条丢）
+    var agyPathCatalog = new TaskCatalog();
+    var agyPathT0 = DateTimeOffset.UtcNow;
+    agyPathCatalog.Accept(A("PreInvocation", new { conversationId = "p_path", workspacePaths = new[] { @"F:\Git\proj" } }), agyPathT0);
+    agyPathCatalog.Accept(A("PreToolUse", new
+    {
+        conversationId = "p_path",
+        workspacePaths = new[] { @"F:\Git\proj" },
+        toolCall = new { name = "view_file", args = new { AbsolutePath = @"F:\Git\proj\docs\a.md" } }
+    }), agyPathT0.AddSeconds(1));
+    TaskSnapshot AgyPathTask() => agyPathCatalog.Projection().Tasks.First(t => t.Id == "p_path");
+    Check(AgyPathTask().LatestStep == "Read docs/a.md", $"agy path: in-workspace relative (got '{AgyPathTask().LatestStep}')");
+    agyPathCatalog.Accept(A("PreToolUse", new
+    {
+        conversationId = "p_path",
+        workspacePaths = new[] { @"F:\Git\proj" },
+        toolCall = new { name = "view_file", args = new { AbsolutePath = @"C:\Windows\win.ini" } }
+    }), agyPathT0.AddSeconds(2));
+    Check(AgyPathTask().LatestStep == "Read C:/Windows/win.ini",
+        $"agy path: outside the workspace keeps the full path, not just the file name (got '{AgyPathTask().LatestStep}')");
+
+    // opencode：工作区根取自会话目录（chat.message 不带目录，所以要记在会话上）
+    var ocPathCatalog = new TaskCatalog();
+    var ocPathT0 = DateTimeOffset.UtcNow;
+    ocPathCatalog.Accept(H("session.created", new { sessionID = "ses_path", info = new { id = "ses_path", directory = @"F:\Git\proj", time = new { created = 1 } } }), ocPathT0);
+    ocPathCatalog.Accept(H("message.part.updated", new
+    {
+        sessionID = "ses_path",
+        part = new { id = "prt_1", sessionID = "ses_path", type = "tool", tool = "read", state = new { status = "running", input = new { filePath = @"F:\Git\proj\src\b.ts" } } }
+    }), ocPathT0.AddSeconds(1));
+    Check(ocPathCatalog.Projection().Tasks.First(t => t.Id == "ses_path").LatestStep == "Read src/b.ts",
+        $"opencode path: shortened against the session directory (got '{ocPathCatalog.Projection().Tasks.First(t => t.Id == "ses_path").LatestStep}')");
+}
+finally
+{
+    PathDisplay.HomeRootOverride = previousHomeRoot;
 }
 
 Console.WriteLine();

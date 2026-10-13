@@ -44,6 +44,11 @@ public sealed class TaskCatalog
     private readonly Dictionary<string, PendingRequest> _requests;
     // opencode：乱序残帧守卫——处于 pending/running 的工具 part 所属会话（见 Accept(OpenCodeHookPayload)）。
     private readonly HashSet<string> _openCodeToolActive = new();
+    // opencode：会话 → 工作区目录（session.created/updated 的 info.directory）。
+    // 只用来做工具步里的路径缩写（opencode 的 chat.message 不带目录，行是那时才建的）。
+    private readonly Dictionary<string, string> _openCodeDirectories = new(StringComparer.Ordinal);
+    // Claude Code：会话 → 我们**曾显示为排队中**的那条提示词文本（投递时用来判不算新回合）。
+    private readonly Dictionary<string, string> _claudeQueuedText = new(StringComparer.Ordinal);
     // Claude Code：会话 → 转录本路径（每个 hook 事件都带 transcript_path），供 Maintain 心跳复用。
     private readonly Dictionary<string, string> _claudeTranscripts = new(StringComparer.Ordinal);
     // 转录本 mtime 门控：文件没变就不重读（照抄 agy 的 DB mtime 门控思路）。
@@ -165,7 +170,20 @@ public sealed class TaskCatalog
                 break;
         }
 
-        Upsert(ClaudeEventReducer.Reduce(hook, existing, ReadClaudeTranscript(hook), now));
+        var transcript = ReadClaudeTranscript(hook);
+
+        // 记下"我们曾把它显示成排队中"的那条提示词。用途只有一个：**排队消息被投递时不算新回合**
+        // （用户裁定：一轮完了之后重新开始才重置计时；中途插入的那句是同一个 burst）。
+        // 为什么不能直接用 PromptQueued 标记：投递时最后一条队列操作已经变成 dequeue/remove，
+        // 标记已被清空 ✗ —— 所以要另存一份文本，投递时对表。
+        if (transcript?.QueuedPrompt is { Length: > 0 } queuedText)
+            _claudeQueuedText[hook.SessionID] = queuedText;
+
+        var queuedDelivery = hook.HookEventName == "UserPromptSubmit" &&
+            _claudeQueuedText.TryGetValue(hook.SessionID, out var queuedPrompt) &&
+            queuedPrompt == ClaudeEventReducer.NormalizePrompt(hook.Prompt);
+        Upsert(ClaudeEventReducer.Reduce(hook, existing, transcript, now, queuedDelivery));
+        if (queuedDelivery) _claudeQueuedText.Remove(hook.SessionID);
 
         switch (hook.HookEventName)
         {
@@ -208,7 +226,7 @@ public sealed class TaskCatalog
                 _requests[hook.SessionID] = new(
                     hook.SessionID,
                     PendingRequestKind.Approval,
-                    ClaudeEventReducer.Summary(hook.ToolInput) ?? hook.ToolName,
+                    ClaudeEventReducer.Summary(hook.ToolInput, hook.Cwd) ?? hook.ToolName,
                     []);
                 _claudeApprovalSource[hook.SessionID] = string.Empty; // 父级询问
                 break;
@@ -396,7 +414,7 @@ public sealed class TaskCatalog
                     isQuestion ? PendingRequestKind.Question : PendingRequestKind.Approval,
                     isQuestion
                         ? ClaudeEventReducer.QuestionText(hook.ToolInput) ?? "等待用户选择"
-                        : ClaudeEventReducer.Summary(hook.ToolInput) ?? hook.ToolName,
+                        : ClaudeEventReducer.Summary(hook.ToolInput, hook.Cwd) ?? hook.ToolName,
                     isQuestion ? ClaudeEventReducer.QuestionOptions(hook.ToolInput) : []);
             _claudeApprovalSource[parent.Id] = hook.AgentID!;
 
@@ -482,7 +500,7 @@ public sealed class TaskCatalog
                     Lifecycle = AgentLifecycle.Running,
                     Activity = ClaudeEventReducer.ActivityFor(hook.ToolName, hook.ToolInput),
                     LatestStep = CodexEventReducer.LatestStep(
-                        hook.ToolName, ClaudeEventReducer.Summary(hook.ToolInput)) ?? subagent.LatestStep,
+                        hook.ToolName, ClaudeEventReducer.Summary(hook.ToolInput, hook.Cwd)) ?? subagent.LatestStep,
                 };
                 break;
             case "PostToolUse":
@@ -558,8 +576,22 @@ public sealed class TaskCatalog
         if (hook.Event is "session.idle" or "session.error" or "plugin.dispose" or "session.deleted")
             _openCodeToolActive.Remove(sessionID);
         var existing = _tasks.FirstOrDefault(task => task.Id == sessionID);
-        if (existing is null && hook.Event is "plugin.dispose" or "session.deleted" or "subagent") return false;
-        Upsert(OpenCodeEventReducer.Reduce(hook, existing, now));
+
+        // 会话目录**必须在不建行早退之前登记**：它只在 session.created/updated 出现（chat.message
+        // 不带），而 session.created 恰恰是不再建行的那条 —— 挡在后面的话行永远拿不到目录。
+        if (hook.Event is "session.created" or "session.updated" &&
+            OpenCodeEventReducer.Directory(hook.Properties) is { Length: > 0 } directory)
+            _openCodeDirectories[sessionID] = directory;
+
+        // 不造幽灵任务（三家同一条规矩，见 Claude 的 SessionStart 处置）：
+        //   · plugin.dispose / session.deleted / subagent 只"结束/归拢"已知会话；
+        //   · **session.created 也只登记不建行**——opencode 一建会话（TUI 一启动）就发这条，
+        //     而那一刻会话还没有标题，建出来的行只能顶着项目目录名（实测 `opencode run` 启动即
+        //     冒出一行 title=项目名 / prompt 空 / idle 的无名幽灵，直到第一个提示词到达）。
+        //     行改由 chat.message 建，那时提示词、标题都已在手。
+        if (existing is null && hook.Event is "plugin.dispose" or "session.deleted" or "subagent" or "session.created") return false;
+
+        Upsert(OpenCodeEventReducer.Reduce(hook, existing, now, _openCodeDirectories.GetValueOrDefault(sessionID)));
         switch (hook.Event)
         {
             case "permission.asked":
@@ -946,7 +978,7 @@ public sealed class TaskCatalog
     {
         var currentTime = now ?? DateTimeOffset.UtcNow;
         var changed = CheckAgyQueuedPrompts(currentTime);
-        changed = CheckAgyOffline(currentTime) || changed;
+        changed = CheckSilentOffline(currentTime) || changed;
         changed = CheckSubagentSilence(currentTime) || changed;
         changed = CheckAgyPreviewRecheck(currentTime) || changed;
         changed = MaintainAgyDatabase(currentTime) || changed;
@@ -1260,13 +1292,23 @@ public sealed class TaskCatalog
         return true;
     }
 
-    private bool CheckAgyOffline(DateTimeOffset now)
+    /// <summary>
+    /// 静默离线兜底（agy 与 opencode 共用同一口径，2026-10-11 统一）。
+    ///
+    /// 为什么需要：两家的"会话结束"信号都不牢靠——agy 只在自己的 `Stop` 里收场（进程被强杀就没有），
+    /// opencode 只有 `plugin.dispose` / `session.deleted`（插件没跑或进程被强杀同样没有）。
+    /// 没有这条兜底，那条 running 行会**永远**留着：容量裁剪只挑终态任务（`Normalize`），
+    /// 非终态连裁都裁不掉。判据与实测一致：10 分钟无更新 **且** 活动位为 null/thinking
+    /// （正在跑工具的长任务不算死）。
+    /// </summary>
+    private bool CheckSilentOffline(DateTimeOffset now)
     {
         var changed = false;
         for (var i = 0; i < _tasks.Count; i++)
         {
             var task = _tasks[i];
-            if (task.Source != AgentSource.Antigravity || task.IsTerminal || task.Lifecycle == AgentLifecycle.Offline) continue;
+            if (task.Source is not (AgentSource.Antigravity or AgentSource.OpenCode)) continue;
+            if (task.IsTerminal || task.Lifecycle == AgentLifecycle.Offline) continue;
             if (now - task.UpdatedAt <= TimeSpan.FromMinutes(10)) continue;
             if (task.Activity is not (null or AgentActivity.Thinking)) continue;
             _tasks[i] = task with
@@ -1656,6 +1698,8 @@ public sealed class TaskCatalog
         var live = _tasks.Select(task => task.Id).ToHashSet(StringComparer.Ordinal);
         _claudeToolActive.RemoveWhere(id => !live.Contains(id));
         _claudeRegistrySeen.RemoveWhere(id => !live.Contains(id));
+        PruneSessionMap(_openCodeDirectories, live);
+        PruneSessionMap(_claudeQueuedText, live);
         PruneSessionMap(_claudeTranscripts, live);
         PruneSessionMap(_claudeTranscriptMtimes, live);
         PruneSessionMap(_claudeQuestionInputs, live);
@@ -1769,6 +1813,70 @@ internal static class ToolStep
     }
 
     private static string Clamp(string value) => value.Length > 220 ? value[..220] : value;
+}
+
+/// <summary>
+/// 工具步里的**路径展示**（三家共用，2026-10-11 起）。
+///
+/// 规则：**工作区根下的写工作区相对路径；用户主目录下的写 <c>~/…</c>；其它写全路径**。
+/// 分隔符统一为正斜杠（与 agy 既有行为一致，手机上也不会被反斜杠的转义搞乱）。
+///
+/// 只对**路径型字段**调用（<c>file_path</c>/<c>path</c>/<c>notebook_path</c>/<c>AbsolutePath</c>/<c>TargetFile</c>/<c>filePath</c>…）：
+/// 命令行文本、URL、pattern 一律不动——把一条 shell 命令里的路径改写掉只会变成误导。
+/// </summary>
+public static class PathDisplay
+{
+    /// <summary>路径型入参键（命中才做缩写；命令/URL/pattern 一律原样）。</summary>
+    public static bool IsPathKey(string key) => key is "file_path" or "path" or "notebook_path" or "filePath";
+
+    /// <summary>用户主目录的注入点（测试用；null = 真实主目录）。</summary>
+    public static string? HomeRootOverride { get; set; }
+
+    public static string? Shorten(string? path, string? workspaceRoot)
+    {
+        if (string.IsNullOrWhiteSpace(path)) return null;
+        var value = path.Replace('\\', '/').Trim();
+        if (value.Length == 0) return null;
+
+        if (Root(workspaceRoot) is { } root && UnderRoot(value, root))
+        {
+            var relative = value[root.Length..].TrimStart('/');
+            // 路径正好等于工作区根：相对形式是空的，退化成根目录名（否则步骤会变成光秃秃的 "Read"）
+            return relative.Length > 0 ? relative : Leaf(root);
+        }
+
+        var home = Root(HomeRootOverride) ?? Root(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
+        if (home is not null && UnderRoot(value, home))
+        {
+            var relative = value[home.Length..].TrimStart('/');
+            return relative.Length > 0 ? "~/" + relative : "~";
+        }
+
+        return value;
+    }
+
+    /// <summary>把根规范化成"正斜杠、无尾斜杠"；空值返回 null。</summary>
+    private static string? Root(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        var normalized = value.Replace('\\', '/').Trim().TrimEnd('/');
+        return normalized.Length == 0 ? null : normalized;
+    }
+
+    /// <summary>按**目录边界**判定在不在根下：F:/Git 不该把 F:/GitHub 吃掉。</summary>
+    private static bool UnderRoot(string path, string root) =>
+        path.Equals(root, StringComparison.OrdinalIgnoreCase) ||
+        path.StartsWith(root + "/", StringComparison.OrdinalIgnoreCase);
+
+    private static string Leaf(string normalizedPath) =>
+        normalizedPath.Split('/').LastOrDefault(part => part.Length > 0) ?? normalizedPath;
+
+    /// <summary>目录的叶子名（opencode 建行时拿会话目录兜项目名用）。</summary>
+    public static string? LeafOf(string? path)
+    {
+        if (Root(path) is not { } normalized) return null;
+        return normalized.Split('/').LastOrDefault(part => part.Length > 0);
+    }
 }
 
 /// <summary>测试命令判定：按独立词匹配 test/pytest/jest/vitest（词边界强约束，
@@ -1899,7 +2007,8 @@ public static class ClaudeEventReducer
         ClaudeHookPayload hook,
         TaskSnapshot? existing,
         ClaudeTranscriptSnapshot? transcript,
-        DateTimeOffset now)
+        DateTimeOffset now,
+        bool queuedDelivery = false)
     {
         var task = existing ?? new(
             hook.SessionID,
@@ -1924,6 +2033,12 @@ public static class ClaudeEventReducer
                 // 只会走到这里的是**已存在的行**（resume / clear / compact / fork 把会话复位成 idle）；
                 // 全新会话的那条 SessionStart 在 Accept 里就被挡掉了——它在转录本尚未创建时到达，
                 // 那时候建行只能得到一个顶着 cwd 目录名的无名幽灵（详见 Accept 里的注释）。
+                //
+                // **终态保护**（2026-10-11 修，对齐 opencode 的 session.created 写法）：已完成的任务
+                // 被 resume/clear 打回 idle 会让它掉优先级（300→100）、丢掉未读高亮——用户实测报出
+                // "app 重连后原本 succeeded 的任务变成 idle"。会话重新打开不代表上一轮没完成；
+                // 用户随后真发提示词时 UserPrompt 会自然把它推回 running。
+                if (task.IsTerminal) return task;
                 return task with
                 {
                     Lifecycle = AgentLifecycle.Idle,
@@ -1934,7 +2049,7 @@ public static class ClaudeEventReducer
                     PromptQueued = false,
                 };
             case "UserPromptSubmit":
-                return UserPrompt(task, hook.Prompt, now);
+                return UserPrompt(task, hook.Prompt, now, queuedDelivery);
             case "PreToolUse" when IsTaskStopTool(hook.ToolName):
                 // 掐子代理（TaskStop）这条调用**不动父任务**：入参只有 `{"task_id":"…"}`，白名单取不到摘要，
                 // 走通用分支会让第三行退化成光秃秃的 "Task" 并且粘住（PostToolUse 不清 step）。
@@ -1957,7 +2072,7 @@ public static class ClaudeEventReducer
                 {
                     Lifecycle = AgentLifecycle.Running,
                     Activity = ActivityFor(hook.ToolName, hook.ToolInput),
-                    LatestStep = CodexEventReducer.LatestStep(hook.ToolName, Summary(hook.ToolInput)) ?? task.LatestStep,
+                    LatestStep = CodexEventReducer.LatestStep(hook.ToolName, Summary(hook.ToolInput, hook.Cwd)) ?? task.LatestStep,
                     CompletedAt = null,
                     Capabilities = [],
                 };
@@ -2011,7 +2126,7 @@ public static class ClaudeEventReducer
                 {
                     Lifecycle = AgentLifecycle.WaitingApproval,
                     Activity = AgentActivity.Executing,
-                    LatestStep = CodexEventReducer.LatestStep(hook.ToolName, Summary(hook.ToolInput)) ?? task.LatestStep,
+                    LatestStep = CodexEventReducer.LatestStep(hook.ToolName, Summary(hook.ToolInput, hook.Cwd)) ?? task.LatestStep,
                     CompletedAt = null,
                     Capabilities = [TaskCapability.Approve, TaskCapability.Deny],
                 };
@@ -2024,7 +2139,7 @@ public static class ClaudeEventReducer
                 {
                     Lifecycle = AgentLifecycle.Running,
                     Activity = AgentActivity.Thinking,
-                    LatestStep = $"✗ 已拒绝 {Summary(hook.ToolInput) ?? hook.ToolName}".TrimEnd(),
+                    LatestStep = $"✗ 已拒绝 {Summary(hook.ToolInput, hook.Cwd) ?? hook.ToolName}".TrimEnd(),
                     CompletedAt = null,
                     Capabilities = [],
                 };
@@ -2204,8 +2319,10 @@ public static class ClaudeEventReducer
     /// 从 Claude 的任意 tool_input JSON 中提取最具信息量的字段。
     /// **白名单刻意不含 prompt**：`Agent` 一类工具的入参带 prompt，取它会让第三行回显第二行
     /// （opencode 的白名单同样排除 prompt，agy 也"严格排除 Prompt"——三家同一条规范，G18）。
+    ///
+    /// <paramref name="workspaceRoot"/> 只用于路径型键的缩写；命令/URL/pattern 一律原样。
     /// </summary>
-    public static string? Summary(JsonElement? toolInput)
+    public static string? Summary(JsonElement? toolInput, string? workspaceRoot = null)
     {
         if (toolInput is null) return null;
         var value = toolInput.Value;
@@ -2218,7 +2335,7 @@ public static class ClaudeEventReducer
                  })
         {
             if (value.TryGetProperty(key, out var child) && DisplayValue(child) is { Length: > 0 } text)
-                return text;
+                return PathDisplay.IsPathKey(key) ? PathDisplay.Shorten(text, workspaceRoot) ?? text : text;
         }
         return null;
     }
@@ -2382,12 +2499,17 @@ public static class ClaudeEventReducer
         return Text(value, "command");
     }
 
-    private static TaskSnapshot UserPrompt(TaskSnapshot task, string? prompt, DateTimeOffset now)
+    private static TaskSnapshot UserPrompt(TaskSnapshot task, string? prompt, DateTimeOffset now, bool queuedDelivery = false)
     {
         var normalized = Normalize(prompt);
         // 本轮计时：一轮的第一个 prompt 开始计时；轮内插入的 prompt 不重置；新一轮清第三行。
         // 与 opencode/agy 同一条规则（旧实现把 StartedAt 停在会话创建时刻，显示的是"会话总长"，G5/G6）。
-        var startsTurn = task.Lifecycle is AgentLifecycle.Idle or AgentLifecycle.Offline
+        //
+        // **排队投递不算新回合**（用户裁定，2026-10-11）：计时只在"一轮完了之后又重新开始"时才重置，
+        // 而排队消息是用户**在上一轮没完时**说的那半句 —— 属于同一个 burst，不该归零。它到达时
+        // 上一轮往往刚好 Stop（状态已是 succeeded），单看生命周期必然误判成新回合 ✗，
+        // 所以由 Accept 事先对表（`queuedDelivery`）把它摁回同一轮。
+        var startsTurn = !queuedDelivery && task.Lifecycle is AgentLifecycle.Idle or AgentLifecycle.Offline
             or AgentLifecycle.Succeeded or AgentLifecycle.Interrupted;
         return task with
         {
@@ -2410,6 +2532,12 @@ public static class ClaudeEventReducer
         JsonValueKind.Null => "null",
         _ => null,
     };
+
+    /// <summary>
+    /// 提示词归一化（排队文本对表用）。**必须与 `UserPrompt` 里走的同一套**，否则
+    /// "排队那句"和"投递那句"会因空白差异对不上表，守卫静默失效。
+    /// </summary>
+    public static string? NormalizePrompt(string? value) => Normalize(value);
 
     private static string? Normalize(string? value)
     {
@@ -2458,10 +2586,12 @@ public static class OpenCodeEventReducer
         return state is { } current ? Text(current, "status") : null;
     }
 
-    public static TaskSnapshot Reduce(OpenCodeHookPayload hook, TaskSnapshot? existing, DateTimeOffset now)
+    public static TaskSnapshot Reduce(OpenCodeHookPayload hook, TaskSnapshot? existing, DateTimeOffset now, string? workspaceRoot = null)
     {
         var sessionID = SessionID(hook) ?? existing?.Id ?? "opencode";
-        var project = ProjectName(hook.Properties) ?? existing?.ProjectName ?? "opencode";
+        // 行现在由 chat.message 建（session.created 不再建行），而 chat.message 不带目录 ——
+        // 回退用会话记住的目录名，否则新行标题会变成字面的 "opencode"。
+        var project = ProjectName(hook.Properties) ?? PathDisplay.LeafOf(workspaceRoot) ?? existing?.ProjectName ?? "opencode";
         var task = existing ?? new TaskSnapshot(
             sessionID, AgentSource.OpenCode, project, project,
             null, null, null, [],
@@ -2515,7 +2645,7 @@ public static class OpenCodeEventReducer
             case "message.updated":
                 return MessageUpdated(task, hook.Properties, now);
             case "message.part.updated":
-                return PartUpdated(task, hook.Properties);
+                return PartUpdated(task, hook.Properties, workspaceRoot);
             case "reply":
                 // 正文预览（插件从 assistant text part 节流转发）：只更新第三行，不动生命周期；
                 // 等待用户输入期间忽略（迟到正文不盖掉问题/批准卡片的标题）。
@@ -2705,7 +2835,7 @@ public static class OpenCodeEventReducer
         value.TryGetProperty(name, out var child) &&
         child.ValueKind == JsonValueKind.True;
 
-    private static TaskSnapshot PartUpdated(TaskSnapshot task, JsonElement? properties)
+    private static TaskSnapshot PartUpdated(TaskSnapshot task, JsonElement? properties, string? workspaceRoot)
     {
         if (properties is not { } value) return task;
         var part = Child(value, "part");
@@ -2713,7 +2843,7 @@ public static class OpenCodeEventReducer
         var state = Child(item, "state");
         var status = state is { } current ? Text(current, "status") : null;
         var tool = Text(item, "tool");
-        var step = LatestStep(tool, state);
+        var step = LatestStep(tool, state, workspaceRoot);
 
         // 终态/等待态忽略工具 part 更新：
         // - Interrupted/Waiting*：question.asked / permission.asked 之后工具 part 补发 running 的竞态，
@@ -2895,10 +3025,16 @@ public static class OpenCodeEventReducer
         return Clamp($"{task.ProjectName} · {title}", 120);
     }
 
-    private static string? ProjectName(JsonElement? properties)
+    /// <summary>会话目录（session.created/updated 的 info.directory）；没有返回 null。</summary>
+    public static string? Directory(JsonElement? properties)
     {
         var info = properties is { } value ? Child(value, "info") : null;
-        var directory = info is { } session ? Text(session, "directory") : null;
+        return info is { } session ? Text(session, "directory") : null;
+    }
+
+    private static string? ProjectName(JsonElement? properties)
+    {
+        var directory = Directory(properties);
         if (directory is null) return null;
         var leaf = directory.TrimEnd('\\', '/').Split('\\', '/').LastOrDefault(part => part.Length > 0);
         return string.IsNullOrEmpty(leaf) ? null : leaf;
@@ -2947,19 +3083,22 @@ public static class OpenCodeEventReducer
         return ShellTestRun.Matches(command);
     }
 
-    private static string? LatestStep(string? tool, JsonElement? state)
+    private static string? LatestStep(string? tool, JsonElement? state, string? workspaceRoot = null)
     {
-        var detail = state is { } value ? Text(value, "title") ?? SummarizeInput(value) : null;
+        var detail = state is { } value ? Text(value, "title") ?? SummarizeInput(value, workspaceRoot) : null;
         return ToolStep.Compose(tool, detail);
     }
 
-    private static string? SummarizeInput(JsonElement state)
+    /// <summary>opencode 自己的 state.title 优先；没有才用入参，且路径型入参按三档缩写。</summary>
+    private static string? SummarizeInput(JsonElement state, string? workspaceRoot)
     {
         var input = Child(state, "input");
         if (input is not { } value) return null;
         foreach (var key in InputKeys)
             if (Text(value, key) is { } text)
-                return text;
+                return PathDisplay.IsPathKey(key)
+                    ? PathDisplay.Shorten(text, workspaceRoot) ?? text
+                    : text;
         return null;
     }
 

@@ -71,6 +71,12 @@
 7. **2026-10-06 等待态被工具 part 压回（实测竞态）**：`question.asked` 正确推送 waitingAnswer + 卡片后，8ms 内又被该工具补发的 part running 更新压回 running（并把挂起请求清掉）。修复：WaitingApproval / WaitingAnswer 期间忽略工具 part 更新（bridge v11）。诊断手法：WS 行车记录仪（watch-git.mjs）+ DB part 序列双证。
 8. **2026-10-07 工具执行期第三行被迟到正文盖回（实测乱序 ~200ms）**：`message.part.updated`（工具 running，+9ms）与正文结束帧（→ reply，+198ms）在插件侧到达顺序与语义相反——命令开始 9ms 就写对了第三行，198ms 后被上一段正文盖回，整个构建期显示旧正文，直到 completed 事件恢复。修复（bridge v15）：工具活动期间（activity 非空且非 thinking）整条忽略 `reply`；同时把工具 part 的忽略守卫扩到终态（Succeeded/Offline），防迟到 part 复活已完成任务。诊断手法：行车记录仪三连快照 + `ap-git-watch.log` 时间线（+9ms / +198ms / +12.2s），一次抓全。2026-10-08 终稿（bridge v28 + 插件 v8）：④ 源头守卫——插件对「结束帧晚于工具 part」的乱序残帧直接丢弃（toolSinceText，替代 v26 的 1 秒时间窗，不再吞合法短终稿）；⑤ 桥侧按「工具 pending/running」状态集忽略 `reply`（兜底，覆盖 todowrite 类 thinking 工具）；⑥ 退出/删除时未终态子代理级联扫为 interrupted；⑦ 插件无界 map 封顶 + session.deleted 清理（v8）。
 
+9. **2026-10-11 判例 8 的 ④ 是错的：残帧判定不能比"到达顺序"**（用户报出"中途 reply 经常只有前两三个字，后面整段话都没了"）。④ 原文"插件对『结束帧晚于工具 part』的乱序残帧直接丢弃（toolSinceText）"——**"晚到"不等于"内容旧"**：模型写完一段正文**接着**调工具是常规时序，那段正文的结束帧同样晚到，但内容是**新的** ✗。于是整段小结/结尾正文被源头丢掉，那行只剩流式期节流发出的开头两三个字（用户看到的就是"什么数据库""关键"这种残句）✗✗。
+   → **修法（插件 v11）**：按 opencode 自己的时间戳判残——`packages/schema/src/v1/session.ts` 里 `TextPart.time = { start, end }`、`ToolStateRunning/Completed/Error.time.start` 都是毫秒时间戳；**结束帧的 `time.end <= 最近一次工具 time.start` 才算残帧**，其余照收。工具 part 没有 `time.start` 时用到达时刻兜底（保持旧行为）。
+   → **判据**：凡是"乱序/迟到"的守卫，**要比内容自身的时间戳，不能比到达顺序**——到达顺序只说明"谁先被看见"，不说明"谁更新"。
+   → 测试两条钉住正反两面：`a text that ended AFTER the tool started is forwarded` / `a text that ended BEFORE the tool started is still dropped`。
+   → **未复现的部分**：我自己那轮实测第三行是**正常生长**的（`工作` 2 字 → 102 字 → 120 字，走的是有增量 deltas 的路径，与守卫无关）。用户遇到的是"没有后续增量、只有结束帧"的路径（很可能是该 provider/model 不逐字流式），这条只能靠用户在重启后再验一次。
+
 ## 六、一句话的验收模板（交付时照抄）
 
 > 产物：bridge `dist\opencode-main-baseline-vN\AgentPagerBridge.exe`；插件 vN（需要的话给"待更新"提示）；APK 已拷 `…\AgentPager-debug.apk`（SHA 一致）。

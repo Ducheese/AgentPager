@@ -102,8 +102,18 @@
    → **修法**：① 转录本启发式**只在 DB 没有这一行时**才允许开口（它的存在意义只是覆盖落库时差）；② 兜底防线——认定下来的"父"**必须是已知任务**才允许搬移（宁可留一行可见的顶层行，也不许无声消失）。
    → **测试**：`windows/tests` 用真 SQLite 临时库 + 注入的 brain 根复刻了事故现场（`BrainRoot` / `DatabasePathOverride` 两个注入点就是为此加的）。
 
+   **附（2026-10-11 路径写法统一）**：`RelativizePath` 现在委托给三家共享的 `PathDisplay.Shorten`（claude-code notes G51）——工作区内仍是相对路径，**工作区外改为写全路径**（旧实现在区外只留文件名，`C:/Windows/win.ini` 会显示成 `win.ini`，目录信息整条丢）。
+
 11. **2026-10-11 被掐掉的子代理没有任何信号可用**（用户追问"agy subagent 被 kill 的状态是不是无法同步"）：实测确认**同步不了**——① 掐掉时 agy **一个 hook 事件都不发**（注册的只有 `PreToolUse/PostToolUse/PreInvocation/PostInvocation/Stop`，没有"会话被取消"这类事件）；② agy 会话库里**没有 cancelled/aborted 状态**（205 条会话只有 `CASCADE_RUN_STATUS_IDLE` 与空串两种）；③ 被掐的子会话**仍留在库里**（`status=CASCADE_RUN_STATUS_IDLE`），所以也不能用"会话消失"判死；④ 它的转录本停在最后一个正常步骤上，没有终止标记。
-   → **结论**：agy 侧无信号可用，只能靠桥端的静默兜底收敛（判例 9 的第 ③ 条）。**Claude 不同**：它掐子代理虽也不发 `SubagentStop`，但 `TaskStop` 的入参带着目标 id，能秒级收敛（claude-code notes 的 G47）。
+   → **结论**：agy 侧无信号可用，只能靠桥端的静默兜底收敛（判例 9 的第 ③ 条）。**Claude 不同**：它掐子代理虽也不发 `SubagentStop`，但 `TaskStop` 的入参带着目标 id，能秒级收敛（claude-code notes 的 G47）。agy 自己的静默离线（10 分钟 + 活动位守卫）与 opencode 合并成同一个 `CheckSilentOffline`（claude-code notes G54）。
+
+12. **2026-10-11 中途插话不是"同一回合"——它被 agy 排成独立的一轮**（用户问"运行中收到新 prompt 不该重置计时"，agy 标 ⚠️）：用 `agy --input-format stream-json` 实测（事件名是 **`user`**，`{"event":"user","message":{...}}`，探测法见下）：第一轮跑着时喂第二条 → agy 把第一条跑完（20 s）**才**跑第二条，自己的 output 里 `num_turns:2` ✓。桥侧时间线：第一轮全程 `startedAt` 未变 ✓，第二条是在第一轮 `succeeded` **之后**才成为新回合、计时才重置 ✓ —— **不是缺陷**，"接单时重置"是对的。
+   → **但由此暴露了另一处真问题**（已修）：异步子代理回报会**唤醒**已 `succeeded` 的父任务（实测 16:50:28 Stop → 16:50:38 回报 → 父又连续发起模型调用），旧实现按 `isNewRound` 把计时清零 + 第三行清空 ✗ = 手机上"已完成的任务突然重新计时"。**修法**：把判据拆成两半——**生命周期**该翻 `running` 就翻（它确实在跑，诚实），**计时与第三行只认用户真的发了新东西**。
+
+   **③ 2026-10-11 用户裁定：排队被接单也**不该**重置计时**（本条第一版写成 `isNewPrompt || wasQueued`，即"接单算新回合"——**已被用户否掉**）。理由：中途插入属于**同一个 burst**，agy 把它排成独立一轮只是它自己的调度，计量不该归零。现为 **`isNewPrompt && !wasQueued`**。
+   → **必须带 `!wasQueued`**：排队时 `CheckAgyQueuedPrompts` 已经把排队文本**先写进 `task.UserPrompt`**（转录本此刻还没落盘），于是接单那一下 `isNewPrompt` 会**假阳性**命中 ✗ —— 不带这个守卫就会照旧清零。而 `DetectQueuedPrompt` 带 `Lifecycle == Running` 前提 ✓，所以"上一轮结束后用户才说的话"永远不会被标成排队，那种真新回合仍然照常重置 ✓。
+   → **口径对照（三家，2026-10-11 已全部对齐）**：**标准 = 计时只在一轮对话完了之后又重新开始才重置**。opencode 本来就不重置 ✓；agy 现已对齐 ✓（本条 ③）；Claude 也已按同一标准修好（claude-code notes G55：把"曾显示为排队中"的文本记下来，投递时对表摁回同一轮）✓。三家一致 ✓。
+   → **探测 agy stream-json 协议的方法**（复用处）：① 事件名不在二进制里成串出现（Go 的 .rodata 无引号包裹），别硬扫；② 直接喂并读回显——**缺 `event` 是致命错，`event` 不认识只是 warning**，所以可以一次喂一堆候选名看哪个不报警：实测 `user_turn`/`prompt`/`user_input`/`user_text`/`input`/`turn` 全被拒，**`user` 命中**。
 
 ---
 

@@ -95,7 +95,10 @@ public static class AgyConversationDatabase
 
 public static class AgyHistoryReader
 {
-    public static string DefaultHistoryPath => Path.Combine(
+    /// <summary>history.jsonl 路径的注入点（测试用；null = 真实路径）。</summary>
+    public static string? HistoryPathOverride { get; set; }
+
+    public static string DefaultHistoryPath => HistoryPathOverride ?? Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
         ".gemini", "antigravity-cli", "history.jsonl");
 
@@ -431,9 +434,19 @@ public static class AgyEventReducer
         var wasWaitingBefore = existing?.Lifecycle is AgentLifecycle.WaitingApproval or AgentLifecycle.WaitingAnswer;
         var isNewPrompt = !wasWaitingBefore && existing?.UserPrompt is not null && userPrompt is not null && existing.UserPrompt != userPrompt;
         var wasQueued = existing?.PromptQueued == true;
-        var isTerminalBefore = existing is null || existing.Lifecycle is
-            AgentLifecycle.Idle or AgentLifecycle.Succeeded or AgentLifecycle.Interrupted or AgentLifecycle.Offline;
-        var isNewRound = isNewPrompt || wasQueued || isTerminalBefore;
+        // 计时与第三行**只认"用户在本轮之外重新开口"**（2026-10-11 两轮实测修正）：
+        //
+        // ① 异步子代理回报唤醒父任务时不算新回合：agy 的 invoke_subagent 是异步的（实测 16:50:28
+        //    父 Stop → 16:50:38 子代理回报 → 父又连续发起模型调用），那是同一个请求还在继续，
+        //    按 isNewRound 清零 = 手机上"已完成的任务突然重新计时"✗。生命周期照实翻 Running（它在跑）。
+        // ② **排队被接单也不算新回合**（用户裁定）：中途插入的提示词属于**同一个 burst**，
+        //    乙方（agy）把它排成独立的一轮只是它自己的调度，计量不该归零 ✗。
+        //    这一条必须写成 `&& !wasQueued`：排队时 `CheckAgyQueuedPrompts` 已经把排队文本
+        //    **先写进 task.UserPrompt**（转录本此刻还没落盘），于是接单那一下 isNewPrompt 会
+        //    假阳性命中 ✗ —— 不用 wasQueued 挡就会照旧清零。（`DetectQueuedPrompt` 带
+        //    `Lifecycle == Running` 前提，所以"上一轮结束后用户才说的话"永远不会被标成排队 ✓
+        //    —— 那种真新回合仍然照常重置。）
+        var startsNewRound = isNewPrompt && !wasQueued;
 
         // OpenCode 规范：正文回复预览仅在回合真正结束（Stop 且未终态）时写入 LatestStep；
         // 运行期间（PostInvocation/PreToolUse/PostToolUse）绝对不得以旧正文覆盖工具执行步骤
@@ -465,9 +478,9 @@ public static class AgyEventReducer
                 {
                     Lifecycle = AgentLifecycle.Running,
                     Activity = AgentActivity.Thinking,
-                    StartedAt = isNewRound ? now : task.StartedAt,
-                    // 新一轮开聊时清空第三行，让 lifecycle 文案兜底；轮内插入不清空
-                    LatestStep = isNewRound ? null : task.LatestStep,
+                    StartedAt = startsNewRound ? now : task.StartedAt,
+                    // 新一轮开聊时清空第三行，让 lifecycle 文案兜底；轮内插入与"被唤醒续跑"都不清空
+                    LatestStep = startsNewRound ? null : task.LatestStep,
                     CompletedAt = null,
                     Capabilities = [],
                     PromptQueued = false, // 排队接单，标记解除
@@ -752,19 +765,12 @@ public static class AgyEventReducer
         return null;
     }
 
-    private static string? RelativizePath(string? path, string cwd)
-    {
-        if (string.IsNullOrWhiteSpace(path)) return null;
-        var normalized = path.Replace('\\', '/').Trim();
-        if (!string.IsNullOrWhiteSpace(cwd))
-        {
-            var normalizedCwd = cwd.Replace('\\', '/').TrimEnd('/') + "/";
-            if (normalized.StartsWith(normalizedCwd, StringComparison.OrdinalIgnoreCase))
-                return normalized[normalizedCwd.Length..];
-        }
-        var leaf = Path.GetFileName(normalized);
-        return string.IsNullOrEmpty(leaf) ? normalized : leaf;
-    }
+    /// <summary>
+    /// 路径缩写统一走三家的共享实现（2026-10-11 改）：工作区内→相对、家目录→<c>~/…</c>、其它→**全路径**。
+    /// 旧实现在"工作区外"只留文件名（实测 `C:/Windows/win.ini` 显示成 `win.ini`），目录信息整条丢失，
+    /// 与"不是工作区就写全路径"的规范冲突。
+    /// </summary>
+    private static string? RelativizePath(string? path, string cwd) => PathDisplay.Shorten(path, cwd);
 
     private static string? CleanActionVerb(string toolName, string? action)
     {
