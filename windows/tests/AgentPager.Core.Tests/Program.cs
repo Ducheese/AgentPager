@@ -393,21 +393,21 @@ Check(!json.Contains("\"OpenCode\""), "wire has no PascalCase enum leakage");
 var temp = Path.Combine(Path.GetTempPath(), "ap-verify-plugins-" + Guid.NewGuid().ToString("N"));
 var installer = new OpenCodePluginConfiguration(temp);
 Check(installer.Status == OpenCodePluginStatus.NotInstalled, "status: 未安装");
-Check(OpenCodePluginConfiguration.EmbeddedVersion == 15, $"embedded plugin version = 15 (got {OpenCodePluginConfiguration.EmbeddedVersion})");
+Check(OpenCodePluginConfiguration.EmbeddedVersion == 16, $"embedded plugin version = 16 (got {OpenCodePluginConfiguration.EmbeddedVersion})");
 var first = installer.Install();
 Check(first.Changed && File.Exists(Path.Combine(temp, "plugins", "agentpager-opencode.js")), "install writes plugin");
 Check(installer.Status == OpenCodePluginStatus.Installed && installer.IsInstalled(), "status: 已写入（与内置一致）");
-Check(installer.InstalledVersion == 15, "installed version = 15");
+Check(installer.InstalledVersion == 16, "installed version = 16");
 var second = installer.Install();
 Check(!second.Changed, "reinstall is idempotent");
 var pluginPath = Path.Combine(temp, "plugins", "agentpager-opencode.js");
 var content = File.ReadAllText(pluginPath);
 Check(content.Contains("Managed by AgentPager (OpenCode)"), "managed marker present");
-Check(content.Contains("agentpager-opencode v15"), "version header present");
+Check(content.Contains("agentpager-opencode v16"), "version header present");
 Check(content.Contains("hook_source: \"opencode\"") && content.Contains("49361"), "plugin content sane");
 File.WriteAllText(pluginPath, content.Replace("const MAX_TEXT = 1000", "const MAX_TEXT = 500"));
 Check(installer.Status == OpenCodePluginStatus.Outdated, "status: 待更新（内容与内置不一致）");
-Check(installer.InstalledVersion == 15, "outdated file still reports v15");
+Check(installer.InstalledVersion == 16, "outdated file still reports v16");
 var repair = installer.Install();
 Check(repair.Changed && installer.Status == OpenCodePluginStatus.Installed, "repair restores 已写入");
 var uninstalled = installer.Uninstall();
@@ -971,7 +971,7 @@ var recorder = new RecordingResolver();
 var answerAck = answerCatalog.Perform(
     Guid.NewGuid(), new ControlPayload("claude_7", ControlAction.Answer, "就用 A"), recorder);
 Check(answerAck.Result == ControlResult.Accepted, $"claude answer: phone answer accepted (got {answerAck.Result}/{answerAck.Reason})");
-Check(recorder.AnswerText == "就用 A", "claude answer: the text reaches the resolver");
+Check(recorder.Written is [{ Labels.Count: 0, Text: "就用 A" }], "claude answer: the free text reaches the resolver as text (not as a label)");
 Check(JsonNode.Parse(recorder.RawInput!)!["questions"] is JsonArray { Count: 1 }, "claude answer: raw tool input passed back whole");
 Check(AnswerTask().Capabilities.Count == 0 && AnswerTask().Lifecycle == AgentLifecycle.Running,
     "claude answer: capability cleared and the turn resumes");
@@ -1118,6 +1118,26 @@ var nullValueSigning = System.Text.Encoding.UTF8.GetString(ControlSigner.Signing
 Check(nullValueSigning.EndsWith("""{"action":"approve","taskID":"ses_1"}""", StringComparison.Ordinal),
     "control signing: null value keeps the short canonical form");
 
+// 多选题的 values 追加在末尾，且与 App 端 ControlSigner.canonicalPayload 逐字同形（那边同名测试钉着）
+var multiSigning = System.Text.Encoding.UTF8.GetString(ControlSigner.SigningData(
+    signEnvelope with { Payload = new ControlPayload("ses_1", ControlAction.Answer, "就用 A", ["A（甲）", "B（乙）"]) }));
+Check(multiSigning.EndsWith(
+        """{"action":"answer","taskID":"ses_1","value":"就用 A","values":["A（甲）","B（乙）"]}""",
+        StringComparison.Ordinal),
+    "control signing: multi-select values are appended last, raw (non-ASCII intact)");
+Check(System.Text.Encoding.UTF8.GetString(ControlSigner.SigningData(signEnvelope with
+        {
+            Payload = new ControlPayload("ses_1", ControlAction.Answer, null, ["A", "B"]),
+        }))
+        .EndsWith("""{"action":"answer","taskID":"ses_1","values":["A","B"]}""", StringComparison.Ordinal),
+    "control signing: values-only keeps the same order");
+Check(System.Text.Encoding.UTF8.GetString(ControlSigner.SigningData(signEnvelope with
+        {
+            Payload = new ControlPayload("ses_1", ControlAction.Answer, "x", []),
+        }))
+        .EndsWith("""{"action":"answer","taskID":"ses_1","value":"x"}""", StringComparison.Ordinal),
+    "control signing: an empty values list is not signed (same rule as the app)");
+
 // ===================== 24. 复审缺口回归（子代理挂卡撤销 / 撤卡清单 / 离线 / 清理 / 终稿补读） =====================
 var gapNow = DateTimeOffset.UtcNow;
 
@@ -1222,7 +1242,7 @@ Check(Multi().LatestStep == "第 1/2 题： 题一", $"multi advance: third line
 var multiResolver = new RecordingResolver();
 var firstAck = multiCatalog.Perform(Guid.NewGuid(), new ControlPayload("claude_30", ControlAction.Answer, "A"), multiResolver);
 Check(firstAck.Result == ControlResult.Accepted, "multi advance: first answer accepted");
-Check(multiResolver.AnswersWritten is null, "multi advance: nothing is written back until every question is answered");
+Check(multiResolver.Written is null, "multi advance: nothing is written back until every question is answered");
 
 var secondCard = multiCatalog.Projection().PendingRequests.First();
 Check(secondCard.Summary == "第 2/2 题： 第二题？" && secondCard.Options is ["C", "D"],
@@ -1233,19 +1253,18 @@ Check(Multi().LatestStep == "第 2/2 题： 题二", $"multi advance: third line
 
 var lastAck = multiCatalog.Perform(Guid.NewGuid(), new ControlPayload("claude_30", ControlAction.Answer, "C"), multiResolver);
 Check(lastAck.Result == ControlResult.Accepted, "multi advance: last answer accepted");
-Check(multiResolver.AnswersWritten is { Count: 2 } written &&
-      written["第一题？"] == "A" && written["第二题？"] == "C",
-    "multi advance: every answer is written back as one map");
+Check(multiResolver.Written is [{ Question: "第一题？", Labels: ["A"] }, { Question: "第二题？", Labels: ["C"] }],
+    "multi advance: every answer is written back in question order");
 Check(multiCatalog.Projection().PendingRequests.Count == 0 && Multi().Lifecycle == AgentLifecycle.Running,
     "multi advance: the wait ends and the turn resumes");
 
-// 单题不受影响：仍走"点选项→answers / 打字→response"的老路，不进逐题推进
+// 单题自由文本：不点选项就落 Text（Claude 那边会写成 response），照旧不走逐题推进
 var singleResolver = new RecordingResolver();
 var singleAdvance = new TaskCatalog();
 singleAdvance.Accept(C("PermissionRequest", new { session_id = "claude_31", tool_name = "AskUserQuestion", tool_input = askInput }), multiNow);
 singleAdvance.Perform(Guid.NewGuid(), new ControlPayload("claude_31", ControlAction.Answer, "就用 A"), singleResolver);
-Check(singleResolver.RawInput is not null && singleResolver.AnswersWritten is null,
-    "multi advance: a single question still uses the plain answer path");
+Check(singleResolver.RawInput is not null && singleResolver.Written is [{ Labels.Count: 0, Text: "就用 A" }],
+    "multi advance: a single question's free text is recorded as text");
 
 // AnswerMap 的形状：整张 answers 表 + 原样带回 questions
 var mapBytes = ClaudeHookOutput.AnswerMap(
@@ -1314,9 +1333,138 @@ Check(annotatedCatalog.Projection().PendingRequests.First().Options is ["A（注
 var annotatedResolver = new RecordingResolver();
 annotatedCatalog.Perform(Guid.NewGuid(), new ControlPayload("claude_41", ControlAction.Answer, "A（注解 A）"), annotatedResolver);
 annotatedCatalog.Perform(Guid.NewGuid(), new ControlPayload("claude_41", ControlAction.Answer, "C（注解 C）"), annotatedResolver);
-Check(annotatedResolver.AnswersWritten is { Count: 2 } annotatedMap &&
-      annotatedMap["第一题？"] == "A" && annotatedMap["第二题？"] == "C",
+Check(annotatedResolver.Written is [{ Labels: ["A"] }, { Labels: ["C"] }],
     "option display: multi answers normalise back to bare labels");
+
+// ===================== 27. 多选题（Claude `multiSelect` / opencode `multiple`） =====================
+// 题上的多选标志必须原样落到卡片上，App 靠它决定画"点一下即作答"还是"可反复点选的开关"
+var multiSelectAsk = JsonSerializer.SerializeToElement(new
+{
+    questions = new[]
+    {
+        new
+        {
+            question = "要开哪些功能？",
+            header = "功能",
+            multiSelect = true,
+            options = new[] { new { label = "A", description = "甲" }, new { label = "B", description = "乙" } },
+        },
+    },
+});
+var pickCatalog = new TaskCatalog();
+pickCatalog.Accept(C("PermissionRequest", new { session_id = "claude_60", tool_name = "AskUserQuestion", tool_input = multiSelectAsk }), multiNow);
+var pickCard = pickCatalog.Projection().PendingRequests.First();
+Check(pickCard.MultiSelect, "multi-select: multiSelect=true reaches the card");
+Check(pickCard.Options is ["A（甲）", "B（乙）"], "multi-select: options keep their annotations");
+
+var pickResolver = new RecordingResolver();
+var pickAck = pickCatalog.Perform(
+    Guid.NewGuid(),
+    new ControlPayload("claude_60", ControlAction.Answer, null, ["A（甲）", "B（乙）"]),
+    pickResolver);
+Check(pickAck.Result == ControlResult.Accepted, $"multi-select: a multi answer is accepted (got {pickAck.Result}/{pickAck.Reason})");
+Check(pickResolver.Written is [{ Labels: ["A", "B"], Text: null }],
+    "multi-select: the picked display texts normalise back to bare labels, in the order tapped");
+
+// 多选 + 打字：打字内容算"再选一项"（Claude 自己的多选界面就是这么算的）
+var pickTypedCatalog = new TaskCatalog();
+pickTypedCatalog.Accept(C("PermissionRequest", new { session_id = "claude_61", tool_name = "AskUserQuestion", tool_input = multiSelectAsk }), multiNow);
+var pickTypedResolver = new RecordingResolver();
+pickTypedCatalog.Perform(
+    Guid.NewGuid(),
+    new ControlPayload("claude_61", ControlAction.Answer, "再加一个 C", ["A（甲）"]),
+    pickTypedResolver);
+Check(pickTypedResolver.Written is [{ Labels: ["A"], Text: "再加一个 C" }],
+    "multi-select: typed text rides alongside the picked options");
+
+// 空作答要挡住（不发一问空答案给模型）
+var pickEmptyCatalog = new TaskCatalog();
+pickEmptyCatalog.Accept(C("PermissionRequest", new { session_id = "claude_62", tool_name = "AskUserQuestion", tool_input = multiSelectAsk }), multiNow);
+var pickEmpty = pickEmptyCatalog.Perform(
+    Guid.NewGuid(), new ControlPayload("claude_62", ControlAction.Answer, "   ", []), new RecordingResolver());
+Check(pickEmpty.Result == ControlResult.Unsupported, $"multi-select: an empty answer is refused (got {pickEmpty.Result})");
+
+// 回包形状：多选按 Claude 自己的格式用 ", " 连接，落在 answers[问题全文]
+var multiReplyBytes = ClaudeHookOutput.QuestionReply(
+    """{"questions":[{"question":"要开哪些功能？","multiSelect":true,"options":[{"label":"A"},{"label":"B"}]}]}""",
+    [new QuestionAnswer("要开哪些功能？", ["A", "B"], null)]);
+var multiReplyInput = JsonNode.Parse(System.Text.Encoding.UTF8.GetString(multiReplyBytes).Trim())!
+    .AsObject()["hookSpecificOutput"]!["decision"]!["updatedInput"]!.AsObject();
+Check(multiReplyInput["answers"]!["要开哪些功能？"]!.GetValue<string>() == "A, B",
+    $"multi-select: the round trip joins with ', ' (got '{multiReplyInput["answers"]!["要开哪些功能？"]}')");
+Check(multiReplyInput["response"] is null, "multi-select: a multi answer does not also set response");
+
+// 单题单选点选项：同样落 answers（不是 response），与自由文本区分开
+var optionReplyBytes = ClaudeHookOutput.QuestionReply(
+    """{"questions":[{"question":"q","options":[{"label":"A"}]}]}""",
+    [new QuestionAnswer("q", ["A"], null)]);
+var optionReplyInput = JsonNode.Parse(System.Text.Encoding.UTF8.GetString(optionReplyBytes).Trim())!
+    .AsObject()["hookSpecificOutput"]!["decision"]!["updatedInput"]!.AsObject();
+Check(optionReplyInput["answers"]!["q"]!.GetValue<string>() == "A" && optionReplyInput["response"] is null,
+    "multi-select: a single tapped option lands in answers, not response");
+
+// 单题自由文本仍走 response（App 的输入框与它一对一）
+var textReplyBytes = ClaudeHookOutput.QuestionReply(
+    """{"questions":[{"question":"q","options":[{"label":"A"}]}]}""",
+    [new QuestionAnswer("q", [], "就用 A")]);
+var textReplyInput = JsonNode.Parse(System.Text.Encoding.UTF8.GetString(textReplyBytes).Trim())!
+    .AsObject()["hookSpecificOutput"]!["decision"]!["updatedInput"]!.AsObject();
+Check(textReplyInput["response"]!.GetValue<string>() == "就用 A" && textReplyInput["answers"] is null,
+    "multi-select: a lone free-text answer still rides on response");
+
+// ===================== 28. opencode 远程作答（与 Claude 同一套节奏） =====================
+var ocAnswerCatalog = new TaskCatalog();
+var ocAnswerNow = DateTimeOffset.UtcNow;
+var ocQuestions = new
+{
+    sessionID = "ses_q",
+    id = "que_1",
+    questions = new object[]
+    {
+        new { question = "先选哪个？", header = "第一", options = new object[] { "A", "B" } },
+        new { question = "再选哪些？", header = "第二", multiple = true, options = new object[] { "C", "D", "E" } },
+    },
+};
+ocAnswerCatalog.Accept(H("chat.message", new { sessionID = "ses_q", text = "干活" }), ocAnswerNow);
+Check(ocAnswerCatalog.Accept(
+        new OpenCodeHookPayload("question.asked", JsonSerializer.SerializeToElement(ocQuestions, WireJson.Options), "question", "que_1"),
+        ocAnswerNow.AddSeconds(1)),
+    "opencode question: a held question is accepted");
+
+TaskSnapshot OcAnswer() => ocAnswerCatalog.Projection().Tasks.First(x => x.Id == "ses_q");
+var ocFirst = ocAnswerCatalog.Projection().PendingRequests.First();
+Check(ocFirst.Summary == "第 1/2 题： 先选哪个？" && ocFirst.Options is ["A", "B"] && !ocFirst.MultiSelect,
+    $"opencode question: one question per screen, own options (got '{ocFirst.Summary}' / {string.Join(",", ocFirst.Options)})");
+Check(OcAnswer().Lifecycle == AgentLifecycle.WaitingAnswer && OcAnswer().Capabilities.Contains(TaskCapability.Answer),
+    "opencode question: waiting and answerable");
+
+var ocFirstResolver = new RecordingResolver();
+var ocFirstAck = ocAnswerCatalog.Perform(
+    Guid.NewGuid(), new ControlPayload("ses_q", ControlAction.Answer, "A"), ocFirstResolver);
+Check(ocFirstAck.Result == ControlResult.Accepted && ocFirstResolver.Written is null,
+    "opencode question: the first answer is banked, not sent");
+
+var ocSecond = ocAnswerCatalog.Projection().PendingRequests.First();
+Check(ocSecond.Summary == "第 2/2 题： 再选哪些？" && ocSecond.Options is ["C", "D", "E"] && ocSecond.MultiSelect,
+    $"opencode question: the multiple flag rides the card too (got '{ocSecond.Summary}' / multi={ocSecond.MultiSelect})");
+
+var ocFinalResolver = new RecordingResolver();
+var ocFinalAck = ocAnswerCatalog.Perform(
+    Guid.NewGuid(), new ControlPayload("ses_q", ControlAction.Answer, null, ["C", "E"]), ocFinalResolver);
+Check(ocFinalAck.Result == ControlResult.Accepted, $"opencode question: the last answer is accepted (got {ocFinalAck.Result}/{ocFinalAck.Reason})");
+Check(ocFinalResolver.Written is [{ Labels: ["A"] }, { Labels: ["C", "E"] }],
+    "opencode question: both questions land in one ordered set, multi-select intact");
+Check(ocAnswerCatalog.Projection().PendingRequests.Count == 0 && OcAnswer().Lifecycle == AgentLifecycle.Running,
+    "opencode question: the wait ends and the turn resumes");
+
+// 没有 hold 的提问：只有卡片、没有按钮（发不出去的输入框不许出现）
+var ocPlainCatalog = new TaskCatalog();
+ocPlainCatalog.Accept(H("chat.message", new { sessionID = "ses_q2", text = "干活" }), ocAnswerNow);
+ocPlainCatalog.Accept(H("question.asked", JsonSerializer.SerializeToElement(
+    new { sessionID = "ses_q2", id = "que_2", questions = new object[] { new { question = "选哪个？", options = new object[] { "A" } } } }, WireJson.Options)),
+    ocAnswerNow.AddSeconds(1));
+Check(!ocPlainCatalog.Projection().Tasks.First(x => x.Id == "ses_q2").Capabilities.Contains(TaskCapability.Answer),
+    "opencode question: a plain (unheld) question grants no answer capability");
 
 // 心跳（A 口径）：工具步粘滞，不被更早的正文盖掉（这条在 C 回退后仍然成立，钉住它防再放宽）
 var heartbeatCatalog = new TaskCatalog();
@@ -2002,8 +2150,10 @@ Check(System.Text.Encoding.UTF8.GetString(OpenCodeHookOutput.Decision(true)).Tri
     "opencode reply: allow encodes as expected");
 Check(System.Text.Encoding.UTF8.GetString(OpenCodeHookOutput.Decision(false)).Trim() == "{\"decision\":\"deny\"}",
     "opencode reply: deny encodes as expected");
-Check(System.Text.Encoding.UTF8.GetString(OpenCodeHookOutput.Answers(["B"])).Trim() == "{\"answers\":[[\"B\"]]}",
-    $"opencode reply: answers are per-question arrays (got {System.Text.Encoding.UTF8.GetString(OpenCodeHookOutput.Answers(["B"])).Trim()})");
+Check(System.Text.Encoding.UTF8.GetString(OpenCodeHookOutput.Answers([["B"]])).Trim() == "{\"answers\":[[\"B\"]]}",
+    $"opencode reply: answers are per-question arrays (got {System.Text.Encoding.UTF8.GetString(OpenCodeHookOutput.Answers([["B"]])).Trim()})");
+Check(System.Text.Encoding.UTF8.GetString(OpenCodeHookOutput.Answers([["A", "C"], ["B"]])).Trim() == "{\"answers\":[[\"A\",\"C\"],[\"B\"]]}",
+    "opencode reply: multi-select and multi-question ride the two dimensions (inner = selected labels, outer = questions)");
 
 // 载荷解析：hold / request_id 两个字段
 var holdPayload = JsonSerializer.Deserialize<OpenCodeHookPayload>(
@@ -2019,39 +2169,28 @@ sealed class AllowResolver : ICodexPermissionResolver
 {
     public bool Resolve(string sessionID, CodexPermissionDecision decision) => true;
 
-    public bool ResolveAnswer(string sessionID, string rawToolInput, string answer) => true;
-
-    public bool ResolveAnswers(string sessionID, string rawToolInput, IReadOnlyDictionary<string, string> answers) => true;
+    public bool ResolveQuestion(string sessionID, string? rawToolInput, IReadOnlyList<QuestionAnswer> answers) => true;
 }
 
 sealed class NullResolver : ICodexPermissionResolver
 {
     public bool Resolve(string sessionID, CodexPermissionDecision decision) => false;
 
-    public bool ResolveAnswer(string sessionID, string rawToolInput, string answer) => false;
-
-    public bool ResolveAnswers(string sessionID, string rawToolInput, IReadOnlyDictionary<string, string> answers) => false;
+    public bool ResolveQuestion(string sessionID, string? rawToolInput, IReadOnlyList<QuestionAnswer> answers) => false;
 }
 
-/// <summary>记下作答回填内容的桩：验证"整份带回原始 tool_input + 自由文本 / 多题整张答案表"。</summary>
+/// <summary>记下作答回填内容的桩：验证"整份带回原始 tool_input + 按题序的答案"。</summary>
 sealed class RecordingResolver : ICodexPermissionResolver
 {
     public string? RawInput;
-    public string? AnswerText;
-    public Dictionary<string, string>? AnswersWritten;
+    public IReadOnlyList<QuestionAnswer>? Written;
 
     public bool Resolve(string sessionID, CodexPermissionDecision decision) => true;
 
-    public bool ResolveAnswer(string sessionID, string rawToolInput, string answer)
+    public bool ResolveQuestion(string sessionID, string? rawToolInput, IReadOnlyList<QuestionAnswer> answers)
     {
         RawInput = rawToolInput;
-        AnswerText = answer;
-        return true;
-    }
-
-    public bool ResolveAnswers(string sessionID, string rawToolInput, IReadOnlyDictionary<string, string> answers)
-    {
-        AnswersWritten = new Dictionary<string, string>(answers, StringComparer.Ordinal);
+        Written = answers;
         return true;
     }
 }

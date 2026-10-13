@@ -92,6 +92,7 @@ interface PhoneSession : AutoCloseable {
         taskID: String,
         action: ControlAction,
         value: String? = null,
+        values: List<String>? = null,
     ): ControlSubmission
 
     suspend fun unpair()
@@ -229,6 +230,7 @@ internal class DefaultPhoneSession(
         taskID: String,
         action: ControlAction,
         value: String?,
+        values: List<String>?,
     ): ControlSubmission = mutex.withLock {
         val currentPairing = pairing
             ?: return@withLock ControlSubmission.Rejected(PhoneSessionProblem.NotPaired)
@@ -248,7 +250,7 @@ internal class DefaultPhoneSession(
             deviceId = deviceID,
             sequence = sequence,
             nonce = nonce(),
-            payload = ControlPayload(taskID, action, value),
+            payload = ControlPayload(taskID, action, value, values),
             signature = "",
         )
         val secret = runCatching { Base64.getDecoder().decode(currentPairing.secret) }

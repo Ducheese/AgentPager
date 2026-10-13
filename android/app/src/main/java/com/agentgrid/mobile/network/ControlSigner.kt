@@ -49,11 +49,11 @@ internal object ControlSigner {
         }
         val escapedAction = json.encodeToString(action)
         val escapedTask = json.encodeToString(payload.taskID)
-        return if (payload.value == null) {
-            """{"action":$escapedAction,"taskID":$escapedTask}"""
-        } else {
-            val escapedValue = json.encodeToString(payload.value)
-            """{"action":$escapedAction,"taskID":$escapedTask,"value":$escapedValue}"""
-        }
+        // 字段顺序有意义：桥端 ControlSigner.SigningData 是照着这个顺序拼同一串字符串的，
+        // 顺序一变签名就废。新增字段**一律追加在末尾**（多选题的 values 就是这么加的）。
+        val fields = StringBuilder("""{"action":$escapedAction,"taskID":$escapedTask""")
+        payload.value?.let { fields.append(""","value":${json.encodeToString(it)}""") }
+        payload.values?.takeIf { it.isNotEmpty() }?.let { fields.append(""","values":${json.encodeToString(it)}""") }
+        return fields.append("}").toString()
     }
 }

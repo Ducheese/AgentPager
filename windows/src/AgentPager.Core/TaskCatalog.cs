@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 
 namespace AgentPager.Core;
@@ -29,13 +30,29 @@ public interface ICodexPermissionResolver
     bool Resolve(string sessionID, CodexPermissionDecision decision);
 
     /// <summary>
-    /// 把"用户在手机上作答"写回挂起的权限请求（目前只有 Claude 的提问工具走这条路）。
-    /// <paramref name="rawToolInput"/> 是该提问工具**原始**的 tool_input——回填时必须整份带回。
+    /// 把"用户在手机上作答"写回挂起的那条提问通道。
+    ///
+    /// <paramref name="answers"/> 是**按题序**排列的答案（来源无关），各家由实现落成自己的协议形态：
+    /// Claude → `PermissionRequest` 的 `updatedInput`（见 <see cref="ClaudeHookOutput.AnswerMap"/>），
+    /// opencode → "每题一组 label" 的 answers 数组（见 <see cref="OpenCodeHookOutput.Answers"/>）。
+    ///
+    /// <paramref name="rawToolInput"/> 只有 Claude 用得上（它是"改写工具入参"，回填必须整份带回原始
+    /// `tool_input`，只塞答案会把问题本身抹掉）；opencode 按 requestID 定位，传 null 即可。
     /// </summary>
-    bool ResolveAnswer(string sessionID, string rawToolInput, string answer);
+    bool ResolveQuestion(string sessionID, string? rawToolInput, IReadOnlyList<QuestionAnswer> answers);
+}
 
-    /// <summary>多题攒齐后一次性回填（"问题全文 → 答案"整张表）。见 <see cref="ClaudeHookOutput.AnswerMap"/>。</summary>
-    bool ResolveAnswers(string sessionID, string rawToolInput, IReadOnlyDictionary<string, string> answers);
+/// <summary>
+/// 一道题的答案：点了选项 → <see cref="Labels"/>（多选就是多个）；手打自由文本 → <see cref="Text"/>。
+/// 两者可以并存——Claude 自己的多选界面里那个"Other 输入框"就是当成**再选一项**，
+/// 最终答案按 ", " 一并拼进 `answers[问题全文]`（见 <see cref="Entries"/>）。
+/// </summary>
+public sealed record QuestionAnswer(string Question, IReadOnlyList<string> Labels, string? Text)
+{
+    /// <summary>这道题最终回给代理的答案项：选中的选项在前，自由文本殿后。</summary>
+    [JsonIgnore]
+    public IReadOnlyList<string> Entries =>
+        Text is { Length: > 0 } text ? [.. Labels, text] : Labels;
 }
 
 public sealed class TaskCatalog
@@ -56,17 +73,32 @@ public sealed class TaskCatalog
     // 在 ~/.claude/sessions 里见过该会话：只有见过才敢用"文件消失"判离线（注册并非所有模式都开）。
     private readonly HashSet<string> _claudeRegistrySeen = new(StringComparer.Ordinal);
     // 提问工具挂起时的**原始 tool_input**：手机上作答要整份回填（只塞答案会把问题抹掉）。
+    // 只有 Claude 需要——opencode 的作答按 requestID 定位，不碰原始入参。
     private readonly Dictionary<string, string> _claudeQuestionInputs = new(StringComparer.Ordinal);
     // 是否有工具正在跑：中间正文只在"没有工具在跑"时进第三行（与 opencode 的 reply 守卫同义）。
     private readonly HashSet<string> _claudeToolActive = new(StringComparer.Ordinal);
+    // 拆好的题（Claude 的 tool_input.questions / opencode 的 properties.questions 同形，共用一个解析器）。
+    private readonly Dictionary<string, List<QuestionItem>> _questionItems = new(StringComparer.Ordinal);
     // 多题提问的逐题推进：桥把 N 题拆成"手机上一次一题"喂给手机（App 照旧渲染单题卡，
-    // 零协议改动），攒齐后再一次性回填 updatedInput.answers。
+    // 零协议改动），攒齐后再一次性回填。**两家共用**（2026-10-12）：opencode 的题同样能一次带多道，
+    // 而且"一次一题"才让手机上的选项按钮归属明确。
     // 为什么值得做：手机端协议里 options 是扁平列表，多题无法按题归属；而"拆轮提问"只存在于
     // 对话上下文里——换个 session 就没人记得了，只有写在桥里才是稳定的。
-    private readonly Dictionary<string, ClaudeQuestionProgress> _claudeQuestionProgress = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, QuestionProgress> _questionProgress = new(StringComparer.Ordinal);
 
-    /// <summary>逐题推进状态：当前第几题 + 已收集的答案（问题全文 → 答案）。</summary>
-    private sealed record ClaudeQuestionProgress(int Index, Dictionary<string, string> Answers);
+    /// <summary>逐题推进状态：当前第几题 + 已收集的答案（按题序）。</summary>
+    private sealed record QuestionProgress(int Index, List<QuestionAnswer> Answers);
+
+    /// <summary>
+    /// 拆好的一道题：全文 / 短标签（header 优先）/ 纯 label / 带注解的显示文本 / 可否多选。
+    /// 显示文本是 `label（注解）`，用于画按钮；纯 label 用于把回传值还原成答案，两套必须分开。
+    /// </summary>
+    private sealed record QuestionItem(
+        string Text,
+        string Short,
+        List<string> Labels,
+        List<string> Display,
+        bool MultiSelect);
 
     // 权限卡是"谁"挂的：父级询问存空串，子代理询问存 agent_id。
     // 撤销必须认来源——子代理的卡挂在父任务上，若用"任意事件就撤"会误撤父级/别的子代理正在等的卡。
@@ -204,16 +236,19 @@ public sealed class TaskCatalog
                 // 提问工具的权限询问 = 提问本身：挂"问题"卡片（带选项），不挂审批卡片。
                 // 作答要整份回填原始入参；拿不到原始入参就没有作答通道（收回 Answer 能力位，
                 // 免得 App 画出一个发不出去的输入框）。
-                if (hook.ToolInput?.GetRawText() is { Length: > 0 } rawInput)
+                if (hook.ToolInput?.GetRawText() is { Length: > 0 } rawInput &&
+                    ParseQuestions(hook.ToolInput) is { Count: > 0 } items)
                 {
                     _claudeQuestionInputs[hook.SessionID] = rawInput;
-                    _claudeQuestionProgress.Remove(hook.SessionID);   // 新一次提问，进度从头算
-                    PresentClaudeQuestion(hook.SessionID);            // 单题=整题；多题=先呈现第 1 题
+                    _questionItems[hook.SessionID] = items;
+                    _questionProgress.Remove(hook.SessionID);   // 新一次提问，进度从头算
+                    PresentQuestion(hook.SessionID);            // 单题=整题；多题=先呈现第 1 题
                 }
                 else
                 {
                     _claudeQuestionInputs.Remove(hook.SessionID);
-                    _claudeQuestionProgress.Remove(hook.SessionID);
+                    _questionItems.Remove(hook.SessionID);
+                    _questionProgress.Remove(hook.SessionID);
                     _requests[hook.SessionID] = new(
                         hook.SessionID,
                         PendingRequestKind.Question,
@@ -307,74 +342,86 @@ public sealed class TaskCatalog
         _requests.Remove(sessionID);
         _claudeApprovalSource.Remove(sessionID);
         _claudeQuestionInputs.Remove(sessionID);
-        _claudeQuestionProgress.Remove(sessionID);
+        _questionItems.Remove(sessionID);
+        _questionProgress.Remove(sessionID);
     }
 
     /// <summary>
-    /// 从原始 tool_input 里读出各题：全文 / 短标签（header 优先）/ 选项（**纯 label** 与**显示文本**两套）。
-    /// 显示文本是 `label（注解）`，用于画按钮；纯 label 用于把回传值还原成答案，两套必须分开。
+    /// 拆题。**Claude 与 opencode 共用同一个解析器**（2026-10-12）——两家的题本来就同形：
+    /// `questions[].{ question, header, options }`，差别只有两处，这里都吃：
+    ///   · 选项：Claude 是 `{label, description}` 对象，opencode 是裸 label 字符串；
+    ///   · 多选标志：Claude 叫 `multiSelect`，opencode 叫 `multiple`。
+    /// 注解跟着按钮走（`label（注解）`），所以纯 label 与显示文本两套必须分开存。
     /// </summary>
-    private static List<(string Text, string Short, List<string> Labels, List<string> Display)> RawQuestions(string rawInput)
+    private static List<QuestionItem> ParseQuestions(JsonElement? source)
     {
-        var result = new List<(string, string, List<string>, List<string>)>();
-        try
-        {
-            if (JsonNode.Parse(rawInput) is not JsonObject root || root["questions"] is not JsonArray questions)
-                return result;
-            foreach (var node in questions)
-            {
-                if (node is not JsonObject question) continue;
-                var header = NodeText(question, "header");
-                var text = NodeText(question, "question") ?? header;
-                if (string.IsNullOrWhiteSpace(text)) continue;
+        var result = new List<QuestionItem>();
+        if (source is not { ValueKind: JsonValueKind.Object } root) return result;
+        if (!root.TryGetProperty("questions", out var questions) || questions.ValueKind != JsonValueKind.Array)
+            return result;
 
-                var labels = new List<string>();
-                var display = new List<string>();
-                if (question["options"] is JsonArray items)
-                    foreach (var item in items)
-                    {
-                        if (item is not JsonObject option) continue;
-                        if (NodeText(option, "label") is not { Length: > 0 } label) continue;
-                        labels.Add(label);
-                        display.Add(ClaudeEventReducer.OptionDisplayText(label, NodeText(option, "description")));
-                    }
-
-                result.Add((text, string.IsNullOrWhiteSpace(header) ? text : header, labels, display));
-            }
-        }
-        catch
+        foreach (var question in questions.EnumerateArray())
         {
-            // 原始入参不可解析：当作"没有题"，调用方退回旧行为。
+            if (question.ValueKind != JsonValueKind.Object) continue;
+            var header = Text(question, "header");
+            var text = Text(question, "question") ?? header;
+            if (string.IsNullOrWhiteSpace(text)) continue;
+
+            var labels = new List<string>();
+            var display = new List<string>();
+            if (question.TryGetProperty("options", out var options) && options.ValueKind == JsonValueKind.Array)
+                foreach (var option in options.EnumerateArray())
+                {
+                    var label = option.ValueKind == JsonValueKind.String
+                        ? option.GetString()                                     // opencode：裸 label
+                        : Text(option, "label");                                 // Claude：{label, description}
+                    if (string.IsNullOrWhiteSpace(label)) continue;
+                    labels.Add(label);
+                    display.Add(ClaudeEventReducer.OptionDisplayText(
+                        label, option.ValueKind == JsonValueKind.Object ? Text(option, "description") : null));
+                }
+
+            result.Add(new QuestionItem(
+                text,
+                string.IsNullOrWhiteSpace(header) ? text : header,
+                labels,
+                display,
+                Bool(question, "multiSelect") || Bool(question, "multiple")));
         }
         return result;
     }
 
-    private static string? NodeText(JsonNode? node, string name) =>
-        node?[name] is JsonValue value && value.TryGetValue<string>(out var text) ? text : null;
+    private static bool Bool(JsonElement element, string name) =>
+        element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.True;
+
+    private static string? Text(JsonElement element, string name) =>
+        element.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
 
     /// <summary>
     /// 建/推进提问卡片。多题时**只呈现当前这一题**（题目 + 它自己的选项），App 照旧渲染单题那张卡
-    /// —— 于是多题在手机上变成"一次一题、每题都能点"，而协议一个字都不用改。
+    /// —— 于是多题在手机上变成"一次一题、每题都能点"，零协议改动。
     /// 单题就是"只有一题"的退化情形，行为与以前完全一致。
+    /// 卡片上的 `MultiSelect` 只描述**当前这一题**：多选由 App 画成可反复点选的开关。
     /// </summary>
-    private void PresentClaudeQuestion(string sessionID)
+    private void PresentQuestion(string sessionID)
     {
-        if (!_claudeQuestionInputs.TryGetValue(sessionID, out var raw)) return;
-        var questions = RawQuestions(raw);
-        if (questions.Count == 0) return;
+        if (!_questionItems.TryGetValue(sessionID, out var items) || items.Count == 0) return;
 
-        var progress = _claudeQuestionProgress.TryGetValue(sessionID, out var current) && current.Index < questions.Count
+        var progress = _questionProgress.TryGetValue(sessionID, out var current) && current.Index < items.Count
             ? current
-            : new ClaudeQuestionProgress(0, new Dictionary<string, string>(StringComparer.Ordinal));
-        _claudeQuestionProgress[sessionID] = progress;
+            : new QuestionProgress(0, []);
+        _questionProgress[sessionID] = progress;
 
-        var (text, shortText, _, display) = questions[progress.Index];
-        var prefix = questions.Count > 1 ? $"第 {progress.Index + 1}/{questions.Count} 题： " : string.Empty;
-        _requests[sessionID] = new(sessionID, PendingRequestKind.Question, prefix + text, display);
+        var item = items[progress.Index];
+        var prefix = items.Count > 1 ? $"第 {progress.Index + 1}/{items.Count} 题： " : string.Empty;
+        _requests[sessionID] = new(
+            sessionID, PendingRequestKind.Question, prefix + item.Text, item.Display, item.MultiSelect);
 
         // 多题时第三行跟着"当前这一题"走；单题保持 reducer 给的短标签（行为不变）。
-        if (questions.Count > 1 && _tasks.FirstOrDefault(candidate => candidate.Id == sessionID) is { } task)
-            Upsert(task with { LatestStep = $"第 {progress.Index + 1}/{questions.Count} 题： {shortText}" });
+        if (items.Count > 1 && _tasks.FirstOrDefault(candidate => candidate.Id == sessionID) is { } task)
+            Upsert(task with { LatestStep = $"{prefix}{item.Short}" });
     }
 
     /// <summary>
@@ -395,19 +442,22 @@ public sealed class TaskCatalog
             // 卡片类型必须跟着走：按审批处理的话，手机上会出现用不了的允许/拒绝按钮，
             // 而且问题文本会被换成工具名——父亲级踩过同一个坑，子代理这边一样。
             var isQuestion = ClaudeEventReducer.IsQuestionTool(hook.ToolName);
-            if (isQuestion && hook.ToolInput?.GetRawText() is { Length: > 0 } rawInput)
+            var subagentItems = isQuestion ? ParseQuestions(hook.ToolInput) : [];
+            if (isQuestion && hook.ToolInput?.GetRawText() is { Length: > 0 } rawInput && subagentItems.Count > 0)
             {
                 _claudeQuestionInputs[parent.Id] = rawInput;
-                _claudeQuestionProgress.Remove(parent.Id);
+                _questionItems[parent.Id] = subagentItems;
+                _questionProgress.Remove(parent.Id);
             }
             else
             {
                 _claudeQuestionInputs.Remove(parent.Id);
-                _claudeQuestionProgress.Remove(parent.Id);
+                _questionItems.Remove(parent.Id);
+                _questionProgress.Remove(parent.Id);
             }
 
             if (isQuestion && _claudeQuestionInputs.ContainsKey(parent.Id))
-                PresentClaudeQuestion(parent.Id);   // 子代理的多题同样逐题推进
+                PresentQuestion(parent.Id);   // 子代理的多题同样逐题推进
             else
                 _requests[parent.Id] = new(
                     parent.Id,
@@ -601,15 +651,28 @@ public sealed class TaskCatalog
                     OpenCodeEventReducer.PermissionSummary(hook.Properties),
                     []);
                 break;
-            // 挂住等手机的提问：只有"我们攥着回话通道"时才给作答能力位 ——
-            // 否则手机上会画出一个发不出去的输入框（Claude 侧踩过同一个坑）。
+            // 挂住等手机的提问（插件 v16 起）：与 Claude 同一套——桥攥着回话通道，手机上作答，
+            // 桥把答案回给插件，插件再用 opencode 自己的接口答复（`POST /question/{requestID}/reply`）。
+            //
+            // 只有"攥着回话通道"时才给作答能力位 —— 否则手机上会画出一个发不出去的输入框
+            // （Claude 侧踩过同一个坑）。题拆不动（插件没带 questions）时同样只挂卡不给按钮。
             case "question.asked" when hook.Hold is { Length: > 0 }:
-                _requests[sessionID] = new(
-                    sessionID,
-                    PendingRequestKind.Question,
-                    OpenCodeEventReducer.QuestionText(hook.Properties),
-                    OpenCodeEventReducer.QuestionOptions(hook.Properties));
-                Upsert(_tasks.First(task => task.Id == sessionID) with { Capabilities = [TaskCapability.Answer] });
+                if (ParseQuestions(hook.Properties) is { Count: > 0 } openCodeItems)
+                {
+                    _questionItems[sessionID] = openCodeItems;
+                    _questionProgress.Remove(sessionID);   // 新一次提问，进度从头算
+                    PresentQuestion(sessionID);
+                    Upsert(_tasks.First(task => task.Id == sessionID) with { Capabilities = [TaskCapability.Answer] });
+                }
+                else
+                {
+                    _requests[sessionID] = new(
+                        sessionID,
+                        PendingRequestKind.Question,
+                        OpenCodeEventReducer.QuestionText(hook.Properties),
+                        OpenCodeEventReducer.QuestionOptions(hook.Properties));
+                    Upsert(_tasks.First(task => task.Id == sessionID) with { Capabilities = [] });
+                }
                 break;
             case "question.asked":
                 _requests[sessionID] = new(
@@ -1459,56 +1522,65 @@ public sealed class TaskCatalog
         {
             case ControlAction.Answer:
                 {
-                    // 手机作答：把文本当作 PermissionRequest 的 updatedInput 回给 Claude
-                    // （提问工具会把入参里的答案原样当成工具结果，见 notes §八）。
+                    // 手机作答：把答案回给挂住的那条提问通道，由 resolver 按来源落成各家协议
+                    // （Claude → PermissionRequest 的 updatedInput；opencode → answers 数组）。
                     if (!task.Capabilities.Contains(TaskCapability.Answer) ||
                         !_requests.TryGetValue(task.Id, out var question) ||
                         question.Kind != PendingRequestKind.Question)
                         return new(requestID, ControlResult.Unsupported, "当前任务不能处理该作答");
-                    if (string.IsNullOrWhiteSpace(control.Value))
-                        return new(requestID, ControlResult.Unsupported, "作答内容为空");
-                    if (!_claudeQuestionInputs.TryGetValue(task.Id, out var rawToolInput))
+                    if (!_questionItems.TryGetValue(task.Id, out var questions) || questions.Count == 0)
                         return new(requestID, ControlResult.Rejected, "Hook 作答通道已失效");
 
-                    var questions = RawQuestions(rawToolInput);
-                    var progress = _claudeQuestionProgress.TryGetValue(task.Id, out var current) && current.Index < questions.Count
+                    var progress = _questionProgress.TryGetValue(task.Id, out var current) && current.Index < questions.Count
                         ? current
-                        : new ClaudeQuestionProgress(0, new Dictionary<string, string>(StringComparer.Ordinal));
+                        : new QuestionProgress(0, []);
+                    var item = questions[progress.Index];
 
-                    // 单题：维持"点选项→answers / 打字→response"的老行为（response 的语义是
-                    // "用户手打的自由文本"，别把它降级成 answers 里的一项）。
-                    if (questions.Count <= 1)
+                    // 多选题走 `Values`（点选出来的多项），单选与自由文本走 `Value`；两者可并存
+                    // ——打字内容算"再选一项"（Claude 自己的多选界面就是这么算的）。
+                    // 回传的是按钮上的显示文本（`label（注解）`），记账前要还原成纯 label。
+                    var typed = control.Value?.Trim();
+                    var picked = new List<string>();
+                    foreach (var value in control.Values is { Count: > 0 } values ? values : [])
+                        if (item.Labels.Contains(ClaudeHookOutput.NormalizeOptionLabel(value, item.Labels)))
+                            picked.Add(ClaudeHookOutput.NormalizeOptionLabel(value, item.Labels));
+
+                    // 单选：`Value` 既可能是点的那个选项（显示文本），也可能是打的话——命中才算点选。
+                    if (picked.Count == 0 && !string.IsNullOrEmpty(typed))
                     {
-                        if (!resolver.ResolveAnswer(task.Id, rawToolInput, control.Value!))
-                            return new(requestID, ControlResult.Rejected, "Hook 作答通道已失效");
-                    }
-                    else
-                    {
-                        // 多题：先记账，攒齐了再一次性回填（工具层的 answers 本来就是"问题全文 → 答案"的 map）。
-                        // 回传的是按钮上的显示文本（`label（注解）`），记进答案前要还原成纯 label。
-                        var answers = new Dictionary<string, string>(progress.Answers, StringComparer.Ordinal)
+                        var asLabel = ClaudeHookOutput.NormalizeOptionLabel(typed, item.Labels);
+                        if (item.Labels.Contains(asLabel))
                         {
-                            [questions[progress.Index].Text] =
-                                ClaudeHookOutput.NormalizeOptionLabel(control.Value!, questions[progress.Index].Labels),
-                        };
-                        if (progress.Index + 1 < questions.Count)
-                        {
-                            // 还有下一题：推进卡片并留在等待态——**不写回 hook**，等攒齐。
-                            _claudeQuestionProgress[task.Id] = progress with { Index = progress.Index + 1, Answers = answers };
-                            PresentClaudeQuestion(task.Id);
-                            Upsert(_tasks.First(candidate => candidate.Id == task.Id) with
-                            {
-                                Lifecycle = AgentLifecycle.WaitingAnswer,
-                                Activity = AgentActivity.Thinking,
-                                CompletedAt = null,
-                                UpdatedAt = DateTimeOffset.UtcNow,
-                            });
-                            Changed();
-                            return new(requestID, ControlResult.Accepted, null);
+                            picked.Add(asLabel);
+                            typed = null;   // 它就是那个选项，别再当自由文本重复记一遍
                         }
-                        if (!resolver.ResolveAnswers(task.Id, rawToolInput, answers))
-                            return new(requestID, ControlResult.Rejected, "Hook 作答通道已失效");
                     }
+                    if (picked.Count == 0 && string.IsNullOrEmpty(typed))
+                        return new(requestID, ControlResult.Unsupported, "作答内容为空");
+
+                    var answer = new QuestionAnswer(
+                        item.Text, picked, string.IsNullOrEmpty(typed) ? null : typed);
+
+                    var answers = new List<QuestionAnswer>(progress.Answers) { answer };
+                    if (progress.Index + 1 < questions.Count)
+                    {
+                        // 还有下一题：推进卡片并留在等待态——**不写回通道**，等攒齐。
+                        _questionProgress[task.Id] = new QuestionProgress(progress.Index + 1, answers);
+                        PresentQuestion(task.Id);
+                        Upsert(_tasks.First(candidate => candidate.Id == task.Id) with
+                        {
+                            Lifecycle = AgentLifecycle.WaitingAnswer,
+                            Activity = AgentActivity.Thinking,
+                            CompletedAt = null,
+                            UpdatedAt = DateTimeOffset.UtcNow,
+                        });
+                        Changed();
+                        return new(requestID, ControlResult.Accepted, null);
+                    }
+
+                    var rawToolInput = _claudeQuestionInputs.GetValueOrDefault(task.Id);
+                    if (!resolver.ResolveQuestion(task.Id, rawToolInput, answers))
+                        return new(requestID, ControlResult.Rejected, "Hook 作答通道已失效");
 
                     DropClaudeRequest(task.Id);
                     var answeredAt = DateTimeOffset.UtcNow;
@@ -1758,7 +1830,8 @@ public sealed class TaskCatalog
         PruneSessionMap(_claudeTranscripts, live);
         PruneSessionMap(_claudeTranscriptMtimes, live);
         PruneSessionMap(_claudeQuestionInputs, live);
-        PruneSessionMap(_claudeQuestionProgress, live);
+        PruneSessionMap(_questionItems, live);
+        PruneSessionMap(_questionProgress, live);
         PruneSessionMap(_claudeApprovalSource, live);
         PruneSessionMap(_claudePreviewRecheck, live);
         PruneSessionMap(_requests, live);
@@ -2804,13 +2877,25 @@ public static class OpenCodeEventReducer
         return null;
     }
 
+    /// <summary>
+    /// 降级路径（插件没挂住、只有一张说明卡）用的选项列表：把各题的选项拍平。
+    /// 选项可能是裸 label（插件 v15 及以前）或 `{label, description}`（v16 起），两种都吃。
+    /// </summary>
     public static List<string> QuestionOptions(JsonElement? properties)
     {
         var result = new List<string>();
         if (properties is not { } value) return result;
         if (!value.TryGetProperty("questions", out var questions) || questions.ValueKind != JsonValueKind.Array)
             return result;
-        foreach (var item in questions.EnumerateArray()) result.AddRange(StringArray(item, "options"));
+        foreach (var item in questions.EnumerateArray())
+        {
+            if (!item.TryGetProperty("options", out var options) || options.ValueKind != JsonValueKind.Array) continue;
+            foreach (var option in options.EnumerateArray())
+            {
+                var label = option.ValueKind == JsonValueKind.String ? option.GetString() : Text(option, "label");
+                if (!string.IsNullOrWhiteSpace(label)) result.Add(label);
+            }
+        }
         return result.Take(16).ToList();
     }
 

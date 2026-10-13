@@ -139,6 +139,27 @@ class PhoneSessionTest {
     }
 
     @Test
+    fun `多选题作答把选中的选项随控制一起发出去`() = runTest {
+        val fixture = connectedFixture()
+
+        fixture.session.control(
+            taskID = "task-1",
+            action = ControlAction.ANSWER,
+            value = null,
+            values = listOf("A（甲）", "B（乙）"),
+        )
+        val envelope = json.decodeFromString<SignedControlEnvelope>(
+            fixture.transport.sentTexts.single(),
+        )
+
+        assertEquals(listOf("A（甲）", "B（乙）"), envelope.payload.values)
+        assertEquals(null, envelope.payload.value)
+        // 签名覆盖了 values：改一个选项，签名就变
+        assertEquals(ControlSigner.sign(envelope.copy(signature = ""), SECRET), envelope.signature)
+        fixture.close()
+    }
+
+    @Test
     fun `发送失败仍烧掉序号且下次请求严格递增`() = runTest {
         val fixture = connectedFixture()
         fixture.transport.sendAccepted = false

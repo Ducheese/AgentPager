@@ -23,7 +23,9 @@ function check(condition, name) {
 
 const received = []
 // hold 帧（插件挂住等手机的那种）由假桥回一行 JSON；普通帧回裸换行（即发即走）。
+// 审批回 `{decision}`、提问回 `{answers}`——与真桥的 OpenCodeHookOutput 同一形状。
 let replyDecision = "allow"
+let questionAnswers = [["A"]]
 const holds = () => received.filter((i) => i.payload?.hold)
 const server = net.createServer((socket) => {
   let buffer = ""
@@ -36,7 +38,8 @@ const server = net.createServer((socket) => {
       if (line.trim()) {
         const envelope = JSON.parse(line)
         received.push(envelope)
-        if (envelope.payload?.hold) socket.write(JSON.stringify({ decision: replyDecision }) + "\n")
+        if (envelope.payload?.hold === "question") socket.write(JSON.stringify({ answers: questionAnswers }) + "\n")
+        else if (envelope.payload?.hold) socket.write(JSON.stringify({ decision: replyDecision }) + "\n")
         else socket.write("\n")
       }
     }
@@ -47,10 +50,17 @@ await new Promise((resolve) => server.listen(TEST_PORT, "127.0.0.1", resolve))
 const clientCalls = []
 // 装好的 1.18.35 给插件的是 SDK 生成的那版客户端：方法名 postSessionIdPermissionsPermissionId。
 // （新版封装是 permission.reply —— 插件按"运行时可用的那个"挑，两条路各测一次。）
+const lowLevelCalls = []
 const fakeClient = {
   postSessionIdPermissionsPermissionId: async (args) => {
     clientCalls.push(args)
     if (process.env.AP_TEST_REPLY_THROWS === "1") throw new Error("模板未替换：/session/{sessionID}/...")
+  },
+  // 1.18.35 的插件 client 上**没有** question 分组（二进制实测：内部类 R7 只有 permission 那个
+  // 扁平方法 + 一堆分组属性），所以作答走它自己的底层请求器——每个生成方法体都是
+  // `this._client.post({url, path, body, headers})`，插件照抄这个调用约定。
+  _client: {
+    post: async (args) => { lowLevelCalls.push(args) },
   },
 }
 const plugin = await AgentPagerOpenCode({ client: fakeClient, directory: "F:/Git/demo" })
@@ -164,12 +174,53 @@ const noteFrame = received.slice(beforeNote).map((i) => i.payload).find((p) => p
 check(typeof noteFrame?.properties?.note === "string" && noteFrame.properties.note.includes("权限回复失败"),
   `a failed reply is reported back through the bridge (got ${JSON.stringify(noteFrame?.properties?.note)})`)
 
+// 5c. 远程作答（v16）：提问事件 → 只发 hold 一帧 → 桥上拿到答案 → 用 opencode 接口回复
+questionAnswers = [["A"], ["C", "E"]]
+const beforeQuestion = received.length
+await emit("question.asked", {
+  sessionID: "ses_t",
+  id: "que_1",
+  questions: [
+    { question: "先选哪个？", header: "第一", options: [{ label: "A", description: "甲" }, { label: "B" }] },
+    { question: "再选哪些？", header: "第二", multiple: true, options: [{ label: "C" }, { label: "D" }, { label: "E" }] },
+  ],
+})
+await flush()
+const questionFrames = received.slice(beforeQuestion).filter((i) => i.payload?.event === "question.asked")
+check(questionFrames.length === 1 && questionFrames[0].payload?.hold === "question",
+  `a question sends exactly one frame, and it is the hold (got ${JSON.stringify(questionFrames.map((i) => i.payload?.hold ?? "plain"))})`)
+check(questionFrames[0].payload?.request_id === "que_1", "the hold carries the request id the reply route needs")
+
+const forwardedQuestions = questionFrames[0].payload.properties.questions
+check(forwardedQuestions.length === 2, `both questions are forwarded (got ${forwardedQuestions.length})`)
+check(forwardedQuestions[0].options[0].label === "A" && forwardedQuestions[0].options[0].description === "甲",
+  `option annotations ride along, same shape as Claude (got ${JSON.stringify(forwardedQuestions[0].options[0])})`)
+check(forwardedQuestions[1].multiple === true, "the per-question multiple flag is forwarded")
+
+check(lowLevelCalls.at(-1)?.url === "/question/{requestID}/reply" &&
+  lowLevelCalls.at(-1)?.path?.requestID === "que_1",
+  `the answer is handed back through the client's own request wrapper (got ${JSON.stringify(lowLevelCalls.at(-1))})`)
+check(JSON.stringify(lowLevelCalls.at(-1)?.body?.answers) === '[["A"],["C","E"]]',
+  `the per-question / per-selection arrays pass through untouched (got ${JSON.stringify(lowLevelCalls.at(-1)?.body)})`)
+
+// 5d. 一层接口都没有时，把可用键报回桥（不猜；真机踩过"点了没反应、却查不到任何痕迹"的亏）
+const beforeNoInterface = received.length
+const bare = await AgentPagerOpenCode({ client: { postSessionIdPermissionsPermissionId: async () => {} } })
+await bare.event({ event: { type: "question.asked", properties: { sessionID: "ses_bare", id: "que_bare", questions: [] } } })
+await flush()
+const bareNote = received.slice(beforeNoInterface).map((i) => i.payload).find((p) => p?.event === "plugin.note")
+check(typeof bareNote?.properties?.note === "string" && bareNote.properties.note.includes("作答接口"),
+  `a missing reply interface is reported back through the bridge (got ${JSON.stringify(bareNote?.properties?.note)})`)
+
 // 6. 子会话的询问不上报、也不挂起
 const beforeChild = holds().length
 await emit("session.created", { info: { id: "ses_child3", parentID: "ses_t", title: "x (@x subagent)" } })
 await emit("permission.asked", { sessionID: "ses_child3", id: "per_child", permission: "bash" })
+await emit("question.asked", { sessionID: "ses_child3", id: "que_child", questions: [{ question: "?" }] })
 await flush()
 check(holds().length === beforeChild, "child session permissions are never held")
+check(!events("question.asked").some((i) => i.payload.properties.sessionID === "ses_child3"),
+  "child session questions are never forwarded")
 
 // 7. dispose 只列自有会话
 await plugin.dispose()

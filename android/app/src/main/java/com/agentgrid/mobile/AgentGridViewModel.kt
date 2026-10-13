@@ -108,9 +108,14 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    fun control(taskID: String, action: ControlAction, value: String? = null) {
+    fun control(
+        taskID: String,
+        action: ControlAction,
+        value: String? = null,
+        values: List<String>? = null,
+    ) {
         viewModelScope.launch {
-            phoneSession.control(taskID, action, value)
+            phoneSession.control(taskID, action, value, values)
         }
     }
 

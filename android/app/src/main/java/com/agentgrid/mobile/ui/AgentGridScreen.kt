@@ -128,7 +128,7 @@ fun AgentGridScreen(
     state: AgentGridUiState,
     onPair: (String) -> Unit,
     onUnpair: () -> Unit,
-    onControl: (String, ControlAction, String?) -> Unit,
+    onControl: (String, ControlAction, String?, List<String>?) -> Unit,
     onFocus: (String) -> Unit,
     onToggleDashboard: () -> Unit,
     onExitTerminal: () -> Unit,
@@ -261,7 +261,7 @@ private fun PairingScreen(
 private fun TaskTerminal(
     state: AgentGridUiState,
     onUnpair: () -> Unit,
-    onControl: (String, ControlAction, String?) -> Unit,
+    onControl: (String, ControlAction, String?, List<String>?) -> Unit,
     onFocus: (String) -> Unit,
     onToggleDashboard: () -> Unit,
     onExitTerminal: () -> Unit,
@@ -405,7 +405,7 @@ private fun TaskTerminal(
                                 val willExpand = expandedTaskID != task.id
                                 expandedTaskID = if (willExpand) task.id else null
                                 if (task.isUnread) {
-                                    onControl(task.id, ControlAction.MARK_READ, null)
+                                    onControl(task.id, ControlAction.MARK_READ, null, null)
                                 }
                                 onFocus(task.id)
                             },
@@ -575,7 +575,7 @@ private fun TaskRow(
     dimmed: Boolean,
     showDivider: Boolean,
     onClick: () -> Unit,
-    onControl: (String, ControlAction, String?) -> Unit,
+    onControl: (String, ControlAction, String?, List<String>?) -> Unit,
 ) {
     val rowAlpha by animateFloatAsState(
         targetValue = if (dimmed) 0.34f else 1f,
@@ -812,7 +812,7 @@ private fun TaskDetails(
     task: TaskSnapshot,
     pending: PendingRequest?,
     showToken: Boolean,
-    onControl: (String, ControlAction, String?) -> Unit,
+    onControl: (String, ControlAction, String?, List<String>?) -> Unit,
 ) {
     var answer by remember(task.id) { mutableStateOf("") }
     Column(
@@ -880,33 +880,65 @@ private fun TaskDetails(
                 ) {
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         PixelButton("允许", AgentGridColors.Green) {
-                            onControl(task.id, ControlAction.APPROVE, null)
+                            onControl(task.id, ControlAction.APPROVE, null, null)
                         }
                         PixelButton("拒绝", AgentGridColors.Red) {
-                            onControl(task.id, ControlAction.DENY, null)
+                            onControl(task.id, ControlAction.DENY, null, null)
                         }
                     }
                 } else if (
                     targetPending?.kind == PendingRequestKind.QUESTION &&
                     TaskCapability.ANSWER in task.capabilities
                 ) {
-                    // 选项按钮：桥端只在**只有一题**时下发选项（多题时 options 为空），
-                    // 所以"有选项"就等于"这道题可以点选"——点一下把 label 原样发回去，
-                    // 桥端识别出来就走结构化 answers（而不是自由文本 response）。
-                    targetPending.options.forEach { option ->
-                        PixelButton(option, AgentGridColors.Cyan) {
-                            onControl(task.id, ControlAction.ANSWER, option)
+                    // 单选题：点一下即作答——把按钮上的文本（`label（注解）`）原样发回去，
+                    // 桥端对表还原成纯 label，走结构化 answers（而不是自由文本 response）。
+                    //
+                    // 多选题（桥端从 Claude 的 multiSelect / opencode 的 multiple 取来）：
+                    // 选项变成可反复点选的开关，攒够了由「发送回答」一次性提交（走 ControlPayload.values）。
+                    // 打字内容两种题都可以带——Claude 那边它算"再选一项"。
+                    if (targetPending.multiSelect) {
+                        var picked by remember(task.id, targetPending.summary) { mutableStateOf(emptyList<String>()) }
+                        targetPending.options.forEach { option ->
+                            val on = option in picked
+                            PixelButton(
+                                if (on) "✓ $option" else option,
+                                if (on) AgentGridColors.Green else AgentGridColors.Cyan,
+                            ) {
+                                picked = if (on) picked - option else picked + option
+                            }
                         }
-                    }
-                    OutlinedTextField(
-                        value = answer,
-                        onValueChange = { answer = it },
-                        modifier = Modifier.fillMaxWidth(),
-                        maxLines = 3,
-                    )
-                    PixelButton("发送回答", AgentGridColors.Yellow) {
-                        if (answer.isNotBlank()) {
-                            onControl(task.id, ControlAction.ANSWER, answer)
+                        OutlinedTextField(
+                            value = answer,
+                            onValueChange = { answer = it },
+                            modifier = Modifier.fillMaxWidth(),
+                            maxLines = 3,
+                        )
+                        PixelButton("发送回答", AgentGridColors.Yellow) {
+                            if (picked.isNotEmpty() || answer.isNotBlank()) {
+                                onControl(
+                                    task.id,
+                                    ControlAction.ANSWER,
+                                    answer.ifBlank { null },
+                                    picked,
+                                )
+                            }
+                        }
+                    } else {
+                        targetPending.options.forEach { option ->
+                            PixelButton(option, AgentGridColors.Cyan) {
+                                onControl(task.id, ControlAction.ANSWER, option, null)
+                            }
+                        }
+                        OutlinedTextField(
+                            value = answer,
+                            onValueChange = { answer = it },
+                            modifier = Modifier.fillMaxWidth(),
+                            maxLines = 3,
+                        )
+                        PixelButton("发送回答", AgentGridColors.Yellow) {
+                            if (answer.isNotBlank()) {
+                                onControl(task.id, ControlAction.ANSWER, answer, null)
+                            }
                         }
                     }
                 }

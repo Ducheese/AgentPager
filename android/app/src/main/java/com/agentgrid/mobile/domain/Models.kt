@@ -238,6 +238,12 @@ data class PendingRequest(
     val kind: PendingRequestKind,
     val summary: String? = null,
     val options: List<String> = emptyList(),
+    /**
+     * 这道题可否多选（桥端取自 Claude 的 `multiSelect` / opencode 的 `multiple`）。
+     * true 时把选项画成可反复点选的开关、由「发送回答」一次性提交；
+     * false 保持老交互——点一下就是作答（自由文本仍走输入框）。
+     */
+    val multiSelect: Boolean = false,
 )
 
 @Serializable
@@ -303,6 +309,11 @@ data class ControlPayload(
     val taskID: String,
     val action: ControlAction,
     val value: String? = null,
+    /**
+     * 多选题的作答：选中的选项文本（按点选顺序）。单选与自由文本仍走 [value]。
+     * **签名串里排在 `value` 之后**，两端必须一起改（见 ControlSigner.canonicalPayload）。
+     */
+    val values: List<String>? = null,
 )
 
 @Serializable

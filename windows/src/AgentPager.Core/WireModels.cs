@@ -106,7 +106,13 @@ public sealed record PendingRequest(
     string TaskID,
     PendingRequestKind Kind,
     string? Summary,
-    List<string> Options);
+    List<string> Options,
+    /// <summary>
+    /// 这道题可否多选（Claude 的 `multiSelect` / opencode 的 `multiple`）。
+    /// true 时 App 把选项画成可反复点选的开关，回传走 `ControlPayload.Values`（多值）；
+    /// false 保持老交互（点一下即作答，回传单值 `Value`）。
+    /// </summary>
+    bool MultiSelect = false);
 
 public sealed record StateSnapshotPayload(
     List<TaskSnapshot> Tasks,
@@ -124,7 +130,12 @@ public sealed record PairingPayload(
 public sealed record ControlPayload(
     string TaskID,
     ControlAction Action,
-    string? Value);
+    string? Value,
+    /// <summary>
+    /// 多选题的作答：选中的选项文本（可多个，按点选顺序）。
+    /// 单选与自由文本仍走 <see cref="Value"/>；两处可以并存（打字内容算附加的一项）。
+    /// </summary>
+    List<string>? Values = null);
 
 public sealed record SignedControlEnvelope(
     int Version,

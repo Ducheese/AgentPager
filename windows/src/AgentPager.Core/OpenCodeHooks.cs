@@ -32,14 +32,22 @@ public static class OpenCodeHookOutput
         Encoding.UTF8.GetBytes($"{{\"decision\":\"{(allow ? "allow" : "deny")}\"}}\n");
 
     /// <summary>
-    /// 作答：opencode 的答复是"每题一个已选 label 数组"（源码 routes/question.ts 原文：
-    /// "User answers in order of questions (each answer is an array of selected labels)"）。
-    /// 现在只走单题单选的形态 → 一个数组包一个 label；多选题以后再扩。
+    /// 作答：opencode 的答复是"**每题一个已选 label 数组**，按题序排列"
+    /// （安装版 1.18.35 的 schema 原文："User answers in order of questions
+    /// (each answer is an array of selected labels)"；路由 `POST /question/{requestID}/reply`）。
+    ///
+    /// 于是多题是外层数组、多选是内层数组——同一个形状，**(题, 选项) 两个维度天然都在**，
+    /// 比 Claude 那套"问题全文 → 逗号拼接的字符串"更直接。
+    /// 自由文本也当一项 label 塞进该题的内层数组（opencode 自己的 TUI 就是这么答自定义输入的）。
     /// </summary>
-    public static byte[] Answers(IReadOnlyList<string> labels)
+    public static byte[] Answers(IReadOnlyList<IReadOnlyList<string>> answers)
     {
-        var array = new JsonArray(labels.Select(label => (JsonNode)JsonValue.Create(label)!).ToArray());
-        var root = new JsonObject { ["answers"] = new JsonArray(array) };
+        var outer = new JsonArray(answers
+            .Select(question => (JsonNode)new JsonArray(question
+                .Select(label => (JsonNode)JsonValue.Create(label)!)
+                .ToArray()))
+            .ToArray());
+        var root = new JsonObject { ["answers"] = outer };
         return Encoding.UTF8.GetBytes(root.ToJsonString() + "\n");
     }
 }

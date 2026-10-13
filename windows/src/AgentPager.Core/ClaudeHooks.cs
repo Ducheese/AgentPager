@@ -113,6 +113,27 @@ public static class ClaudeHookOutput
     }
 
     /// <summary>
+    /// 手机作答的放行回包（桥端只认"这条连接来自 Claude"时调它，落形收在这里方便单测）。
+    ///
+    /// **单题 + 纯自由文本**走 `response`：它的语义就是"用户手打的自由文本"（App 上那个输入框
+    /// 与它一对一），别把它降级成 `answers` 里的一项。
+    /// 其余全部走 `answers` 映射——点选项、多选、多题都是。
+    ///
+    /// **多选用 `", "` 连接**：这是 Claude 自己的格式（`AskUserQuestionOutput.answers` 的文档原文
+    /// "multi-select answers are comma-separated"，二进制里就是 `labels.join(", ")`，读取端再按
+    /// 同一规则拆回去）。
+    /// </summary>
+    public static byte[] QuestionReply(string rawToolInputJson, IReadOnlyList<QuestionAnswer> answers)
+    {
+        if (answers is [{ Labels.Count: 0, Text: { Length: > 0 } text }])
+            return Answer(rawToolInputJson, text);
+
+        var map = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var answer in answers) map[answer.Question] = string.Join(", ", answer.Entries);
+        return AnswerMap(rawToolInputJson, map);
+    }
+
+    /// <summary>
     /// 多题一次性回填：<paramref name="answers"/> 是"问题全文 → 答案"的整张表。
     /// 工具层的 `answers` 本来就是 map（多题各占一个 key），所以这里不需要逐题拆包。
     /// 桥端把多题拆成"手机上一题一屏"逐题收集，攒齐后走这一条。

@@ -41,9 +41,14 @@ public static class ControlSigner
     {
         var action = JsonSerializer.Serialize(WireAction(envelope.Payload.Action), Canonical);
         var task = JsonSerializer.Serialize(envelope.Payload.TaskID, Canonical);
-        var payload = envelope.Payload.Value is null
-            ? $"{{\"action\":{action},\"taskID\":{task}}}"
-            : $"{{\"action\":{action},\"taskID\":{task},\"value\":{JsonSerializer.Serialize(envelope.Payload.Value, Canonical)}}}";
+        var fields = new StringBuilder($"{{\"action\":{action},\"taskID\":{task}");
+        if (envelope.Payload.Value is not null)
+            fields.Append($",\"value\":{JsonSerializer.Serialize(envelope.Payload.Value, Canonical)}");
+        // 多选题的作答（2026-10-12 加）：**排在最末**，与 App 端 ControlSigner.canonicalPayload
+        // 的拼接顺序逐字对齐——顺序一变签名就废，两端必须一起改。
+        if (envelope.Payload.Values is { Count: > 0 } values)
+            fields.Append($",\"values\":{JsonSerializer.Serialize(values, Canonical)}");
+        var payload = fields.Append('}').ToString();
         var text = string.Join('\n',
             envelope.Version.ToString(),
             envelope.MessageId.ToString().ToLowerInvariant(),

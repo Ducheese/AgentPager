@@ -89,6 +89,13 @@
     → **验证**：插件测试 8 条（**一次权限只发一帧且必是 hold** ✓ allow→`response=once` / deny→`response=reject` ✓ **两个 path 键都发** ✓ **回复失败会发 plugin.note** ✓ 子会话不上报不挂起 ✓）；Core 断言 10 条（能力位有/无 hold 两态、**只升不降**、提问两态、回包字节形状、新载荷字段）。真机侧：合成 hold 帧在手机上确认过**卡片 + 可用按钮** ✓。
     → **待真机确认**：① 手机上出现"允许/拒绝"并能真的放行 ✓ ② **opencode 自己的 TUI 会不会因此不再弹它自己的对话框**（这条决定了手机审批能否真正替掉终端 ✗）。
 
+11. **2026-10-12 opencode 远程作答打通（插件 v16 + 桥 v74）**：提问也能在手机上答，节奏与审批完全一致（事件回调里 `void holdQuestion(...)` 游离地另挂一条连接 → 桥攥住 → 手机作答 → 桥回 `{"answers":[[...],...]}` → 插件**用 opencode 自己的接口**答复）。三点值得记：
+    → **答复形状天然吃多选与多题**：`POST /question/{requestID}/reply` 的 body 是 `{answers: string[][]}`——**内层 = 该题选中的 label，外层 = 题序**（安装版 1.18.35 的 schema 原文："User answers in order of questions (each answer is an array of selected labels)"）。所以桥侧攒齐了**原样转发**，不需要像 Claude 那样把多选拼成字符串 ✓。自由文本也是当一项 label 塞进该题的内层数组（opencode 自己的 TUI 答自定义输入就是这么做的 ✓）。
+    → **坑：插件 client 上根本没有 `question` 分组**。装好的 1.18.35 给插件的客户端是内部类 `R7`（`grep -aoE 'class R7 extends V0\{.{0,3000}' opencode.exe` 直接看得见）——它只有**一个**扁平方法 `postSessionIdPermissionsPermissionId` + 一堆分组属性（`session`/`app`/`tui`/…），**没有 `question`** ✗；`session` 分组里也没有 question 相关方法 ✗（对照：clone 的 HEAD 有 `session.question.reply`，那是**更新的版本**）。**出路是它自己的底层请求器**：`class V0{_client=KW; constructor($){if($?.client)this._client=$.client}}`，而每个生成方法体都是 `($.client ?? this._client).post({url, path, body, headers})` —— 照抄这个调用约定即可：`client._client.post({url:"/question/{requestID}/reply", path:{requestID}, body:{answers}, headers:{"Content-Type":"application/json"}})` ✓。**为什么不用 fetch 打 `input.serverUrl`**：TUI 无独立端口时 SDK 用的是**进程内直连**（`P7({... fetch: async(...N)=>z.Default().app.fetch(...N)})`），外面打不进来 ✗ —— 所以 `_client` 优先，fetch 只作兜底 ✓。
+    → **插件分层降级 + 自诊断**（照抄审批那套）：① `client.question.reply` ② `client.session.question.reply` ③ `client._client.post` ④ `fetch(input.serverUrl)`；全都不成 → `plugin.note` 把 client 上的可用键报回桥 ✓。真机若仍然不动，先看桥日志里那条 note，别猜 ✗。
+    → **选项带上注解**（插件 v16 起）：`{label, description}` 不再是裸 label，桥端画成 `label（注解）`，与 Claude 那条来源**同一形态** ✓（桥侧解析器两家共用：`question.asked` 的 `questions` 与 Claude `tool_input.questions` 同形，差别只有"选项是裸字符串还是对象"与"多选标志叫 `multiple` 还是 `multiSelect`"，两种都吃 ✓）。多题同样是**一次一题**推进（与 Claude 同一套）✓。
+    → **待真机确认**：① 手机上作答后 opencode **自己的 TUI 对话框会不会关掉**（与审批那条同一个悬而未决的问题）；② 桥攥住的那条 hold 超时 10 分钟与本地对话框的关系。
+
 ## 六、一句话的验收模板（交付时照抄）
 
 > 产物：bridge `dist\opencode-main-baseline-vN\AgentPagerBridge.exe`；插件 vN（需要的话给"待更新"提示）；APK 已拷 `…\AgentPager-debug.apk`（SHA 一致）。
