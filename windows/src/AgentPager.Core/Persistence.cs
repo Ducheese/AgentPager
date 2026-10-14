@@ -15,12 +15,20 @@ public sealed class TaskSnapshotPersistence(string? filePath = null)
 {
     private readonly string _filePath = filePath ?? AgentPagerPaths.TasksFile;
 
+    /// <summary>
+    /// 读回上次的行。**非终态的行一律丢弃**（用户裁定，2026-10-14）：
+    /// 重启意味着所有挂住的 hook 连接都没了，那些还写着 `running` 的行不可能再收到事件，
+    /// 只会变成永远点不动的僵尸（实测三种来源：终端里按 Esc 打断、桥被关掉后该会话再无事件、
+    /// headless 探针进程结束时没有 `Stop`）——宁可不要，也不要留着。
+    /// **终态行（succeeded/interrupted/offline）保留**：那是历史，清空会让 app 每次重启都变白板。
+    /// </summary>
     public List<TaskSnapshot> Load()
     {
         try
         {
             if (!File.Exists(_filePath)) return [];
-            return JsonSerializer.Deserialize<List<TaskSnapshot>>(File.ReadAllText(_filePath), WireJson.Options) ?? [];
+            var tasks = JsonSerializer.Deserialize<List<TaskSnapshot>>(File.ReadAllText(_filePath), WireJson.Options) ?? [];
+            return tasks.Where(task => task.IsTerminal).ToList();
         }
         catch { return []; }
     }

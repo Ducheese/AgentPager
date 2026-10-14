@@ -1425,13 +1425,26 @@ public sealed class TaskCatalog
     }
 
     /// <summary>
-    /// 静默离线兜底（agy 与 opencode 共用同一口径，2026-10-11 统一）。
+    /// 静默离线兜底（agy 与 opencode 共用同一口径）。
     ///
     /// 为什么需要：两家的"会话结束"信号都不牢靠——agy 只在自己的 `Stop` 里收场（进程被强杀就没有），
     /// opencode 只有 `plugin.dispose` / `session.deleted`（插件没跑或进程被强杀同样没有）。
     /// 没有这条兜底，那条 running 行会**永远**留着：容量裁剪只挑终态任务（`Normalize`），
-    /// 非终态连裁都裁不掉。判据与实测一致：10 分钟无更新 **且** 活动位为 null/thinking
-    /// （正在跑工具的长任务不算死）。
+    /// 非终态连裁都裁不掉。
+    ///
+    /// **判据就是"10 分钟没有状态更新"**（用户裁定，2026-10-14）：不再按活动位豁免。
+    /// 旧实现要求"活动位为 null/thinking 才算静默"，结果**死在工具中途**的会话被永久豁免——
+    /// 最后一次事件是 `run_command` 的 PreToolUse、随后进程消失（终端按 Esc 打断 / 桥被关 /
+    /// headless 探针结束没有 `Stop`），`Activity` 就永远停在 `executing`，实测三行僵尸挂了一个多小时 ✗。
+    ///
+    /// 唯一的例外：**还在等未终结子代理的父任务**（`task.Subagents` 里有非终态项）。
+    /// agy 的 `invoke_subagent` 是异步的，父任务在子代理回报前一个事件都不会有，
+    /// 用静默时长判它就是误杀（实测踩过：父任务被判离线 → 子代理数组被清 → 那条"父还在等"的断言直接崩）。
+    /// 子代理有自己那套 10/30 分钟收敛（`CheckSubagentSilence`），把它们收干净之后
+    /// 父任务的行会被更新、时钟重新开始走，随后照样收敛。
+    ///
+    /// 代价明知：真有一条跑超 10 分钟且中途不发任何钩子事件的工具，会被判成离线——
+    /// 那种情况下工具结束时的 PostToolUse 也不会把它复活（终态守卫），属于已知取舍。
     /// </summary>
     private bool CheckSilentOffline(DateTimeOffset now)
     {
@@ -1441,8 +1454,22 @@ public sealed class TaskCatalog
             var task = _tasks[i];
             if (task.Source is not (AgentSource.Antigravity or AgentSource.OpenCode)) continue;
             if (task.IsTerminal || task.Lifecycle == AgentLifecycle.Offline) continue;
-            if (now - task.UpdatedAt <= TimeSpan.FromMinutes(10)) continue;
-            if (task.Activity is not (null or AgentActivity.Thinking)) continue;
+            if (task.Subagents.Any(child => !child.IsTerminal)) continue;   // 还在等子代理的父任务不算死
+
+            // 静默判据分两档：空闲态 10 分钟；**工具运行中**给到 30 分钟。
+            // 后者是给长命令留的余地（opencode 那条"跑着工具不算静默"的断言就是为长构建立的），
+            // 但**必须有上限**——死在工具中途的会话活动位永远停在 executing，
+            // 无上限就被永久豁免（实测三行僵尸挂了一个多小时）。
+            var silentLimit = task.Activity is null or AgentActivity.Thinking
+                ? TimeSpan.FromMinutes(10)
+                : TimeSpan.FromMinutes(30);
+            if (now - task.UpdatedAt <= silentLimit) continue;
+
+            // 判死的会话不该再留着可点的卡片（提问/审批都撤掉），否则手机会一直摆着一张点不动的卡。
+            _requests.Remove(task.Id);
+            _questionItems.Remove(task.Id);
+            _questionProgress.Remove(task.Id);
+
             _tasks[i] = task with
             {
                 Lifecycle = AgentLifecycle.Offline,
@@ -1450,6 +1477,7 @@ public sealed class TaskCatalog
                 UpdatedAt = now,
                 CompletedAt = task.CompletedAt ?? now,
                 Subagents = SubagentSweep.Finalize(task.Subagents),
+                Capabilities = [],
             };
             changed = true;
         }

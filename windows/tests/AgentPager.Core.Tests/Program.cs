@@ -554,17 +554,45 @@ Check(agy.Subagents.All(s => s.IsTerminal), "agy: stop cascades subagent finaliz
 agy = AgyEventReducer.Reduce(A("PostToolUse", new { conversationId = "agy_1", toolCall = new { name = "run_command", args = new { CommandLine = "late" } } }), agy, agyInfo, agyNow.AddSeconds(10));
 Check(agy.Lifecycle == AgentLifecycle.Succeeded, "agy: late tool after stop ignored");
 
-// A4: 静默 ≥10 分钟判离线（工具活动中不算静默）
+// A4: 静默 ≥10 分钟判离线。2026-10-14 起**不再豁免"工具活动中"**——
+// 死在工具中途的会话（最后一次事件是 PreToolUse，随后进程消失）活动位永远停在 executing，
+// 旧规则把它永久豁免，实测三条僵尸行挂了一个多小时不收敛。
 var agyCatalog = new TaskCatalog();
 var agyT0 = DateTimeOffset.UtcNow;
 agyCatalog.Accept(A("PreInvocation", new { conversationId = "agy_off", workspacePaths = new[] { @"F:\Git\demo" } }), agyT0);
 agyCatalog.Accept(A("PreToolUse", new { conversationId = "agy_off", toolCall = new { name = "run_command", args = new { CommandLine = "Start-Sleep 1" } } }), agyT0.AddSeconds(1));
 Check(agyCatalog.Projection().Tasks.First(t => t.Id == "agy_off").Lifecycle == AgentLifecycle.Running, "A4: agy task running before timeout");
-agyCatalog.Maintain(agyT0.AddMinutes(11));
-Check(agyCatalog.Projection().Tasks.First(t => t.Id == "agy_off").Lifecycle == AgentLifecycle.Running, "A4: active tool is not silent");
-agyCatalog.Accept(A("PostToolUse", new { conversationId = "agy_off", toolCall = new { name = "run_command", args = new { CommandLine = "x" } } }), agyT0.AddSeconds(2));
-agyCatalog.Maintain(agyT0.AddMinutes(12));
-Check(agyCatalog.Projection().Tasks.First(t => t.Id == "agy_off").Lifecycle == AgentLifecycle.Offline, "A4: silent agy task -> offline after 10min");
+agyCatalog.Maintain(agyT0.AddMinutes(29));
+Check(agyCatalog.Projection().Tasks.First(t => t.Id == "agy_off").Lifecycle == AgentLifecycle.Running,
+    "A4: a tool actually running gets the longer 30 minute grace");
+agyCatalog.Maintain(agyT0.AddMinutes(31));
+Check(agyCatalog.Projection().Tasks.First(t => t.Id == "agy_off").Lifecycle == AgentLifecycle.Offline,
+    "A4: a session stuck mid-tool converges once the 30 minute cap passes");
+
+// 判死的会话不该继续摆着可点的卡片
+var agyCardCatalog = new TaskCatalog();
+agyCardCatalog.Accept(A("PreToolUse", new
+{
+    conversationId = "agy_off_card",
+    toolCall = new { name = "ask_question", args = new { questions = new[] { new { question = "还问吗？", options = new[] { "A", "B" } } } } }
+}), agyT0);
+Check(agyCardCatalog.Projection().PendingRequests.Count == 1, "A4: question card registered before the timeout");
+agyCardCatalog.Maintain(agyT0.AddMinutes(11));
+Check(agyCardCatalog.Projection().PendingRequests.Count == 0, "A4: the dead session's card is dropped with it");
+
+// 重启只认终态行：非终态的一律丢弃（僵尸行不留）
+var restartPath = Path.Combine(Path.GetTempPath(), "ap-verify-tasks-" + Guid.NewGuid().ToString("N") + ".json");
+var restartStore = new TaskSnapshotPersistence(restartPath);
+var restartCatalog = new TaskCatalog();
+restartCatalog.Accept(A("PreInvocation", new { conversationId = "restart_live" }), agyT0);
+restartCatalog.Accept(A("PreInvocation", new { conversationId = "restart_done" }), agyT0);
+restartCatalog.Accept(A("Stop", new { conversationId = "restart_done", terminationReason = "model_stop" }), agyT0.AddSeconds(1));
+Check(restartCatalog.Projection().Tasks.Count == 2, "restart: fixture has one live and one finished row");
+restartStore.Save(restartCatalog.Projection().Tasks);
+var restartLoaded = restartStore.Load();
+Check(restartLoaded.Count == 1 && restartLoaded[0].Id == "restart_done",
+    $"restart: only terminal rows survive a reload (got {restartLoaded.Count}: {string.Join(",", restartLoaded.Select(t => t.Id))})");
+File.Delete(restartPath);
 
 // A5: 转录本读取按事件门控（工具事件跳过，PostInvocation/Stop 读取）
 var agyTp3 = Path.Combine(Path.GetTempPath(), "ap-verify-agy-" + Guid.NewGuid().ToString("N") + ".jsonl");
