@@ -59,7 +59,7 @@
   - **回复态**：正文预览 ≤120 字单行截断，仅在 `Stop`（且本轮无工具调用）写入，回合结束保留；
   - **守卫**：候选文本若原样包含用户当前 Prompt（≥4 字）直接丢弃并保留上一值，杜绝第三行回显第二行。
 - **子代理**：`invoke_subagent` 派发时父任务置 `delegating`；子代理行在真实子会话钩子到达时经父级路由建立（v2 起不再造哈希占位行，遗留占位由前缀清理兜底）。
-- **提问态（`ask_question`）**：触发 `WaitingAnswer` 状态锁与顶部 `QUESTION` 卡片展示，手机端只读，作答在 CLI 完成。
+- **提问态（`ask_question`）**：触发 `WaitingAnswer` 状态锁与顶部 `QUESTION` 卡片展示；**手机可作答**（2026-10-14 起）：卡片走 Claude/opencode 同一套题目机件（选项按钮 / 多选 / 多题逐题推进），脚本 v3 只在这一条 PreToolUse 上挂起连接，作答经 `{"decision":"deny","reason":"…答案…"}` 回给模型（详见 §五 判例 15）。
 - **Windows UTF-8 No-BOM 红线**：Bridge 对 `~/.gemini/config/hooks.json` 进行管理与注入时，必须强制 UTF-8 No-BOM，防止写入 `\ufeff` 导致 Antigravity 的 Go JSON 解析器崩溃。
 
 ---
@@ -72,6 +72,8 @@
 | 全局钩子配置文件 | `~/.gemini/config/hooks.json` | 挂载与调试 Antigravity 生命周期钩子 |
 | 手机同款快照观察器 | `ap-verify-plugin\snapshot-now.mjs` | WS 连 bridge，直接读取手机收到的 `state.snapshot` |
 | 胶水脚本本地单测 | 命令行执行 `node agentpager-antigravity.js PreToolUse` | 模拟管道输入，验证首帧放行与 TCP 组包 |
+| **钩子脚本单测（v3）** | `windows/tests/agy-hook.test.mjs`（`node`） | 假桥驱动脚本五种收场：提问答案原样转出 / 桥撤等待→放行 / 无桥→放行 / **普通工具不等待**（卡死红线回归）/ 非 PreToolUse→`{}` |
+| 项目级 hooks 实验台 | 临时工作区 + `<ws>/.agents/hooks.json` | **项目级 hooks.json 实测生效**，做钩子实验不必碰 `~/.gemini/config/`（2026-10-14 探针法） |
 | Bridge Reducer 隔离测试 | 仓库 `windows/tests/AgentPager.Core.Tests`（`dotnet run`）+ 插件单测 `windows/tests/opencode-plugin.test.mjs`（`node`） | AgyEventReducer / 转录本解析 / opencode 全链断言（2026-10-08 入库） |
 
 ---
@@ -114,6 +116,26 @@
    → **必须带 `!wasQueued`**：排队时 `CheckAgyQueuedPrompts` 已经把排队文本**先写进 `task.UserPrompt`**（转录本此刻还没落盘），于是接单那一下 `isNewPrompt` 会**假阳性**命中 ✗ —— 不带这个守卫就会照旧清零。而 `DetectQueuedPrompt` 带 `Lifecycle == Running` 前提 ✓，所以"上一轮结束后用户才说的话"永远不会被标成排队，那种真新回合仍然照常重置 ✓。
    → **口径对照（三家，2026-10-11 已全部对齐）**：**标准 = 计时只在一轮对话完了之后又重新开始才重置**。opencode 本来就不重置 ✓；agy 现已对齐 ✓（本条 ③）；Claude 也已按同一标准修好（claude-code notes G55：把"曾显示为排队中"的文本记下来，投递时对表摁回同一轮）✓。三家一致 ✓。
    → **探测 agy stream-json 协议的方法**（复用处）：① 事件名不在二进制里成串出现（Go 的 .rodata 无引号包裹），别硬扫；② 直接喂并读回显——**缺 `event` 是致命错，`event` 不认识只是 warning**，所以可以一次喂一堆候选名看哪个不报警：实测 `user_turn`/`prompt`/`user_input`/`user_text`/`input`/`turn` 全被拒，**`user` 命中**。
+
+13. **2026-10-14 agy 提问的答案只能走 `deny` + `reason`（`overwrite` 预填被结构体证伪）**：手机上作答要成立，先要有一条能把答案塞回去的通道。逐条试过：
+
+   **① 探针法本身可复用**：内嵌文档说 hooks.json 放在「customization root（例如 `.agents/hooks.json`）」，实测**项目级确实生效**（hook 的 cwd = 该 hooks.json 所在目录，一次运行被调用 61 次、matcher 分流正确）。所以做实验可以"临时工作区 + 自己那份 hooks.json"，**完全不碰 `~/.gemini/config/`**（用户的 agy 会话同时在跑也不受影响）。
+
+   **② args 层只有三个字段**（`tools.askQuestionEntryArg`）：`{question, options:[string], is_multi_select}`。hook stdin 里 `questions` 是**原生 JSON 数组**——"双重编码字符串"只存在于 agy 自己 transcript 的序列化里，别被它带偏（历史实现照字符串写过一轮，属白工）。`selected_option_ids` / `skipped` / `write_in_response` 只活在 proto 层（`exa.cortex_pb.AskQuestionEntry` 字段 4/5/6），灌进 args 会被 Go 的 json unmarshal **静默丢弃**。
+
+   **③ `overwrite` 预填 = 死路（实测证伪，非猜测）**：探针三次对照——带预填（`selected_option_ids:["A"]` + `skipped:false`）与**不带预填**的空对照，工具结果**逐字节相同**（都是 `A1: User Skipped`）。同时 overwrite 本身确实生效（回包后结果里会出现 `A pre-tool hook changed the arguments of this tool call before it ran. Changed: questions.`），所以不是"没生效"，是**没有字段可写**。另外：把 `questions` 换成字符串会直接把调用打坏（`cannot unmarshal string into Go struct field askQuestionArgs.questions of type []tools.askQuestionEntryArg`），options 换成 `{id,text}` 对象同样报错——**args 层按原样回填才是安全的**。
+
+   **④ 可行通道 = `{"decision":"deny","reason":"…答案…"}`**：内嵌文档原文 `reason` = "Explanation shown to the user/**agent**"；同类通道已被实测证实可达模型（工具报错全文进 transcript 的 `step.error`，模型后续 30+ 步都在引用它）。于是"手机作答"= **终端不再弹框、答案随拒绝理由直接进模型**（`AgyHookOutput.QuestionReply`）。
+
+   **⑤ 未文档化发现（备选，未采用）**：proto 里有 `PostToolHookResult{ string overwrite_result = 1; }`，且实测 `PostToolUse` 对 `ask_question` **确实触发**——理论上能把 `A1: User Skipped` 改写成任意结果文本。但"要跑工具才有 PostToolUse"，救不了"终端不弹框"这一半，故仅备案。
+
+   **⑥ 边界红线（吃过亏）**：脚本 **只对 `ask_question` 挂起**。2026-10-14 曾经把**所有** PreToolUse 都攥住等回包 → agy 在每一把普通工具上被卡死。非提问一律立刻 `{"decision":"allow"}`，一个字节都不多等。
+
+   **⑦ 超时阶梯**：catalog `HoldLimit` 600s < 脚本 `DECISION_TIMEOUT_MS` 660s < hooks.json `PreToolUse.timeout` 720s（钩子超时从 5s 提到 720s，否则作答还没到就把脚本掐了）。
+
+   **⑧ 显示层照抄，不要手搓**：卡片走 Claude/opencode 同一套 `ParseQuestions` → `_questionItems`/`_questionProgress` → `PresentQuestion`（选项按钮 / 多选 / 多题逐题推进）。旧实现手搓"只取第一题文本 + 裸选项"的简版卡，就是"没有选项框、多题失败"的根因。
+
+   **⑨ 没手机连着就不抢提问**（用户裁定，2026-10-14）：`HookTcpServer` 挂住 agy 提问的前提是 `_phoneCount > 0`；没人能作答时回一个空行就关（脚本 v3 见空包即放行），**终端自己弹框作答**。同一判据透到 catalog（`Accept(agy, …, answerable)`）→ 无手机时卡片照旧带题目与选项，但**不给 `Answer` 能力位**（否则手机上那张卡是个点不动的假入口）。注意：这条门只加在 agy 这条新路上，Claude/opencode 的挂起行为未动。
 
 ---
 

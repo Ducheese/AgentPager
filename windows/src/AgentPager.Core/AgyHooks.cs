@@ -380,7 +380,11 @@ public static class AgyEventReducer
     public static TaskSnapshot Reduce(AgyHookPayload hook, TaskSnapshot? existing, DateTimeOffset now) =>
         Reduce(hook, existing, null, now);
 
-    public static TaskSnapshot Reduce(AgyHookPayload hook, TaskSnapshot? existing, AgyConversationSummary? dbInfo, DateTimeOffset now)
+    /// <param name="answerable">
+    /// 这次提问**能不能在手机上作答**（= 桥此刻挂住了这条连接，而桥只在有手机连着时才挂）。
+    /// 没有手机连着就不该抢提问：桥放行、终端自己弹框，卡片也就不该给出作答入口。
+    /// </param>
+    public static TaskSnapshot Reduce(AgyHookPayload hook, TaskSnapshot? existing, AgyConversationSummary? dbInfo, DateTimeOffset now, bool answerable = true)
     {
         var sessionID = hook.SessionID;
         var project = hook.ProjectName;
@@ -501,7 +505,11 @@ public static class AgyEventReducer
                         Lifecycle = AgentLifecycle.WaitingAnswer,
                         Activity = AgentActivity.Thinking,
                         CompletedAt = null,
-                        Capabilities = [],
+                        // 给作答能力：脚本 v3 对**这条调用**挂住连接（其它 PreToolUse 照旧立即放行），
+                        // 手机作答后由 AgyHookOutput.QuestionReply 把答案写进回包的 reason。
+                        // 与 Claude 同一条件（Claude 只在持连接的 PermissionRequest 上给这个位）——
+                        // 且**没有手机连着时不给**：那种情况桥直接放行、终端弹框作答，作答入口是假的。
+                        Capabilities = answerable ? [TaskCapability.Answer] : [],
                     }, question ?? "等待输入与选择");
                 }
 
@@ -847,6 +855,54 @@ public static class AgyEventReducer
     }
 }
 
+/// <summary>
+/// agy 钩子的回包编码。与 <see cref="ClaudeHookOutput"/> 同位：**只有这一层认得出这条连接来自谁**，
+/// 各家的答案形态在此落形。
+///
+/// 提问的答案**不能**用 PreToolUse 的 `overwrite` 写回工具入参（2026-10-14 探针实测证伪）：
+/// args 层（Go 结构 `askQuestionEntryArg`）只有 `Question / Options([]string) / IsMultiSelect`
+/// 三个字段，`selected_option_ids` / `skipped` / `write_in_response` 只活在 proto 层
+/// （`exa.cortex_pb.AskQuestionEntry`）；灌进 args 会被 json unmarshal **静默丢弃**——
+/// 探针里"带预填"的那次与"不带预填"的对照，工具结果逐字节相同（都是 `A1: User Skipped`）。
+/// 唯一畅通的通道是**拒绝 + 理由**：内嵌文档原文 `reason` = "Explanation shown to the user/agent"，
+/// 且同类通道已实测可达模型（工具报错全文进 transcript 的 step.error，模型后续会引用它）。
+/// 于是手机上作答 = 终端不再弹框、答案随 reason 直接进模型。
+/// </summary>
+public static class AgyHookOutput
+{
+    public static byte[] Decision(bool allow) =>
+        Encoding.UTF8.GetBytes($"{{\"decision\":\"{(allow ? "allow" : "deny")}\"}}\n");
+
+    /// <summary>
+    /// 把手机上的作答写成"带答案的拒绝"。
+    /// 题目与**全部选项**一并写进理由：agy 的弹框属于工具自己的 UI，被拒绝就不会渲染，
+    /// 终端那份记录里能留下的只有这段文字——把选项带上，终端才看得到"问了什么、有哪些选项"。
+    /// </summary>
+    public static byte[] QuestionReply(IReadOnlyList<QuestionAnswer> answers)
+    {
+        var body = new StringBuilder();
+        body.Append("用户已在 AgentPager 手机端作答，请直接采用以下答复继续，不要再重复提问：\n");
+        for (var index = 0; index < answers.Count; index++)
+        {
+            var answer = answers[index];
+            body.Append($"Q{index + 1}: {answer.Question}\n");
+            if (answer.Options is { Count: > 0 } choices)
+                body.Append($"选项：{string.Join(" / ", choices)}\n");
+            var entries = answer.Entries is { Count: > 0 } values ? string.Join("、", values) : "（未作答）";
+            body.Append($"A{index + 1}: {entries}\n");
+        }
+
+        // 与 ClaudeHookOutput 同一口径：匿名对象 + 默认序列化器（非 ASCII 走 \uXXXX 转义，
+        // 合法 JSON，agy 侧 Go 的 unmarshal 照常认）。
+        var payload = new
+        {
+            decision = "deny",
+            reason = body.ToString().TrimEnd('\n'),
+        };
+        return Encoding.UTF8.GetBytes(JsonSerializer.Serialize(payload) + "\n");
+    }
+}
+
 public enum AntigravityPluginStatus { NotInstalled, Installed, Outdated }
 
 public sealed class AgyHookConfiguration(string? configDirectory = null)
@@ -952,7 +1008,10 @@ public sealed class AgyHookConfiguration(string? configDirectory = null)
                             {
                                 ["type"] = "command",
                                 ["command"] = $"{hookCommand} PreToolUse",
-                                ["timeout"] = 5,
+                                // 提问要挂到手机作答为止，5 秒不够（原有 5 秒会在作答前把脚本掐掉）。
+                                // 挂长超时不等于会卡 12 分钟：脚本自己保证**非提问一律立刻回 allow**，
+                                // 只有 ask_question 那条才留在等待里；脚本内部还有 HOLD_MS 上限兜底。
+                                ["timeout"] = 720,
                             }
                         }
                     }

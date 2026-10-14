@@ -91,7 +91,10 @@ public sealed class BridgeRuntime : IAsyncDisposable
         try
         {
             _hookServer = new HookTcpServer(
-                envelope => _events.Writer.WriteAsync(new HookEvent(envelope), token).AsTask(), _log);
+                envelope => _events.Writer.WriteAsync(new HookEvent(envelope), token).AsTask(),
+                _log,
+                // "有没有手机连着" —— agy 的提问拦截只在有人能作答时才成立（见 HookTcpServer 的说明）。
+                () => Volatile.Read(ref _phoneCount) > 0);
             _hookServer.Start();
             _lanServer = new(
                 PairingText,
@@ -286,7 +289,7 @@ public sealed class BridgeRuntime : IAsyncDisposable
                             HookEnvelope.Codex codex => HandleCodexHook(codex.Hook),
                             HookEnvelope.Claude claude => AcceptClaudeHook(claude.Hook),
                             HookEnvelope.OpenCode openCode => AcceptOpenCodeHook(openCode.Hook),
-                            HookEnvelope.Antigravity agy => _catalog.Accept(agy.Hook),
+                            HookEnvelope.Antigravity agy => AcceptAgyHook(agy.Hook),
                             _ => false,
                         };
                         break;
@@ -375,6 +378,26 @@ public sealed class BridgeRuntime : IAsyncDisposable
             hook.Event is "permission.replied" or "question.replied" or "question.rejected"
                 or "plugin.dispose" or "session.deleted" or "session.idle" or "session.error")
             _hookServer.Cancel(sessionID);
+        return changed;
+    }
+
+    /// <summary>
+    /// agy 事件统一入口：与 <see cref="AcceptClaudeHook"/> 同一个目的——提问的等待若已以别的方式
+    /// 结束（工具跑完 / 回合结束），那条被脚本 v3 挂住的连接就该放掉，否则脚本会一直吊到
+    /// 它自己的 11 分钟上限。判据只认"等待真的结束了"的事件，不按"这一刻没有挂起项"来判
+    /// （opencode 那里的教训：事件流一密，刚挂上就会被误撤）。
+    /// </summary>
+    private bool AcceptAgyHook(AgyHookPayload hook)
+    {
+        // 提问的作答入口只在"有手机连着"时才给：没有手机时桥并不挂住那条钩子（HookTcpServer
+        // 同一判据），终端会自己弹框作答，此时卡片若还画着作答按钮就是假的。
+        var changed = _catalog.Accept(hook, null, Volatile.Read(ref _phoneCount) > 0);
+        if (_hookServer is not null && _hookServer.HasPending(hook.SessionID))
+        {
+            var isAskQuestion = hook.ToolCall?.Name?.Equals("ask_question", StringComparison.OrdinalIgnoreCase) == true;
+            if (hook.EffectiveEvent == "Stop" || (hook.EffectiveEvent == "PostToolUse" && isAskQuestion))
+                _hookServer.Cancel(hook.SessionID);
+        }
         return changed;
     }
 

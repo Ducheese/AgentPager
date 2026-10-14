@@ -459,6 +459,83 @@ Check(agy.Lifecycle == AgentLifecycle.Running, "agy: ask_question answered -> ru
 agy = AgyEventReducer.Reduce(A("PostToolUse", new { conversationId = "agy_1", toolCall = new { name = "run_command", args = new { CommandLine = "x" } }, error = "boom" }), agy, agyInfo, agyNow.AddSeconds(6));
 Check(agy.LatestStep is not null && agy.LatestStep.StartsWith("✗"), $"agy: tool error -> ✗ step (got '{agy.LatestStep}')");
 
+// ---- agy 远程作答：卡片走共享机件（选项 / 多选 / 多题逐题），答案经 deny+reason 回给模型 ----
+// 依据：2026-10-14 探针实测（overwrite 预填被 Go 的 json unmarshal 静默丢弃、与空对照逐字节相同）。
+var agyAskAt = DateTimeOffset.UtcNow;
+var agyAskCatalog = new TaskCatalog();
+agyAskCatalog.Accept(A("PreToolUse", new
+{
+    conversationId = "agy_ask",
+    workspacePaths = new[] { @"F:\Git\demo" },
+    toolCall = new { name = "ask_question", args = new { questions = new[] { new { question = "选哪个方案？", options = new[] { "A", "B" }, is_multi_select = false } } } }
+}), agyAskAt);
+var agyAskTask = agyAskCatalog.Projection().Tasks.First(t => t.Id == "agy_ask");
+Check(agyAskTask.Lifecycle == AgentLifecycle.WaitingAnswer && agyAskTask.Capabilities.Contains(TaskCapability.Answer),
+    $"agy ask: waitingAnswer + answer capability (got {agyAskTask.Lifecycle}/[{string.Join(",", agyAskTask.Capabilities)}])");
+var agyAskCard = agyAskCatalog.Projection().PendingRequests.First(r => r.TaskID == "agy_ask");
+Check(agyAskCard.Kind == PendingRequestKind.Question && agyAskCard.Summary == "选哪个方案？" &&
+      agyAskCard.Options is ["A", "B"] && !agyAskCard.MultiSelect,
+    $"agy ask: card carries the real options (got '{agyAskCard.Summary}' / [{string.Join(",", agyAskCard.Options)}] / multi={agyAskCard.MultiSelect})");
+
+// 没有手机连着时不抢提问：卡片照旧带题目与选项，但不给作答入口（终端自己弹框，作答入口是假的）
+var agyNoPhoneCatalog = new TaskCatalog();
+agyNoPhoneCatalog.Accept(A("PreToolUse", new
+{
+    conversationId = "agy_ask_nophone",
+    toolCall = new { name = "ask_question", args = new { questions = new[] { new { question = "终端自己问？", options = new[] { "A", "B" }, is_multi_select = false } } } }
+}), agyAskAt, answerable: false);
+var agyNoPhoneTask = agyNoPhoneCatalog.Projection().Tasks.First(t => t.Id == "agy_ask_nophone");
+var agyNoPhoneCard = agyNoPhoneCatalog.Projection().PendingRequests.First(r => r.TaskID == "agy_ask_nophone");
+Check(agyNoPhoneTask.Lifecycle == AgentLifecycle.WaitingAnswer && !agyNoPhoneTask.Capabilities.Contains(TaskCapability.Answer),
+    $"agy ask: no phone -> no answer capability (got {agyNoPhoneTask.Lifecycle}/[{string.Join(",", agyNoPhoneTask.Capabilities)}])");
+Check(agyNoPhoneCard.Summary == "终端自己问？" && agyNoPhoneCard.Options is ["A", "B"],
+    $"agy ask: card keeps question + options when nobody can answer (got '{agyNoPhoneCard.Summary}')");
+
+// 多题：与 Claude/opencode 同一条队列——先呈现第 1 题（带题号前缀），每题各带自己的选项与多选位
+var agyAskMultiCatalog = new TaskCatalog();
+agyAskMultiCatalog.Accept(A("PreToolUse", new
+{
+    conversationId = "agy_ask_multi",
+    toolCall = new
+    {
+        name = "ask_question",
+        args = new
+        {
+            questions = new[]
+            {
+                new { question = "第一题单选？", options = new[] { "A", "B" }, is_multi_select = false },
+                new { question = "第二题多选？", options = new[] { "C", "D" }, is_multi_select = true }
+            }
+        }
+    }
+}), agyAskAt);
+var agyAskMultiCard = agyAskMultiCatalog.Projection().PendingRequests.First(r => r.TaskID == "agy_ask_multi");
+Check(agyAskMultiCard.Summary == "第 1/2 题： 第一题单选？" && agyAskMultiCard.Options is ["A", "B"] && !agyAskMultiCard.MultiSelect,
+    $"agy ask: multi-question shows 1/2 with its own options (got '{agyAskMultiCard.Summary}' / multi={agyAskMultiCard.MultiSelect})");
+
+// 字符串形态的 questions 也认（hook 实测是数组，但 transcript/历史实现写过字符串，两种都得能解析）
+const string agyStringified = """[{"question":"字符串形态？","options":["X","Y"],"is_multi_select":true}]""";
+var agyAskStringCatalog = new TaskCatalog();
+agyAskStringCatalog.Accept(A("PreToolUse", new
+{
+    conversationId = "agy_ask_string",
+    toolCall = new { name = "ask_question", args = new { questions = agyStringified } }
+}), agyAskAt);
+var agyAskStringCard = agyAskStringCatalog.Projection().PendingRequests.First(r => r.TaskID == "agy_ask_string");
+Check(agyAskStringCard.Summary == "字符串形态？" && agyAskStringCard.Options is ["X", "Y"] && agyAskStringCard.MultiSelect,
+    $"agy ask: stringified questions still parse (got '{agyAskStringCard.Summary}' / [{string.Join(",", agyAskStringCard.Options)}] / multi={agyAskStringCard.MultiSelect})");
+
+// 回包：`deny` + `reason` 承载答案（终端不再弹框；reason 是文档里"shown to the user/agent"的那个字段）。
+// 题目与选项一并带上——终端那份记录里能留下的只有这段文字，不带选项终端就只剩"被拒绝了"。
+var agyReplyText = System.Text.Encoding.UTF8.GetString(
+    AgyHookOutput.QuestionReply([new QuestionAnswer("选哪个方案？", ["A"], null, ["A", "B"])]));
+using var agyReplyDoc = JsonDocument.Parse(agyReplyText);
+Check(agyReplyDoc.RootElement.GetProperty("decision").GetString() == "deny" &&
+      agyReplyDoc.RootElement.GetProperty("reason").GetString() is { } reason &&
+      reason.Contains("Q1: 选哪个方案？") && reason.Contains("选项：A / B") &&
+      reason.Contains("A1: A") && reason.Contains("不要再重复提问"),
+    $"agy ask: reply is deny + reason carrying question/options/answer (got '{agyReplyText.Trim()}')");
+
 // 回显守卫：步骤包含当前 prompt（≥4 字）应被丢弃
 agy = agy with { UserPrompt = "帮我看看日志" };
 var agyStepBeforeEcho = agy.LatestStep;
@@ -713,6 +790,24 @@ Check(Claude().Lifecycle == AgentLifecycle.WaitingAnswer &&
       claude.Projection().PendingRequests.First().Kind == PendingRequestKind.Question,
     "claude: question permission request alone enters waitingAnswer");
 claude.Accept(C("PostToolUse", new { tool_name = "AskUserQuestion" }), claudeNow.AddSeconds(54));
+
+// ---- 空闲通知不是提问（用户实测："app 上有个 question …但没人发起过 question"）----
+// idle_prompt 的发射条件是"会话空闲超过阈值"，文案就是 "Claude is waiting for your input"——
+// 它只是终端空着，不是提问；旧实现把它当提问，于是每次空闲都弹一张没有选项的问题卡。
+var idleNotif = new TaskCatalog();
+idleNotif.Accept(C("UserPromptSubmit", new { session_id = "idle_notif", prompt = "跑一下" }), claudeNow);
+idleNotif.Accept(C("Notification", new { session_id = "idle_notif", notification_type = "idle_prompt", message = "Claude is waiting for your input" }), claudeNow.AddSeconds(1));
+TaskSnapshot IdleNotifTask() => idleNotif.Projection().Tasks.First(t => t.Id == "idle_notif");
+Check(idleNotif.Projection().PendingRequests.Count == 0, "claude: idle_prompt registers no question card");
+Check(IdleNotifTask().Lifecycle == AgentLifecycle.Running,
+    $"claude: idle_prompt leaves the lifecycle alone (got {IdleNotifTask().Lifecycle})");
+// 真正的输入弹窗仍旧是问题卡（回归守卫）
+idleNotif.Accept(C("Notification", new { session_id = "idle_notif", notification_type = "elicitation_dialog", message = "Claude Code needs your input" }), claudeNow.AddSeconds(2));
+var elicitationCard = idleNotif.Projection().PendingRequests.FirstOrDefault(r => r.TaskID == "idle_notif");
+Check(elicitationCard is { Kind: PendingRequestKind.Question, Summary: "Claude Code needs your input" },
+    $"claude: elicitation_dialog still gets a question card (got '{elicitationCard?.Summary}')");
+Check(IdleNotifTask().Lifecycle == AgentLifecycle.WaitingAnswer,
+    $"claude: elicitation_dialog enters waitingAnswer (got {IdleNotifTask().Lifecycle})");
 
 // 普通工具的权限询问仍然是审批卡片（回归守卫）
 claude.Accept(C("PermissionRequest", new { tool_name = "Bash", tool_input = new { command = "rm -rf x" } }), claudeNow.AddSeconds(55));

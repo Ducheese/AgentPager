@@ -8,9 +8,16 @@ using AgentPager.Core;
 
 namespace AgentPager.Bridge;
 
-public sealed class HookTcpServer(Func<HookEnvelope, Task> hookHandler, DailyFileLog log)
+public sealed class HookTcpServer(
+    Func<HookEnvelope, Task> hookHandler,
+    DailyFileLog log,
+    Func<bool>? isPhoneConnected = null)
     : ICodexPermissionResolver, IAsyncDisposable
 {
+    // 没有手机连着就别抢提问：agy 的 ask_question 若无人可答，应当放行让终端自己弹框，
+    // 而不是把工具调用攥住到超时（用户裁定，2026-10-14）。其它来源不套这个门（行为不变）。
+    private readonly Func<bool> _isPhoneConnected = isPhoneConnected ?? (() => true);
+
     private readonly ConcurrentDictionary<string, (TcpClient Client, HookSource Source)> _pending = new(StringComparer.Ordinal);
     private TcpListener? _listener;
     private CancellationTokenSource? _cancellation;
@@ -56,9 +63,11 @@ public sealed class HookTcpServer(Func<HookEnvelope, Task> hookHandler, DailyFil
 
     /// <summary>
     /// 作答：与 <see cref="Resolve"/> 同一条待决通道，只是回包换成"带答案的放行"。
-    /// 两家的答案形态不同，**落形在这一层做**（只有它认得出这条连接来自谁）：
+    /// 各家的答案形态不同，**落形在这一层做**（只有它认得出这条连接来自谁）：
     ///   · Claude → 改写 `PermissionRequest` 的 `updatedInput`；
-    ///   · opencode → "每题一组 label"的 answers 数组（插件拿去调它自己的 reply 接口）。
+    ///   · opencode → "每题一组 label"的 answers 数组（插件拿去调它自己的 reply 接口）；
+    ///   · agy → `deny` + `reason`（答案随拒绝理由进模型；`overwrite` 预填已实测证伪，
+    ///     见 <see cref="AgyHookOutput"/>）。
     /// </summary>
     public bool ResolveQuestion(string sessionID, string? rawToolInput, IReadOnlyList<QuestionAnswer> answers)
     {
@@ -80,6 +89,9 @@ public sealed class HookTcpServer(Func<HookEnvelope, Task> hookHandler, DailyFil
                         break;
                     case HookSource.Claude when rawToolInput is { Length: > 0 }:
                         response = ClaudeHookOutput.QuestionReply(rawToolInput, answers);
+                        break;
+                    case HookSource.Antigravity:
+                        response = AgyHookOutput.QuestionReply(answers);
                         break;
                     default:
                         log.Write("WARN", $"[作答] 该来源不支持作答：{entry.Source}");
@@ -150,11 +162,17 @@ public sealed class HookTcpServer(Func<HookEnvelope, Task> hookHandler, DailyFil
             // "要不要挂住这条连接等手机" —— 三家形态不同，意思相同：
             //   · Codex/Claude：权限询问事件（Claude 的提问工具也走这条，回包带 updatedInput）
             //   · opencode：插件显式带 hold 标记的帧（权限询问 v13 起挂住、提问 v16 起也挂住）
+            //   · agy：**只有 ask_question 的 PreToolUse**（脚本 v3 只在这一条上等回包）。
+            //     边界必须写死成提问本身：曾经把"所有 PreToolUse"都攥住，agy 在每一把普通工具上
+            //     被卡住（2026-10-14 实测），因为脚本那时也在等一条永远不会来的回包。
             var isPermission = envelope switch
             {
                 HookEnvelope.Codex codex => codex.Hook.HookEventName == CodexHookEventName.PermissionRequest,
                 HookEnvelope.Claude claude => claude.Hook.HookEventName == "PermissionRequest",
                 HookEnvelope.OpenCode openCode => openCode.Hook.Hold is { Length: > 0 },
+                HookEnvelope.Antigravity agy => agy.Hook.EffectiveEvent == "PreToolUse" &&
+                                                agy.Hook.ToolCall?.Name?.Equals("ask_question", StringComparison.OrdinalIgnoreCase) == true &&
+                                                _isPhoneConnected(),
                 _ => false,
             };
             var sessionID = envelope switch
@@ -173,6 +191,7 @@ public sealed class HookTcpServer(Func<HookEnvelope, Task> hookHandler, DailyFil
                 {
                     HookEnvelope.Claude => HookSource.Claude,
                     HookEnvelope.OpenCode => HookSource.OpenCode,
+                    HookEnvelope.Antigravity => HookSource.Antigravity,
                     _ => HookSource.Codex,
                 };
                 if (_pending.TryGetValue(sessionID, out var previous)) previous.Client.Dispose();

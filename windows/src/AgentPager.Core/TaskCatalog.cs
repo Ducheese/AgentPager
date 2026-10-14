@@ -47,7 +47,16 @@ public interface ICodexPermissionResolver
 /// 两者可以并存——Claude 自己的多选界面里那个"Other 输入框"就是当成**再选一项**，
 /// 最终答案按 ", " 一并拼进 `answers[问题全文]`（见 <see cref="Entries"/>）。
 /// </summary>
-public sealed record QuestionAnswer(string Question, IReadOnlyList<string> Labels, string? Text)
+public sealed record QuestionAnswer(
+    string Question,
+    IReadOnlyList<string> Labels,
+    string? Text,
+    /// <summary>
+    /// 这道题**全部**可选项（带注解的显示文本）。只给"看得见题目本身"的来源用：
+    /// agy 那边终端不渲染题目（答案走拒绝理由回传），把选项一并写进理由，终端至少留得下
+    /// 一份"问了什么、有哪些选项、答了什么"的可读记录。
+    /// </summary>
+    IReadOnlyList<string>? Options = null)
 {
     /// <summary>这道题最终回给代理的答案项：选中的选项在前，自由文本殿后。</summary>
     [JsonIgnore]
@@ -357,8 +366,7 @@ public sealed class TaskCatalog
     {
         var result = new List<QuestionItem>();
         if (source is not { ValueKind: JsonValueKind.Object } root) return result;
-        if (!root.TryGetProperty("questions", out var questions) || questions.ValueKind != JsonValueKind.Array)
-            return result;
+        if (!TryGetQuestionsArray(root, out var questions)) return result;
 
         foreach (var question in questions.EnumerateArray())
         {
@@ -386,9 +394,40 @@ public sealed class TaskCatalog
                 string.IsNullOrWhiteSpace(header) ? text : header,
                 labels,
                 display,
-                Bool(question, "multiSelect") || Bool(question, "multiple")));
+                // 多选位：Claude/opencode 用 multiSelect/multiple；agy 的字段名是 is_multi_select
+                // （`AskQuestionEntry.is_multi_select`，模型面向的 JSON 里原样带 snake_case）。
+                Bool(question, "multiSelect") || Bool(question, "multiple") ||
+                Bool(question, "is_multi_select") || Bool(question, "isMultiSelect")));
         }
         return result;
+    }
+
+    /// <summary>
+    /// 取题目数组的两种形态。Claude / opencode 原样就是数组；agy 的 hook **实测也是数组**
+    /// （2026-10-14 探针抓到 stdin 原文 `"questions":[{"is_multi_select":false,…}]`），
+    /// 只有它自己的 transcript 序列化会把同一份写成字符串——历史实现照字符串写过一轮，
+    /// 所以两种都认，免得对方形态再动一次就整条提问链哑掉。
+    /// </summary>
+    private static bool TryGetQuestionsArray(JsonElement root, out JsonElement questions)
+    {
+        questions = default;
+        if (!root.TryGetProperty("questions", out var prop)) return false;
+        if (prop.ValueKind == JsonValueKind.Array)
+        {
+            questions = prop;
+            return true;
+        }
+        if (prop.ValueKind != JsonValueKind.String) return false;
+        var raw = prop.GetString();
+        if (string.IsNullOrWhiteSpace(raw)) return false;
+        try
+        {
+            var document = JsonDocument.Parse(raw);
+            if (document.RootElement.ValueKind != JsonValueKind.Array) return false;
+            questions = document.RootElement.Clone();
+            return true;
+        }
+        catch (JsonException) { return false; }
     }
 
     private static bool Bool(JsonElement element, string name) =>
@@ -698,7 +737,11 @@ public sealed class TaskCatalog
         return true;
     }
 
-    public bool Accept(AgyHookPayload hook, DateTimeOffset? receivedAt = null)
+    /// <param name="answerable">
+    /// 这次事件里若有提问，**能不能在手机上作答**（桥只在有手机连着时才挂住那条钩子连接）。
+    /// 没手机连着 = 桥放行、终端自己弹框，卡片就不该给出作答入口。
+    /// </param>
+    public bool Accept(AgyHookPayload hook, DateTimeOffset? receivedAt = null, bool answerable = true)
     {
         var now = receivedAt ?? DateTimeOffset.UtcNow;
         var sessionID = hook.SessionID;
@@ -730,7 +773,7 @@ public sealed class TaskCatalog
 
         // 4. 顶层主任务状态流转
         var existing = _tasks.FirstOrDefault(task => task.Id == sessionID);
-        var updated = AgyEventReducer.Reduce(hook, existing, dbInfo, now);
+        var updated = AgyEventReducer.Reduce(hook, existing, dbInfo, now, answerable);
         Upsert(updated);
 
         // 侦测父任务调用的 invoke_subagent，记录子代理绑定关系与先验派发窗口
@@ -745,26 +788,42 @@ public sealed class TaskCatalog
         }
 
         // 5. 用户交互问题（ask_question）挂起与移除逻辑
+        //    **与 Claude / opencode 共用同一套题目机件**：解析出来的题目进队列，呈现交给
+        //    PresentQuestion——于是 agy 的提问在手机上和另外两家长得一模一样：选项按钮、多选
+        //    开关、多题逐题推进。旧实现是手搓一张"只取第一题文本 + 裸选项"的简版卡，多题直接丢。
         if (hook.EffectiveEvent == "PreToolUse" &&
             hook.ToolCall?.Name?.Equals("ask_question", StringComparison.OrdinalIgnoreCase) == true)
         {
-            var questionText = AgyEventReducer.QuestionText(hook.ToolCall?.Args) ?? "等待输入与选择";
-            var questionOptions = AgyEventReducer.QuestionOptions(hook.ToolCall?.Args);
-            _requests[sessionID] = new(
-                sessionID,
-                PendingRequestKind.Question,
-                questionText,
-                questionOptions);
+            if (ParseQuestions(hook.ToolCall?.Args) is { Count: > 0 } agyItems)
+            {
+                _questionItems[sessionID] = agyItems;
+                _questionProgress.Remove(sessionID);   // 新一次提问，进度从头算
+                PresentQuestion(sessionID);            // 单题=整题；多题=先呈现第 1 题
+            }
+            else
+            {
+                // 解析不出结构化题目时的兜底：把整段文本当成一道**没有选项**的题（可自由作答），
+                // 走同一条队列，免得手机上一张卡片都没有、连"通道已失效"都无从谈起。
+                var fallbackText = AgyEventReducer.QuestionText(hook.ToolCall?.Args) ?? "等待输入与选择";
+                _questionItems[sessionID] =
+                    [new QuestionItem(fallbackText, fallbackText, [], [], false)];
+                _questionProgress.Remove(sessionID);
+                PresentQuestion(sessionID);
+            }
         }
         else if (hook.EffectiveEvent == "PostToolUse" &&
                  hook.ToolCall?.Name?.Equals("ask_question", StringComparison.OrdinalIgnoreCase) == true)
         {
-            // 问题作答完毕，移除挂起请求
+            // 问题作答完毕：撤卡**并清队列**（下次提问要从第 1 题重新算，不能带着上一轮的进度）
             _requests.Remove(sessionID);
+            _questionItems.Remove(sessionID);
+            _questionProgress.Remove(sessionID);
         }
         else if (hook.EffectiveEvent is "Stop")
         {
             _requests.Remove(sessionID);
+            _questionItems.Remove(sessionID);
+            _questionProgress.Remove(sessionID);
         }
         else
         {
@@ -1559,7 +1618,7 @@ public sealed class TaskCatalog
                         return new(requestID, ControlResult.Unsupported, "作答内容为空");
 
                     var answer = new QuestionAnswer(
-                        item.Text, picked, string.IsNullOrEmpty(typed) ? null : typed);
+                        item.Text, picked, string.IsNullOrEmpty(typed) ? null : typed, item.Display);
 
                     var answers = new List<QuestionAnswer>(progress.Answers) { answer };
                     if (progress.Index + 1 < questions.Count)
@@ -2568,9 +2627,18 @@ public static class ClaudeEventReducer
             ? value.GetString()
             : null;
 
-    /// <summary>会让 Claude 暂停并等待用户输入的通知类型（本机 2.1.236 实测存在的四种）。</summary>
+    /// <summary>
+    /// 会让 Claude 暂停并等待用户作答的通知类型。
+    /// 2.1.236 二进制里的通知定义（bin/claude.exe 内 `notificationType:"…"` 的发射点）:
+    /// `elicitation_dialog` / `elicitation_url_dialog`("Claude Code needs your input"，MCP 弹窗在等人)、
+    /// `agent_needs_input`(代理需要输入)——这三个是真在等人。
+    /// `idle_prompt` **不算**：它的发射条件是"会话空闲超过 messageIdleNotifThresholdMs"，
+    /// 文案 "Claude is waiting for your input"，只是"终端空着没人打字"，不是提问。旧实现把它当提问，
+    /// 于是每次空闲都在 app 上弹一张没有选项、也送不回去的问题卡（用户实测报出"没人发起过 question"）。
+    /// 空闲语义对齐 opencode 的 session.idle（那一路是收尾/已完成，不是等待作答）。
+    /// </summary>
     public static bool IsAnswerNotification(string? notificationType) =>
-        notificationType is "idle_prompt" or "elicitation_dialog" or "elicitation_url_dialog" or "agent_needs_input";
+        notificationType is "elicitation_dialog" or "elicitation_url_dialog" or "agent_needs_input";
 
     /// <summary>
     /// 工具 → Activity。与 opencode/agy 的判据统一为"工具名 + 入参文本"：
