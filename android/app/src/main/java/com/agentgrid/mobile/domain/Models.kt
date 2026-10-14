@@ -193,6 +193,9 @@ data class UsageWindow(
     val remainingPercentage: Double,
     val windowMinutes: Int,
     val resetsAt: Long? = null,
+    // 只显示一行文字、不画进度条的窗口（例如 Command Code 的月额度是美元余额）。
+    // 有值就渲染成文字行，为空则照旧按百分比画条。
+    val detail: String? = null,
 )
 
 @Serializable

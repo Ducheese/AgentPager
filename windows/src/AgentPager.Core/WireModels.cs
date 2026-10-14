@@ -84,7 +84,12 @@ public sealed record UsageWindow(
     double UsedPercentage,
     double RemainingPercentage,
     int WindowMinutes,
-    DateTimeOffset? ResetsAt);
+    DateTimeOffset? ResetsAt,
+    /// <summary>
+    /// 只显示一行文字、不画进度条的窗口（例如 Command Code 的月额度是美元余额，没有百分比可言）。
+    /// App 见到它有值就走文字行。为空则照旧按百分比画条。
+    /// </summary>
+    string? Detail = null);
 
 public sealed record DailyUsagePoint(
     string Date,

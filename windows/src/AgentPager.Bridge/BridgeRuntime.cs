@@ -46,6 +46,7 @@ public sealed class BridgeRuntime : IAsyncDisposable
     private readonly CodexRolloutObserver _rollout = new();
     private readonly CodexUsageLoader _usageLoader = new();
     private readonly AgyUsageLoader _agyUsageLoader = new();
+    private readonly CommandCodeUsageLoader _commandCodeUsageLoader = new();
     private readonly CodexHookConfiguration _hookConfiguration = new();
     private readonly ClaudeHookConfiguration _claudeHookConfiguration = new();
     private readonly OpenCodePluginConfiguration _openCodePluginConfiguration = new();
@@ -75,8 +76,9 @@ public sealed class BridgeRuntime : IAsyncDisposable
         _selectedAddress = _networks.FirstOrDefault(value => value.Address == Settings.SelectedNetworkAddress)?.Address
             ?? _networks.FirstOrDefault()?.Address ?? "127.0.0.1";
         Settings.SelectedNetworkAddress = _selectedAddress;
-        // agy 额度拉取是外挂子进程，失败时会静默返回 null——没有日志就只能靠猜（实测踩过）。
+        // 两家额度拉取都可能静默返回 null——没有日志就只能靠猜（实测踩过）。
         _agyUsageLoader.Log = _log.Write;
+        _commandCodeUsageLoader.Log = _log.Write;
         _pairingSecret = new PairingSecretStore().LoadOrCreate();
         _catalog = new(_persistence.Load());
         _catalog.ApplyTitles(_titleReader.Load());
@@ -470,17 +472,20 @@ public sealed class BridgeRuntime : IAsyncDisposable
             {
                 var codexTask = Task.Run(() => _usageLoader.Load(), cancellationToken);
                 var agyTask = Task.Run(() => _agyUsageLoader.Load(), cancellationToken);
+                var commandCodeTask = Task.Run(() => _commandCodeUsageLoader.Load(), cancellationToken);
 
-                await Task.WhenAll(codexTask, agyTask);
+                await Task.WhenAll(codexTask, agyTask, commandCodeTask);
 
                 var codex = await codexTask;
                 var agy = await agyTask;
+                var commandCode = await commandCodeTask;
 
                 var list = new List<UsageSnapshot>();
                 if (agy is not null) list.Add(agy);
+                if (commandCode is not null) list.Add(commandCode);
                 if (codex is not null) list.Add(codex);
 
-                var primary = agy ?? codex;
+                var primary = agy ?? commandCode ?? codex;
                 await _events.Writer.WriteAsync(new UsageEvent(primary, list), cancellationToken);
             }
             catch (OperationCanceledException) { break; }

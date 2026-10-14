@@ -2339,6 +2339,8 @@ var testNow = DateTimeOffset.UtcNow;
 var parsedQuota = AgyUsageLoader.ParseQuotaJson(sampleAgyQuotaJson, testNow);
 Check(parsedQuota is not null, "agy quota: JSON parsed successfully");
 Check(parsedQuota!.Value.PlanType == "Antigravity", "agy quota: PlanType is Antigravity");
+// 手机上那行订阅名直接取 limitID（App 只做大写），所以这里钉住文案。
+Check(parsedQuota!.Value.LimitID == "Google AI Pro", $"agy quota: LimitID is the subscription name (got '{parsedQuota.Value.LimitID}')");
 Check(parsedQuota!.Value.Windows.Count == 4, $"agy quota: 4 windows extracted (got {parsedQuota.Value.Windows.Count})");
 
 var gemini5h = parsedQuota.Value.Windows.FirstOrDefault(w => w.Key == "primary");
@@ -2408,6 +2410,61 @@ var olderAfter = afterMarkRead.First(t => t.Id == "task_older");
 Check(!olderAfter.IsUnread, "markRead: task is now marked as read");
 Check(olderAfter.UpdatedAt == tOlder, $"markRead: UpdatedAt remains unchanged (expected {tOlder}, got {olderAfter.UpdatedAt})");
 Check(afterMarkRead[0].Id == "task_newer" && afterMarkRead[1].Id == "task_older", "markRead: older task does NOT jump ahead of newer task");
+
+// Command Code（cmdc）额度解析：样本是 2026-10-15 从 api.commandcode.ai 真实抓下来的响应。
+// 字段名或单位错一个，手机上就是空白或离谱数字，而这类错误不会在任何地方报错。
+const string cmdcCredits = """
+{"credits":{"belowThreshold":false,"creditThreshold":0,"monthlyCredits":0.1311898708,"purchasedCredits":0,"freeCredits":0},
+ "windowLimits":{"limited":true,"exceeded":null,
+   "fiveHour":{"used":0.846497784,"cap":3,"exceeded":false,"resetAt":1792012561503},
+   "weekly":{"used":3.868543266,"cap":6,"exceeded":false,"resetAt":1792560907759}},
+ "sandboxAccess":false}
+""";
+const string cmdcSubscriptions = """
+{"success":true,"data":{"id":"sub_x","status":"active","currentPeriodEnd":"2026-11-04T11:56:42.000Z","planId":"individual-go-v1"}}
+""";
+const string cmdcSummary = """
+{"totalCount":2094,"totalCredits":9.859189651200007,
+ "daily":[{"date":"2026-10-04","tokens":90721819,"requests":222},{"date":"2026-10-14","tokens":388623077,"requests":1098}]}
+""";
+
+var cmdcWindows = CommandCodeUsageLoader.ParseWindows(cmdcCredits, cmdcSubscriptions, DateTimeOffset.Now);
+Check(cmdcWindows.Count == 3, $"cmdc: three windows (5h/weekly/monthly), got {cmdcWindows.Count}");
+
+var cmdcFiveHour = cmdcWindows.FirstOrDefault(w => w.Key == "cc-5h");
+Check(cmdcFiveHour is not null, "cmdc: five-hour window present");
+Check(cmdcFiveHour is not null && Math.Abs(cmdcFiveHour.UsedPercentage - 28.2166) < 0.01,
+    $"cmdc: five-hour used% = used/cap (got {cmdcFiveHour?.UsedPercentage:0.###})");
+Check(cmdcFiveHour?.RemainingPercentage is > 71 and < 72, $"cmdc: five-hour remaining ~71.8% (got {cmdcFiveHour?.RemainingPercentage:0.###})");
+Check(cmdcFiveHour?.WindowMinutes == 300, "cmdc: five-hour window is 300 minutes");
+Check(cmdcFiveHour?.ResetsAt is not null, "cmdc: five-hour reset time parsed");
+
+var cmdcWeekly = cmdcWindows.FirstOrDefault(w => w.Key == "cc-weekly");
+Check(cmdcWeekly is not null && Math.Abs(cmdcWeekly.UsedPercentage - 64.4757) < 0.01,
+    $"cmdc: weekly used% (got {cmdcWeekly?.UsedPercentage:0.###})");
+Check(cmdcWeekly?.WindowMinutes == 10080, "cmdc: weekly window is 10080 minutes");
+
+var cmdcMonthly = cmdcWindows.FirstOrDefault(w => w.Key == "cc-monthly");
+Check(cmdcMonthly?.Detail is not null && cmdcMonthly.Detail.Contains("$0.13"),
+    $"cmdc: monthly is a text row showing the balance (got '{cmdcMonthly?.Detail}')");
+Check(cmdcMonthly?.ResetsAt == new DateTimeOffset(2026, 11, 4, 11, 56, 42, TimeSpan.Zero),
+    $"cmdc: monthly reset = subscription period end (got {cmdcMonthly?.ResetsAt})");
+
+// 套餐名：App 显示成 "<LIMITID> 订阅"，所以从 planId 推出 "Command Code Go"。
+Check(CommandCodeUsageLoader.PlanLabel(cmdcSubscriptions) == "Command Code Go",
+    $"cmdc: plan label from planId (got '{CommandCodeUsageLoader.PlanLabel(cmdcSubscriptions)}')");
+Check(CommandCodeUsageLoader.PlanLabel("{\"data\":{\"planId\":\"team-max-v2\"}}") == "Command Code Max",
+    "cmdc: other tiers map too (team-max-v2 -> Max)");
+Check(CommandCodeUsageLoader.PlanLabel("{}") == "Command Code", "cmdc: unknown plan falls back to the product name");
+
+var cmdcDaily = CommandCodeUsageLoader.ParseDaily(cmdcSummary, DateTimeOffset.Now);
+Check(cmdcDaily.Count == 2 && cmdcDaily[0].Date == "2026-10-04" && cmdcDaily[0].TotalTokens == 90721819,
+    $"cmdc: daily usage parsed (got {cmdcDaily.Count} points, first={cmdcDaily.FirstOrDefault()?.Date}/{cmdcDaily.FirstOrDefault()?.TotalTokens})");
+
+// 缺字段不能崩：credits 缺席时应当返回空列表，交给上层决定是否沿用缓存。
+Check(CommandCodeUsageLoader.ParseWindows("{}", null, DateTimeOffset.Now).Count == 0, "cmdc: empty payload yields no windows");
+Check(CommandCodeUsageLoader.ParseDaily(null, DateTimeOffset.Now).Count == 0, "cmdc: missing summary yields no daily points");
+Check(CommandCodeUsageLoader.SubscriptionPeriodEnd("not json") is null, "cmdc: malformed subscription json is tolerated");
 
 Console.WriteLine();
 Console.WriteLine(failures.Count == 0 ? "ALL CHECKS PASSED" : $"FAILURES: {string.Join(", ", failures)}");

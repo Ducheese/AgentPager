@@ -70,7 +70,7 @@ public sealed class AgyUsageLoader
             return new DailyUsagePoint(date, usage.Input, usage.Cached, usage.Output, 0, usage.Total);
         }).ToList();
 
-        return new(quota?.CapturedAt ?? current, quota?.PlanType ?? "Antigravity", quota?.LimitID ?? "Gemini",
+        return new(quota?.CapturedAt ?? current, quota?.PlanType ?? "Antigravity", quota?.LimitID ?? "Google AI Pro",
             quota?.Windows ?? [], daily);
     }
 
@@ -174,7 +174,7 @@ public sealed class AgyUsageLoader
 
             if (windows.Count == 0) return null;
 
-            return (now, windows, "Antigravity", "Gemini & Claude");
+            return (now, windows, "Antigravity", "Google AI Pro");
         }
         catch
         {

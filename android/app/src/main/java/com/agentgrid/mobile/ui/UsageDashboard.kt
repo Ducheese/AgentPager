@@ -128,17 +128,23 @@ private fun QuotaPanel(
     val hasThreeP = windows.any { it.key.startsWith("3p") }
     var selectedGroup by remember(usage) { mutableStateOf(0) } // 0 = Gemini, 1 = 3P
 
+    // 画条的两个窗口：先按 key 取（agy 的 primary/secondary），取不到就退到"前两个要画条的窗口"——
+    // 这样新增提供商不用改这里也能显示（Command Code 的 key 就不是 primary/secondary）。
+    val barWindows = windows.filter { it.detail == null }
     val primary = if (hasThreeP && selectedGroup == 1) {
         windows.firstOrNull { it.key == "3p-5h" }
     } else {
-        windows.firstOrNull { it.key == "primary" } ?: windows.firstOrNull()
+        windows.firstOrNull { it.key == "primary" } ?: barWindows.getOrNull(0)
     }
 
     val secondary = if (hasThreeP && selectedGroup == 1) {
         windows.firstOrNull { it.key == "3p-weekly" }
     } else {
-        windows.firstOrNull { it.key == "secondary" }
+        windows.firstOrNull { it.key == "secondary" } ?: barWindows.getOrNull(1)
     }
+
+    // 不带百分比的窗口（如月额度余额）只占一行文字，不画条。
+    val noteWindow = windows.firstOrNull { it.detail != null }
 
     Column(
         modifier = modifier,
@@ -165,9 +171,9 @@ private fun QuotaPanel(
                     .size(42.dp)
                     .semantics {
                         contentDescription = if (connected) {
-                            if (isAgy) "Antigravity 空闲" else "Codex 空闲"
+                            "${providerName(usage)} 空闲"
                         } else {
-                            if (isAgy) "Antigravity 离线" else "Codex 离线"
+                            "${providerName(usage)} 离线"
                         }
                     },
             )
@@ -181,7 +187,7 @@ private fun QuotaPanel(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
-                        if (isAgy) "AGY 额度" else "CODEX 额度",
+                        "${providerLabel(usage)} 额度",
                         color = AgentGridColors.Text,
                         fontSize = 14.sp,
                         fontWeight = FontWeight.Bold,
@@ -195,10 +201,12 @@ private fun QuotaPanel(
                     }
                 }
                 Text(
-                    if (isAgy) {
-                        usage?.limitID?.uppercase() ?: "GEMINI & CLAUDE"
-                    } else {
-                        usage?.planType?.uppercase()?.let { "$it 计划" } ?: "订阅计划"
+                    when (providerName(usage)) {
+                        // agy 的 limitID 就是订阅名（Google AI Pro）
+                        "Antigravity" -> usage?.limitID?.uppercase() ?: "GOOGLE AI PRO"
+                        // Command Code 显示成 "COMMAND CODE GO 订阅"（GO 由 planId 推出）
+                        "Command Code" -> usage?.limitID?.uppercase()?.let { "$it 订阅" } ?: "订阅计划"
+                        else -> usage?.planType?.uppercase()?.let { "$it 计划" } ?: "订阅计划"
                     },
                     color = AgentGridColors.Muted,
                     fontSize = 9.sp,
@@ -219,6 +227,16 @@ private fun QuotaPanel(
 
         SecondaryQuota(window = secondary)
 
+        noteWindow?.detail?.let { detail ->
+            Text(
+                "${noteWindow.label} · $detail",
+                color = AgentGridColors.Muted,
+                fontSize = 10.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+
         Text(
             buildString {
                 append(UsagePresentation.freshnessText(usage?.capturedAt))
@@ -229,6 +247,20 @@ private fun QuotaPanel(
             maxLines = 1,
         )
     }
+}
+
+/** 额度的来源全称：新增提供商只改这里。 */
+private fun providerName(usage: UsageSnapshot?): String = when {
+    usage?.planType?.contains("Antigravity", ignoreCase = true) == true -> "Antigravity"
+    usage?.planType?.contains("Command Code", ignoreCase = true) == true -> "Command Code"
+    else -> "Codex"
+}
+
+/** 切换器与标题上的短名。 */
+private fun providerLabel(usage: UsageSnapshot?): String = when (providerName(usage)) {
+    "Antigravity" -> "AGY"
+    "Command Code" -> "CMDC"
+    else -> "CODEX"
 }
 
 @Composable
@@ -244,8 +276,7 @@ private fun ProviderSwitcher(
         horizontalArrangement = Arrangement.spacedBy(2.dp),
     ) {
         usages.forEachIndexed { index, u ->
-            val isCurrentAgy = u.planType?.contains("Antigravity", ignoreCase = true) == true
-            val label = if (isCurrentAgy) "AGY" else "CODEX"
+            val label = providerLabel(u)
             val selected = index == selectedIndex
             Box(
                 modifier = Modifier
