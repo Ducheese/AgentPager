@@ -159,6 +159,9 @@
                         </Border>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsSelected" Value="True">
+                                <!-- 抬高 z 序：TabBorder 有 -1 右边距，右边缘与后一个标签的左边缘重叠，
+                                     不抬高就会被后者的边框盖住，选中态的四边框看起来缺右边。 -->
+                                <Setter Property="Panel.ZIndex" Value="1"/>
                                 <Setter TargetName="TabBorder" Property="Background" Value="#182432"/>
                                 <Setter TargetName="TabBorder" Property="BorderBrush"
                                         Value="{StaticResource Cyan}"/>
@@ -203,7 +206,7 @@
             </StackPanel>
             <Border Grid.Column="3" Padding="12,8" Background="{StaticResource Surface}"
                     BorderBrush="{StaticResource Border}" BorderThickness="1">
-                <StackPanel Orientation="Horizontal">
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                     <TextBlock Text="PHONE "/>
                     <TextBlock x:Name="PhoneCountText" Foreground="{StaticResource Cyan}" FontWeight="Bold"/>
                 </StackPanel>

@@ -221,6 +221,7 @@ data class StateSnapshotPayload(
     val usage: UsageSnapshot? = null,
     val focusedTaskID: String? = null,
     val pendingRequests: List<PendingRequest> = emptyList(),
+    val usages: List<UsageSnapshot> = emptyList(),
 )
 
 @Serializable

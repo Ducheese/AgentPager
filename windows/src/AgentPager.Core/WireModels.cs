@@ -118,7 +118,8 @@ public sealed record StateSnapshotPayload(
     List<TaskSnapshot> Tasks,
     UsageSnapshot? Usage,
     string? FocusedTaskID,
-    List<PendingRequest> PendingRequests);
+    List<PendingRequest> PendingRequests,
+    List<UsageSnapshot>? Usages = null);
 
 public sealed record PairingPayload(
     int Version,

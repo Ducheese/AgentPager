@@ -28,7 +28,7 @@ public sealed class BridgeRuntime : IAsyncDisposable
     private sealed record RolloutEvent(List<CodexRolloutSignal> Signals) : BridgeEvent;
     private sealed record ControlEvent(string Text) : BridgeEvent;
     private sealed record PhoneCountEvent(int Count) : BridgeEvent;
-    private sealed record UsageEvent(UsageSnapshot? Usage) : BridgeEvent;
+    private sealed record UsageEvent(UsageSnapshot? Usage, List<UsageSnapshot>? Usages = null) : BridgeEvent;
     private sealed record MaintenanceEvent : BridgeEvent;
 
     /// <summary>
@@ -45,6 +45,7 @@ public sealed class BridgeRuntime : IAsyncDisposable
     private readonly CodexSessionTitleReader _titleReader = new();
     private readonly CodexRolloutObserver _rollout = new();
     private readonly CodexUsageLoader _usageLoader = new();
+    private readonly AgyUsageLoader _agyUsageLoader = new();
     private readonly CodexHookConfiguration _hookConfiguration = new();
     private readonly ClaudeHookConfiguration _claudeHookConfiguration = new();
     private readonly OpenCodePluginConfiguration _openCodePluginConfiguration = new();
@@ -59,6 +60,7 @@ public sealed class BridgeRuntime : IAsyncDisposable
     private Task? _pollTask;
     private Task? _usageTask;
     private UsageSnapshot? _usage;
+    private List<UsageSnapshot> _usages = [];
     private DateTimeOffset? _lastHookAt;
     private string _serviceStatus = "正在启动";
     private string? _lastError;
@@ -73,6 +75,8 @@ public sealed class BridgeRuntime : IAsyncDisposable
         _selectedAddress = _networks.FirstOrDefault(value => value.Address == Settings.SelectedNetworkAddress)?.Address
             ?? _networks.FirstOrDefault()?.Address ?? "127.0.0.1";
         Settings.SelectedNetworkAddress = _selectedAddress;
+        // agy 额度拉取是外挂子进程，失败时会静默返回 null——没有日志就只能靠猜（实测踩过）。
+        _agyUsageLoader.Log = _log.Write;
         _pairingSecret = new PairingSecretStore().LoadOrCreate();
         _catalog = new(_persistence.Load());
         _catalog.ApplyTitles(_titleReader.Load());
@@ -305,6 +309,7 @@ public sealed class BridgeRuntime : IAsyncDisposable
                         break;
                     case UsageEvent usage:
                         _usage = usage.Usage;
+                        _usages = usage.Usages ?? (usage.Usage is not null ? [usage.Usage] : []);
                         changed = true;
                         break;
                     case MaintenanceEvent:
@@ -463,13 +468,25 @@ public sealed class BridgeRuntime : IAsyncDisposable
         {
             try
             {
-                var usage = await Task.Run(() => _usageLoader.Load(), cancellationToken);
-                await _events.Writer.WriteAsync(new UsageEvent(usage), cancellationToken);
+                var codexTask = Task.Run(() => _usageLoader.Load(), cancellationToken);
+                var agyTask = Task.Run(() => _agyUsageLoader.Load(), cancellationToken);
+
+                await Task.WhenAll(codexTask, agyTask);
+
+                var codex = await codexTask;
+                var agy = await agyTask;
+
+                var list = new List<UsageSnapshot>();
+                if (agy is not null) list.Add(agy);
+                if (codex is not null) list.Add(codex);
+
+                var primary = agy ?? codex;
+                await _events.Writer.WriteAsync(new UsageEvent(primary, list), cancellationToken);
             }
             catch (OperationCanceledException) { break; }
             catch (Exception error)
             {
-                _log.Write("ERROR", $"读取 Codex 额度失败：{error}");
+                _log.Write("ERROR", $"读取额度失败：{error}");
             }
 
             try { await Task.Delay(TimeSpan.FromMinutes(10), cancellationToken); }
@@ -507,7 +524,7 @@ public sealed class BridgeRuntime : IAsyncDisposable
             Subagents = task.Subagents.Select(subagent =>
                 subagent with { LatestStep = ToolStepSanitizer.Sanitize(subagent.LatestStep) }).ToList(),
         }).ToList();
-        var payload = new StateSnapshotPayload(tasks, _usage, projection.FocusedTaskID, projection.PendingRequests);
+        var payload = new StateSnapshotPayload(tasks, _usage, projection.FocusedTaskID, projection.PendingRequests, _usages.Count > 0 ? _usages : null);
         return JsonSerializer.Serialize(MessageEnvelope<StateSnapshotPayload>.Create("state.snapshot", payload), WireJson.Options);
     }
 

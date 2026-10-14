@@ -346,6 +346,7 @@ private fun TaskTerminal(
             if (isDashboardVisible) {
                 UsageDashboard(
                     usage = state.usage,
+                    usages = state.usages,
                     connected = state.linkState == LinkState.CONNECTED,
                 )
             } else {
@@ -764,12 +765,16 @@ private fun TaskMeta(task: TaskSnapshot, alpha: Float) {
         horizontalAlignment = Alignment.End,
         verticalArrangement = Arrangement.spacedBy(7.dp),
     ) {
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
             MetaTag(agentBadge(task.source), agentBadgeColor(task.source), alpha)
             MetaTag(
                 task.modelName ?: agentOriginLabel(task.source),
                 AgentGridColors.Muted,
                 alpha,
+                modifier = Modifier.weight(1f, fill = false),
             )
         }
         Row(
@@ -796,12 +801,19 @@ private fun TaskMeta(task: TaskSnapshot, alpha: Float) {
 }
 
 @Composable
-private fun MetaTag(text: String, color: Color, alpha: Float) {
+private fun MetaTag(
+    text: String,
+    color: Color,
+    alpha: Float,
+    modifier: Modifier = Modifier,
+) {
     Text(
         text,
         color = color.copy(alpha = alpha),
         fontSize = 9.sp,
-        modifier = Modifier
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+        modifier = modifier
             .background(AgentGridColors.SurfaceRaised.copy(alpha = alpha))
             .padding(horizontal = 7.dp, vertical = 4.dp),
     )

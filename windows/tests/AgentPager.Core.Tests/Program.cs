@@ -2283,6 +2283,132 @@ var holdPayload = JsonSerializer.Deserialize<OpenCodeHookPayload>(
     "{\"event\":\"permission.asked\",\"hold\":\"approval\",\"request_id\":\"req_9\",\"properties\":{}}", WireJson.Options)!;
 Check(holdPayload.Hold == "approval" && holdPayload.RequestID == "req_9", "opencode hold: payload carries hold + request_id");
 
+// AgyUsageLoader: 解析真实的 agy /usage JSON 输出
+const string sampleAgyQuotaJson = """
+{
+  "status": "SUCCESS",
+  "command": {
+    "name": "usage",
+    "data": {
+      "groups": [
+        {
+          "name": "Gemini Models",
+          "buckets": [
+            {
+              "id": "gemini-weekly",
+              "name": "Weekly Limit Remaining",
+              "window": "weekly",
+              "remaining_fraction": 0.368,
+              "reset_time": "2026-10-15T08:11:53Z"
+            },
+            {
+              "id": "gemini-5h",
+              "name": "Five Hour Limit Remaining",
+              "window": "5h",
+              "remaining_fraction": 0.957,
+              "reset_time": "2026-10-14T21:06:44Z"
+            }
+          ]
+        },
+        {
+          "name": "Claude and GPT models",
+          "buckets": [
+            {
+              "id": "3p-weekly",
+              "name": "Weekly Limit Remaining",
+              "window": "weekly",
+              "remaining_fraction": 1.0,
+              "reset_time": "2026-10-21T16:48:42Z"
+            },
+            {
+              "id": "3p-5h",
+              "name": "Five Hour Limit Remaining",
+              "window": "5h",
+              "remaining_fraction": 1.0,
+              "reset_time": "2026-10-14T21:48:42Z"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
+""";
+
+var testNow = DateTimeOffset.UtcNow;
+var parsedQuota = AgyUsageLoader.ParseQuotaJson(sampleAgyQuotaJson, testNow);
+Check(parsedQuota is not null, "agy quota: JSON parsed successfully");
+Check(parsedQuota!.Value.PlanType == "Antigravity", "agy quota: PlanType is Antigravity");
+Check(parsedQuota!.Value.Windows.Count == 4, $"agy quota: 4 windows extracted (got {parsedQuota.Value.Windows.Count})");
+
+var gemini5h = parsedQuota.Value.Windows.FirstOrDefault(w => w.Key == "primary");
+Check(gemini5h is not null && Math.Abs(gemini5h.RemainingPercentage - 95.7) < 0.1, "agy quota: primary is Gemini 5H ~95.7%");
+Check(gemini5h?.WindowMinutes == 300, "agy quota: primary windowMinutes=300");
+
+var geminiWeekly = parsedQuota.Value.Windows.FirstOrDefault(w => w.Key == "secondary");
+Check(geminiWeekly is not null && Math.Abs(geminiWeekly.RemainingPercentage - 36.8) < 0.1, "agy quota: secondary is Gemini Weekly ~36.8%");
+Check(geminiWeekly?.WindowMinutes == 10080, "agy quota: secondary windowMinutes=10080");
+
+var threeP5h = parsedQuota.Value.Windows.FirstOrDefault(w => w.Key == "3p-5h");
+Check(threeP5h is not null && Math.Abs(threeP5h.RemainingPercentage - 100.0) < 0.1, "agy quota: 3p-5h is 100%");
+
+// AgyUsageLoader.Load 联动测试（mock brain 目录与 transcript.jsonl）
+var tempBrainDir = Path.Combine(Path.GetTempPath(), "agentpager_test_brain_" + Guid.NewGuid().ToString("N"));
+var tempSessionDir = Path.Combine(tempBrainDir, "test_session", ".system_generated", "logs");
+Directory.CreateDirectory(tempSessionDir);
+var tempTranscript = Path.Combine(tempSessionDir, "transcript.jsonl");
+
+var mockDate = testNow.Date.ToString("yyyy-MM-dd");
+File.WriteAllText(tempTranscript,
+    $"{{\"step_index\":1,\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"{mockDate}T12:00:00Z\",\"input_tokens\":1000,\"cache_read_tokens\":500,\"output_tokens\":200}}\n" +
+    $"{{\"step_index\":2,\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"{mockDate}T12:05:00Z\",\"input_tokens\":2000,\"cache_read_tokens\":1000,\"output_tokens\":300}}\n");
+
+var prevBrainRoot = AgyTranscriptReader.BrainRoot;
+AgyTranscriptReader.BrainRoot = tempBrainDir;
+AgyUsageLoader.QuotaJsonProviderOverride = () => sampleAgyQuotaJson;
+
+try
+{
+    var agyLoader = new AgyUsageLoader();
+    var agySnapshot = agyLoader.Load(testNow);
+    Check(agySnapshot is not null, "agy usage loader: snapshot loaded");
+    Check(agySnapshot!.PlanType == "Antigravity", "agy usage loader: planType is Antigravity");
+    Check(agySnapshot.DailyUsage.Count == 90, "agy usage loader: dailyUsage has 90 points");
+
+    var todayPoint = agySnapshot.DailyUsage.FirstOrDefault(d => d.Date == mockDate);
+    Check(todayPoint is not null && todayPoint.TotalTokens == (1000 + 500 + 200 + 2000 + 1000 + 300),
+        $"agy usage loader: aggregated total tokens for today is 5000 (got {todayPoint?.TotalTokens})");
+    Check(todayPoint?.InputTokens == 3000, $"agy usage loader: input tokens = 3000 (got {todayPoint?.InputTokens})");
+    Check(todayPoint?.CachedInputTokens == 1500, $"agy usage loader: cached tokens = 1500 (got {todayPoint?.CachedInputTokens})");
+    Check(todayPoint?.OutputTokens == 500, $"agy usage loader: output tokens = 500 (got {todayPoint?.OutputTokens})");
+}
+finally
+{
+    AgyTranscriptReader.BrainRoot = prevBrainRoot;
+    AgyUsageLoader.QuotaJsonProviderOverride = null;
+    try { Directory.Delete(tempBrainDir, recursive: true); } catch { }
+}
+
+// ── MarkRead 状态操作与排序稳定测试 ──
+var tOlder = testNow.AddMinutes(-10);
+var tNewer = testNow.AddMinutes(-5);
+var taskOlder = new TaskSnapshot("task_older", AgentSource.CodexCLI, "proj", "proj", null, null, null, [],
+    AgentLifecycle.Succeeded, null, tOlder, tOlder, tOlder, true, false, false, []);
+var taskNewer = new TaskSnapshot("task_newer", AgentSource.CodexCLI, "proj", "proj", null, null, null, [],
+    AgentLifecycle.Succeeded, null, tNewer, tNewer, tNewer, false, false, false, []);
+
+var markReadCatalog = new TaskCatalog(new[] { taskOlder, taskNewer });
+var beforeMarkRead = markReadCatalog.Projection().Tasks;
+Check(beforeMarkRead[0].Id == "task_newer" && beforeMarkRead[1].Id == "task_older", "markRead: newer task is ahead of older task initially");
+
+// 对 older 标记已读
+markReadCatalog.Perform(Guid.NewGuid(), new ControlPayload("task_older", ControlAction.MarkRead, null), new NullResolver());
+var afterMarkRead = markReadCatalog.Projection().Tasks;
+var olderAfter = afterMarkRead.First(t => t.Id == "task_older");
+Check(!olderAfter.IsUnread, "markRead: task is now marked as read");
+Check(olderAfter.UpdatedAt == tOlder, $"markRead: UpdatedAt remains unchanged (expected {tOlder}, got {olderAfter.UpdatedAt})");
+Check(afterMarkRead[0].Id == "task_newer" && afterMarkRead[1].Id == "task_older", "markRead: older task does NOT jump ahead of newer task");
+
 Console.WriteLine();
 Console.WriteLine(failures.Count == 0 ? "ALL CHECKS PASSED" : $"FAILURES: {string.Join(", ", failures)}");
 return failures.Count == 0 ? 0 : 1;

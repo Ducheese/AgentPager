@@ -29,6 +29,7 @@ data class AgentGridUiState(
     val linkState: LinkState = LinkState.DISCONNECTED,
     val taskProjection: TaskDashboardProjection = TaskDashboardProjection.empty(),
     val usage: UsageSnapshot? = null,
+    val usages: List<UsageSnapshot> = emptyList(),
     val pendingRequests: List<PendingRequest> = emptyList(),
     val pairingError: String? = null,
     val terminalMode: Boolean = true,
@@ -71,11 +72,15 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
                 } else {
                     mutableState.value.taskProjection
                 }
+                val allUsages = session.snapshot.usages.ifEmpty {
+                    listOfNotNull(session.snapshot.usage)
+                }
                 mutableState.value = mutableState.value.copy(
                     pairing = session.pairing,
                     linkState = session.link,
                     taskProjection = projection,
                     usage = session.snapshot.usage,
+                    usages = allUsages,
                     pendingRequests = session.snapshot.pendingRequests,
                 )
                 if (snapshotChanged) scheduleDashboardTransition(projection)

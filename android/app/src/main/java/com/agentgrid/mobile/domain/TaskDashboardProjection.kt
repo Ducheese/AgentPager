@@ -160,7 +160,7 @@ object TaskDashboardProjector {
     private val taskComparator =
         compareByDescending<TaskSnapshot> { it.sortGroup }
             .thenByDescending { it.listPriority }
-            .thenByDescending { it.updatedAt }
+            .thenByDescending { if (it.isTerminal) (it.completedAt ?: it.updatedAt) else it.updatedAt }
             .thenBy { it.id }
 
     private val focusComparator =

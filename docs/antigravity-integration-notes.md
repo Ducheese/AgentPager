@@ -137,6 +137,41 @@
 
    **⑨ 没手机连着就不抢提问**（用户裁定，2026-10-14）：`HookTcpServer` 挂住 agy 提问的前提是 `_phoneCount > 0`；没人能作答时回一个空行就关（脚本 v3 见空包即放行），**终端自己弹框作答**。同一判据透到 catalog（`Accept(agy, …, answerable)`）→ 无手机时卡片照旧带题目与选项，但**不给 `Answer` 能力位**（否则手机上那张卡是个点不动的假入口）。注意：这条门只加在 agy 这条新路上，Claude/opencode 的挂起行为未动。
 
+14. **2026-10-14 三家"远程作答"对照：卡片层一个标准，通道与效果层不是**（用户要求"审查一遍是否一个标准"）
+
+   **一致的部分（共用同一套）**：题目解析 `ParseQuestions`（选项 / `multiSelect` / `is_multi_select` / 双重编码字符串容错）、呈现 `_questionItems` + `_questionProgress` + `PresentQuestion`（单选点一下 / 多选开关 / 多题逐题）、通道形态（挂住连接 → 手机作答 → 回包）、`HoldLimit` 600 秒超时后释放交回终端、能力位原则（只在**真有回话通道**时才画作答按钮）。
+
+   **不一致① 手机没连着时会不会拦**（**待办**）：agy 有门（`ask_question` 的挂起判据里带 `_isPhoneConnected()`），**Claude / opencode 没有**——它们的挂起判据只看"事件形态 / 插件 hold 标记"。后果：手机不在身边时，那次提问会被白挂满 10 分钟才交回终端（2026-10-14 实测：一条 Claude 请求 22:09:33 挂到 22:19:34 超时，用户只好 Esc）。要对齐得在 `HookTcpServer` 的挂起判据与对应能力位判据里一起加同一个门；opencode 那支还要确认"我们不挂时插件怎么解读空回包"。
+
+   **不一致② 答案对模型/终端长什么样**（**平台所限，改不了**）：
+
+   | 来源 | 回包 | 模型看到 | 终端看到 |
+   |---|---|---|---|
+   | Claude | `updatedInput`（答案写进工具入参）→ 工具**正常执行** | "用户选了 A" ✓ | 这次调用的**正常结果**——Claude 的 `AskUserQuestion` 把入参原样透传成结果（`return {data:{questions:r, answers:n}}`），题目与所选答案都在终端 ✓ |
+   | opencode | answers 数组 → 插件调 `POST /question/{id}/reply` | "用户选了 A" ✓ | 自己的**已答复**记录 ✓ |
+   | **agy** | **`deny` + reason** | **"这次调用被拒绝"**，答案塞在理由里 ✗ | 一行**工具失败**（`Error: tool call denied by pre-tool hook: …`），不是"题目 + 选项"的正常呈现 ✗ |
+
+   根源：agy 的 PreToolUse 契约只有 `allow / deny / ask / force_ask` 四个决策，**没有"给结果"这一档**；`overwrite` 只能改入参、预填答案已被实测证伪（判例 13）。所以 agy 自己的交互式题目框**只有在工具真跑起来时才渲染**，而远程作答必须先把它拒掉。
+
+   **结论（别再拿"三家对齐"当目标去追）**：Claude / opencode 能做到"终端看得见题目与作答 **且** 手机能答"；**agy 只能二选一**——要么终端弹框（手机只读），要么手机作答（终端只剩出错块）。另两家的"终端也看得见"不是我们做的，是它们平台本来就回"结果"。
+
+15. **2026-10-14 远程审批研究：Claude/opencode 是一条标准，agy 只能"显示 + 拒绝"**（**用户裁定：不做**，本轮实现已整轮回退，此处只留结论）
+
+   **Claude / opencode 一致 ✓**：谁决定要问 = 代理自己（`PermissionRequest` / `permission.asked`）；我们只做"挂住连接 + 审批卡（摘要=工具+入参）+ Approve/Deny 两个按钮"；回包 `allow`/`deny`；**一次性**（不做持久授权）；CLI 完全认这个回包（允许就执行、不再问）；10 分钟无人答则释放、交回终端。两家的能力位判据都是"**真有回话通道**才给"（Claude 看事件形态，opencode 看插件是否带 `hold`）。
+
+   **agy 的差别不在"有没有选项框"，而在 allow 那一半物理上送不到**：
+
+   - **作答能成，审批不能成，区别在"产物"**：作答的产物是**信息**，可以借 `deny` 的 reason 送进模型（判例 13），终端弹不弹、agy 的 UI 认不认都无所谓；审批的产物是**执行**，而执行与否卡在 agy 自己的**原生权限门**上——信息能借道，"执行"借不了道（回一句"用户批准了，你自己跑"→ 模型重发同一条命令 → 撞同一道门）。
+   - **实测排除的杠杆**：① `overwrite` 预填答案（判例 13 已证伪）；② **`permissionOverrides`**——文档写的 "Temporary permission grants"，实机发 `["command(node --version)"]` 后弹框照旧，headless 里同款（发了仍被原生门 auto-deny）；③ 钩子回 `allow` 不满足原门（headless 铁证：agentpager 已 allow，命令仍被 auto-deny）。
+   - **唯一有效的那条**：`~/.gemini/antigravity-cli/settings.json` 的 `permissions.allow`——headless 实测：加一条 `command(echo allowtest)` 后命令**直接跑通**（无需 `--dangerously-skip-permissions`）。这文件就是原生门的规则源。
+   - **未验的最后一格**（做之前必须先验）：agy 是**每次调用都重读** settings.json，还是启动时读一次。若前者，就能用"手机允许 → 桥写一条 `command(<命令>)` → 工具跑完立刻删"模拟 allow once；若后者则此路不通。**用户 2026-10-14 裁定不再推进，这一格就此封存。**
+   - **净效果（若仍想保留点什么）**：agy 的**拒绝是真的**（一票否决、工具不执行、终端根本不弹）；允许是空的。
+
+   **顺带两个硬事实（与审批无关，但值得记）**：
+
+   - **规则格式**：agy 自己"Persist to settings.json"落盘的是 `command(<完整命令行>)`，**字面前缀、不吃通配**（它把 `cmd.exe /c "ver"` 原样写进去）。推论：`command(git add *)` 里的 `*` 是**字面字符**，永远匹配不上任何命令——用户 `settings.json` 里那三条 deny 一直是**哑的**，真正拦住 `git add` 的一直是 `command-guard.js`（该钩子的拒绝文案逐字可辨）。
+   - **多钩子是单票否决**：另一个钩子投 deny，我们回 allow 洗不白 ✓（实测）。
+
 ---
 
 ## 六、一句话的验收模板（交付时照抄）

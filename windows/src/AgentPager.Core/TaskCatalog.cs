@@ -1717,13 +1717,13 @@ public sealed class TaskCatalog
                     return new(requestID, ControlResult.Accepted, null);
                 }
             case ControlAction.Mute:
-                Upsert(task with { IsMuted = !task.IsMuted, UpdatedAt = DateTimeOffset.UtcNow });
+                Upsert(task with { IsMuted = !task.IsMuted });
                 break;
             case ControlAction.MarkRead:
-                Upsert(task with { IsUnread = false, UpdatedAt = DateTimeOffset.UtcNow });
+                Upsert(task with { IsUnread = false });
                 break;
             case ControlAction.Pin:
-                Upsert(task with { IsPinned = !task.IsPinned, UpdatedAt = DateTimeOffset.UtcNow });
+                Upsert(task with { IsPinned = !task.IsPinned });
                 break;
             default:
                 return new(requestID, ControlResult.Unsupported, "当前 Codex 通道暂未提供稳定能力");

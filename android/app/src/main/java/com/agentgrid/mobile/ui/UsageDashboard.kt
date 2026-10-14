@@ -39,6 +39,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -59,9 +60,16 @@ internal fun UsageDashboard(
     usage: UsageSnapshot?,
     connected: Boolean,
     modifier: Modifier = Modifier,
+    usages: List<UsageSnapshot> = emptyList(),
 ) {
+    val availableUsages = remember(usage, usages) {
+        val list = usages.ifEmpty { listOfNotNull(usage) }
+        list.distinctBy { it.planType ?: it.limitID }
+    }
+    var selectedProviderIndex by remember(availableUsages) { mutableStateOf(0) }
+    val activeUsage = availableUsages.getOrNull(selectedProviderIndex) ?: usage
     var selectedRange by remember { mutableStateOf(UsageRange.SEVEN_DAYS) }
-    val allPoints = usage?.dailyUsage.orEmpty()
+    val allPoints = activeUsage?.dailyUsage.orEmpty()
 
     BoxWithConstraints(
         modifier = modifier
@@ -76,7 +84,10 @@ internal fun UsageDashboard(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             QuotaPanel(
-                usage = usage,
+                usage = activeUsage,
+                availableUsages = availableUsages,
+                selectedUsageIndex = selectedProviderIndex,
+                onSelectUsageIndex = { selectedProviderIndex = it },
                 connected = connected,
                 modifier = Modifier
                     .width(quotaWidth)
@@ -106,12 +117,28 @@ internal fun UsageDashboard(
 @Composable
 private fun QuotaPanel(
     usage: UsageSnapshot?,
+    availableUsages: List<UsageSnapshot>,
+    selectedUsageIndex: Int,
+    onSelectUsageIndex: (Int) -> Unit,
     connected: Boolean,
     modifier: Modifier = Modifier,
 ) {
+    val isAgy = usage?.planType?.contains("Antigravity", ignoreCase = true) == true
     val windows = usage?.windows.orEmpty()
-    val primary = windows.firstOrNull { it.key == "primary" } ?: windows.firstOrNull()
-    val secondary = windows.firstOrNull { it.key == "secondary" }
+    val hasThreeP = windows.any { it.key.startsWith("3p") }
+    var selectedGroup by remember(usage) { mutableStateOf(0) } // 0 = Gemini, 1 = 3P
+
+    val primary = if (hasThreeP && selectedGroup == 1) {
+        windows.firstOrNull { it.key == "3p-5h" }
+    } else {
+        windows.firstOrNull { it.key == "primary" } ?: windows.firstOrNull()
+    }
+
+    val secondary = if (hasThreeP && selectedGroup == 1) {
+        windows.firstOrNull { it.key == "3p-weekly" }
+    } else {
+        windows.firstOrNull { it.key == "secondary" }
+    }
 
     Column(
         modifier = modifier,
@@ -138,25 +165,54 @@ private fun QuotaPanel(
                     .size(42.dp)
                     .semantics {
                         contentDescription = if (connected) {
-                            "Codex 空闲"
+                            if (isAgy) "Antigravity 空闲" else "Codex 空闲"
                         } else {
-                            "Codex 离线"
+                            if (isAgy) "Antigravity 离线" else "Codex 离线"
                         }
                     },
             )
-            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        if (isAgy) "AGY 额度" else "CODEX 额度",
+                        color = AgentGridColors.Text,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    if (availableUsages.size > 1) {
+                        ProviderSwitcher(
+                            usages = availableUsages,
+                            selectedIndex = selectedUsageIndex,
+                            onSelect = onSelectUsageIndex,
+                        )
+                    }
+                }
                 Text(
-                    "CODEX 额度",
-                    color = AgentGridColors.Text,
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Bold,
-                )
-                Text(
-                    usage?.planType?.uppercase()?.let { "$it 计划" } ?: "订阅计划",
+                    if (isAgy) {
+                        usage?.limitID?.uppercase() ?: "GEMINI & CLAUDE"
+                    } else {
+                        usage?.planType?.uppercase()?.let { "$it 计划" } ?: "订阅计划"
+                    },
                     color = AgentGridColors.Muted,
                     fontSize = 9.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
             }
+        }
+
+        if (hasThreeP) {
+            GroupSwitcher(
+                selectedGroup = selectedGroup,
+                onSelectGroup = { selectedGroup = it },
+            )
         }
 
         PrimaryQuota(window = primary)
@@ -176,9 +232,91 @@ private fun QuotaPanel(
 }
 
 @Composable
+private fun ProviderSwitcher(
+    usages: List<UsageSnapshot>,
+    selectedIndex: Int,
+    onSelect: (Int) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .background(AgentGridColors.SurfaceRaised)
+            .padding(1.dp),
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        usages.forEachIndexed { index, u ->
+            val isCurrentAgy = u.planType?.contains("Antigravity", ignoreCase = true) == true
+            val label = if (isCurrentAgy) "AGY" else "CODEX"
+            val selected = index == selectedIndex
+            Box(
+                modifier = Modifier
+                    .background(if (selected) AgentGridColors.Cyan.copy(alpha = 0.2f) else Color.Transparent)
+                    .clickable { onSelect(index) }
+                    .padding(horizontal = 6.dp, vertical = 2.dp),
+            ) {
+                Text(
+                    label,
+                    color = if (selected) AgentGridColors.Cyan else AgentGridColors.Muted,
+                    fontSize = 8.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun GroupSwitcher(
+    selectedGroup: Int,
+    onSelectGroup: (Int) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(AgentGridColors.SurfaceRaised)
+            .padding(2.dp),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        val geminiSelected = selectedGroup == 0
+        val threePSelected = selectedGroup == 1
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .background(if (geminiSelected) AgentGridColors.Surface else Color.Transparent)
+                .clickable { onSelectGroup(0) }
+                .padding(vertical = 3.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                "GEMINI",
+                color = if (geminiSelected) AgentGridColors.Cyan else AgentGridColors.Muted,
+                fontSize = 9.sp,
+                fontWeight = if (geminiSelected) FontWeight.Bold else FontWeight.Normal,
+            )
+        }
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .background(if (threePSelected) AgentGridColors.Surface else Color.Transparent)
+                .clickable { onSelectGroup(1) }
+                .padding(vertical = 3.dp),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                "3P 模型",
+                color = if (threePSelected) AgentGridColors.Cyan else AgentGridColors.Muted,
+                fontSize = 9.sp,
+                fontWeight = if (threePSelected) FontWeight.Bold else FontWeight.Normal,
+            )
+        }
+    }
+}
+
+@Composable
 private fun PrimaryQuota(window: UsageWindow?) {
     val remaining = window?.remainingPercentage?.roundToInt()?.coerceIn(0, 100)
     val color = quotaColor(remaining)
+    val label = window?.label?.uppercase() ?: "5H"
+    val displayLabel = if (label.endsWith("剩余")) label else "$label 剩余"
 
     Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
         Row(
@@ -193,7 +331,7 @@ private fun PrimaryQuota(window: UsageWindow?) {
                 fontWeight = FontWeight.Bold,
             )
             Text(
-                "${window?.label?.uppercase() ?: "5H"} 剩余",
+                displayLabel,
                 color = AgentGridColors.Muted,
                 fontSize = 10.sp,
                 modifier = Modifier.padding(bottom = 5.dp),
@@ -224,6 +362,8 @@ private fun PrimaryQuota(window: UsageWindow?) {
 private fun SecondaryQuota(window: UsageWindow?) {
     val remaining = window?.remainingPercentage?.roundToInt()?.coerceIn(0, 100)
     val color = quotaColor(remaining)
+    val label = window?.label?.uppercase() ?: "7D"
+    val displayLabel = if (label.endsWith("额度")) label else "$label 额度"
 
     Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
         Row(
@@ -232,7 +372,7 @@ private fun SecondaryQuota(window: UsageWindow?) {
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Text(
-                "${window?.label?.uppercase() ?: "7D"} 额度",
+                displayLabel,
                 color = AgentGridColors.Muted,
                 fontSize = 9.sp,
             )
