@@ -111,7 +111,52 @@ await emit("message.part.updated", { part: { id: "prt_text_new", sessionID: "ses
 await emit("message.part.delta", { sessionID: "ses_t", messageID: "msg_1", partID: "prt_text_new", field: "text", delta: "新正文" })
 await flush()
 const resumed = events("reply").slice(repliesBeforeResume)
-check(resumed.length === 1 && resumed[0].payload.properties.text === "新正文", `fresh preview forwarded after text resumed (got ${JSON.stringify(resumed.map((i) => i.payload.properties.text))})`)
+check(resumed.length === 1 && resumed[0].payload.properties.text === "新正文" && resumed[0].payload.properties.fullText === "新正文", `fresh preview and fullText forwarded after text resumed (got ${JSON.stringify(resumed.map((i) => i.payload.properties))})`)
+
+// 4b. 超过 120 字符的长正文结束帧：即使 preview 已经截断饱和，结束帧也必须把权威全文完整转发（v18 修复）
+const longMarkdown = "# 标题\n" + "A".repeat(200) + "\n| col1 | col2 |\n|---|---|\n| 1 | 2 |"
+await emit("message.part.updated", {
+  part: {
+    id: "prt_text_long",
+    sessionID: "ses_t",
+    messageID: "msg_1",
+    type: "text",
+    text: longMarkdown,
+    time: { start: 21_000, end: 25_000 },
+  },
+})
+await flush()
+const lastReply = events("reply").at(-1)
+check(lastReply?.payload?.properties?.fullText === longMarkdown, "authoritative long fullText forwarded at end frame regardless of preview limit saturation")
+
+// 4c. 流式末尾在节流窗口内到达，结束帧必须补发末尾切片（v19 修复）：
+//     delta 累积了最后 22 字符但在 300ms 内未发，结束帧必须判定 sentLength < fullLength 强行补发。
+const chunk1 = "前段文字已超长".repeat(15) // > 100 字符
+const chunk2 = ">>> 节流尾巴第二行"
+await emit("message.part.updated", { part: { id: "prt_stream_tail", sessionID: "ses_t", messageID: "msg_1", type: "text", text: "" } })
+// 第一块触发发送
+await emit("message.part.delta", { sessionID: "ses_t", messageID: "msg_1", partID: "prt_stream_tail", field: "text", delta: chunk1 })
+await flush()
+const replyAfterChunk1 = events("reply").at(-1)
+check(replyAfterChunk1?.payload?.properties?.fullText === chunk1, "chunk 1 emitted via delta")
+
+// 第二块紧接着到达（在 300ms 节流窗口内，delta 被节流阻断不发）
+await emit("message.part.delta", { sessionID: "ses_t", messageID: "msg_1", partID: "prt_stream_tail", field: "text", delta: chunk2 })
+// 立即收到结束帧
+const streamFull = chunk1 + chunk2
+await emit("message.part.updated", {
+  part: {
+    id: "prt_stream_tail",
+    sessionID: "ses_t",
+    messageID: "msg_1",
+    type: "text",
+    text: streamFull,
+    time: { start: 30_000, end: 30_050 },
+  },
+})
+await flush()
+const finalReply = events("reply").at(-1)
+check(finalReply?.payload?.properties?.fullText === streamFull, "throttled tail emitted via final updated frame (v19 fix)")
 
 // 5. 子会话被删除必须先补终态（v9）：旧实现只删映射不发信号，桥上那条子代理行会永远 running
 await emit("session.created", { info: { id: "ses_child", parentID: "ses_t", title: "explore (@explore subagent)" } })

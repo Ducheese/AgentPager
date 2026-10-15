@@ -393,21 +393,21 @@ Check(!json.Contains("\"OpenCode\""), "wire has no PascalCase enum leakage");
 var temp = Path.Combine(Path.GetTempPath(), "ap-verify-plugins-" + Guid.NewGuid().ToString("N"));
 var installer = new OpenCodePluginConfiguration(temp);
 Check(installer.Status == OpenCodePluginStatus.NotInstalled, "status: 未安装");
-Check(OpenCodePluginConfiguration.EmbeddedVersion == 16, $"embedded plugin version = 16 (got {OpenCodePluginConfiguration.EmbeddedVersion})");
+Check(OpenCodePluginConfiguration.EmbeddedVersion == 19, $"embedded plugin version = 19 (got {OpenCodePluginConfiguration.EmbeddedVersion})");
 var first = installer.Install();
 Check(first.Changed && File.Exists(Path.Combine(temp, "plugins", "agentpager-opencode.js")), "install writes plugin");
 Check(installer.Status == OpenCodePluginStatus.Installed && installer.IsInstalled(), "status: 已写入（与内置一致）");
-Check(installer.InstalledVersion == 16, "installed version = 16");
+Check(installer.InstalledVersion == 19, "installed version = 19");
 var second = installer.Install();
 Check(!second.Changed, "reinstall is idempotent");
 var pluginPath = Path.Combine(temp, "plugins", "agentpager-opencode.js");
 var content = File.ReadAllText(pluginPath);
 Check(content.Contains("Managed by AgentPager (OpenCode)"), "managed marker present");
-Check(content.Contains("agentpager-opencode v16"), "version header present");
+Check(content.Contains("agentpager-opencode v19"), "version header present");
 Check(content.Contains("hook_source: \"opencode\"") && content.Contains("49361"), "plugin content sane");
 File.WriteAllText(pluginPath, content.Replace("const MAX_TEXT = 1000", "const MAX_TEXT = 500"));
 Check(installer.Status == OpenCodePluginStatus.Outdated, "status: 待更新（内容与内置不一致）");
-Check(installer.InstalledVersion == 16, "outdated file still reports v16");
+Check(installer.InstalledVersion == 19, "outdated file still reports v19");
 var repair = installer.Install();
 Check(repair.Changed && installer.Status == OpenCodePluginStatus.Installed, "repair restores 已写入");
 var uninstalled = installer.Uninstall();
@@ -634,9 +634,10 @@ File.WriteAllLines(agyTp, new[]
     "{\"type\":\"GENERIC\",\"content\":\"tool output\"}",
     "{\"type\":\"PLANNER_RESPONSE\",\"content\":\"已修复\",\"input_tokens\":150,\"cache_read_tokens\":30,\"output_tokens\":40}",
 });
-var (agyPrompt, agyPreview, agyTokens) = AgyTranscriptReader.ExtractLatest(agyTp);
+var (agyPrompt, agyPreview, agyTokens, agyFull) = AgyTranscriptReader.ExtractLatest(agyTp);
 Check(agyPrompt == "修好登录", $"agy: transcript prompt cleaned (got '{agyPrompt}')");
 Check(agyPreview == "已修复", $"agy: transcript preview from pure-text latest step (got '{agyPreview}')");
+Check(agyFull == "已修复", $"agy: transcript full response preserved (got '{agyFull}')");
 Check(agyTokens is { Input: 150, CachedInput: 30, Output: 40, Total: 220 }, $"agy: transcript tokens follow latest (got '{agyTokens}')");
 File.Delete(agyTp);
 
@@ -646,9 +647,10 @@ File.WriteAllLines(agyTp2, new[]
     "{\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>再看看</USER_REQUEST>\"}",
     "{\"type\":\"PLANNER_RESPONSE\",\"content\":\"正在执行\",\"tool_calls\":[{\"name\":\"run_command\"}],\"input_tokens\":10,\"output_tokens\":5}",
 });
-var (agyPrompt2, agyPreview2, agyTokens2) = AgyTranscriptReader.ExtractLatest(agyTp2);
+var (agyPrompt2, agyPreview2, agyTokens2, agyFull2) = AgyTranscriptReader.ExtractLatest(agyTp2);
 Check(agyPrompt2 == "再看看", "agy: transcript prompt 2");
 Check(agyPreview2 is null, "agy: preview suppressed when latest step has tool calls");
+Check(agyFull2 is null, "agy: full response suppressed when latest step has tool calls");
 Check(agyTokens2 is { Input: 10, Output: 5 }, "agy: tokens from tool-call planner");
 File.Delete(agyTp2);
 
@@ -2282,6 +2284,18 @@ Check(System.Text.Encoding.UTF8.GetString(OpenCodeHookOutput.Answers([["A", "C"]
 var holdPayload = JsonSerializer.Deserialize<OpenCodeHookPayload>(
     "{\"event\":\"permission.asked\",\"hold\":\"approval\",\"request_id\":\"req_9\",\"properties\":{}}", WireJson.Options)!;
 Check(holdPayload.Hold == "approval" && holdPayload.RequestID == "req_9", "opencode hold: payload carries hold + request_id");
+
+// opencode reply: fullText 保留换行并注入 ResponseBody，text 供第三行预览
+var ocReplyCatalog = new TaskCatalog();
+var ocReplyT0 = DateTimeOffset.UtcNow;
+ocReplyCatalog.Accept(H("session.created", new { id = "ses_reply_test", directory = "F:/Git/app" }), ocReplyT0);
+ocReplyCatalog.Accept(H("chat.message", new { sessionID = "ses_reply_test", text = "写个表格" }), ocReplyT0.AddSeconds(1));
+const string markdownWithTables = "# 标题\n| A | B |\n|---|---|\n| 1 | 2 |";
+ocReplyCatalog.Accept(H("reply", new { sessionID = "ses_reply_test", text = "# 标题 | A | B |", fullText = markdownWithTables }), ocReplyT0.AddSeconds(2));
+var ocReplyTask = ocReplyCatalog.Projection().Tasks.First(t => t.Id == "ses_reply_test");
+Check(ocReplyTask.LatestStep == "# 标题 | A | B |", "opencode reply: LatestStep gets preview");
+Check(ocReplyTask.ResponseBody == markdownWithTables, "opencode reply: ResponseBody gets full multiline markdown");
+
 
 // AgyUsageLoader: 解析真实的 agy /usage JSON 输出
 const string sampleAgyQuotaJson = """

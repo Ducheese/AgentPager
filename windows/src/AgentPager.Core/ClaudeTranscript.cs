@@ -242,7 +242,7 @@ public static class ClaudeTranscriptReader
             if (!block.TryGetProperty("text", out var text)) continue;
             var value = text.GetString();
             if (string.IsNullOrWhiteSpace(value)) continue;
-            if (builder.Length > 0) builder.Append(' ');
+            if (builder.Length > 0) builder.Append("\n\n");
             builder.Append(value);
         }
         return builder.Length == 0 ? null : builder.ToString();

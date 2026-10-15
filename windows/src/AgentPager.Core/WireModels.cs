@@ -61,7 +61,8 @@ public sealed record TaskSnapshot(
     bool IsMuted,
     HashSet<TaskCapability> Capabilities,
     string? ModelName = null,
-    bool PromptQueued = false)
+    bool PromptQueued = false,
+    string? ResponseBody = null)
 {
     [JsonIgnore]
     public bool IsTerminal => Lifecycle is AgentLifecycle.Succeeded or AgentLifecycle.Interrupted or AgentLifecycle.Offline;

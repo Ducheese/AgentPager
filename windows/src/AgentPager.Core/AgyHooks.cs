@@ -184,29 +184,30 @@ public static class AgyTranscriptReader
         @"<(?:ADDITIONAL_METADATA|USER_SETTINGS_CHANGE)>[\s\S]*?</(?:ADDITIONAL_METADATA|USER_SETTINGS_CHANGE)>",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
-    public static (string? UserPrompt, string? LatestResponse, TokenUsage? Tokens) ExtractLatest(string? transcriptPath)
+    public static (string? UserPrompt, string? LatestResponse, TokenUsage? Tokens, string? ResponseBody) ExtractLatest(string? transcriptPath)
     {
         if (string.IsNullOrWhiteSpace(transcriptPath) || !File.Exists(transcriptPath))
-            return (null, null, null);
+            return (null, null, null, null);
 
         try
         {
             var fileInfo = new FileInfo(transcriptPath);
             var readSize = (int)Math.Min(fileInfo.Length, 256 * 1024); // 读取尾部最多 256KB
-            if (readSize <= 0) return (null, null, null);
+            if (readSize <= 0) return (null, null, null, null);
 
             byte[] buffer = new byte[readSize];
             using (var stream = new FileStream(transcriptPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
             {
                 stream.Seek(-readSize, SeekOrigin.End);
                 int bytesRead = stream.Read(buffer, 0, readSize);
-                if (bytesRead <= 0) return (null, null, null);
+                if (bytesRead <= 0) return (null, null, null, null);
             }
 
             var text = Encoding.UTF8.GetString(buffer);
             var lines = text.Split('\n');
             string? userPrompt = null;
             string? latestResponse = null;
+            string? fullResponse = null;
             TokenUsage? tokens = null;
             var foundLatestPlannerInTurn = false;
             var turnBoundaryReached = false;
@@ -261,6 +262,7 @@ public static class AgyTranscriptReader
                                 {
                                     latestResponse = normalized.Length > 120 ? normalized[..120] : normalized;
                                 }
+                                fullResponse = resp.Trim();
                             }
                         }
                     }
@@ -271,11 +273,11 @@ public static class AgyTranscriptReader
                     break;
             }
 
-            return (userPrompt, latestResponse, tokens);
+            return (userPrompt, latestResponse, tokens, fullResponse);
         }
         catch
         {
-            return (null, null, null);
+            return (null, null, null, null);
         }
     }
 
@@ -418,11 +420,12 @@ public static class AgyEventReducer
         // 按事件门控（A5）：仅 PreInvocation / PostInvocation / Stop 需要，工具事件跳过整段 256KB 读取。
         string? userPrompt = null;
         string? latestResponse = null;
+        string? fullResponse = null;
         TokenUsage? tokens = null;
         if (hook.EffectiveEvent is "PreInvocation" or "PostInvocation" or "Stop" &&
             !string.IsNullOrWhiteSpace(hook.TranscriptPath))
         {
-            (userPrompt, latestResponse, tokens) = AgyTranscriptReader.ExtractLatest(hook.TranscriptPath);
+            (userPrompt, latestResponse, tokens, fullResponse) = AgyTranscriptReader.ExtractLatest(hook.TranscriptPath);
             if (userPrompt is not null && !task.PromptQueued)
             {
                 task = task with { UserPrompt = userPrompt };
@@ -430,6 +433,10 @@ public static class AgyEventReducer
             if (tokens is not null)
             {
                 task = task with { TokenUsage = tokens };
+            }
+            if (fullResponse is not null)
+            {
+                task = task with { ResponseBody = fullResponse };
             }
         }
 
@@ -485,6 +492,7 @@ public static class AgyEventReducer
                     StartedAt = startsNewRound ? now : task.StartedAt,
                     // 新一轮开聊时清空第三行，让 lifecycle 文案兜底；轮内插入与"被唤醒续跑"都不清空
                     LatestStep = startsNewRound ? null : task.LatestStep,
+                    ResponseBody = startsNewRound ? null : task.ResponseBody,
                     CompletedAt = null,
                     Capabilities = [],
                     PromptQueued = false, // 排队接单，标记解除
@@ -666,9 +674,12 @@ public static class AgyEventReducer
     /// 暂无则返回 null（由调用方保留登记、下个心跳再试）。</summary>
     public static TaskSnapshot? TryApplyLatePreview(TaskSnapshot task, string transcriptPath)
     {
-        var (_, preview, _) = AgyTranscriptReader.ExtractLatest(transcriptPath);
-        if (preview is null) return null;
-        return WithStep(task, preview);
+        var (_, preview, _, full) = AgyTranscriptReader.ExtractLatest(transcriptPath);
+        if (preview is null && full is null) return null;
+        var next = task;
+        if (preview is not null) next = WithStep(next, preview);
+        if (full is not null) next = next with { ResponseBody = full };
+        return next;
     }
 
     public static string? QuestionText(JsonElement? args)

@@ -782,7 +782,7 @@ public sealed class TaskCatalog
         // Stop 终稿落盘竞速补救登记（条目 1）：预览缺失时交给 Maintain 限期内重读。
         if (hook.EffectiveEvent == "Stop" && !string.IsNullOrWhiteSpace(hook.TranscriptPath))
         {
-            var (_, preview, _) = AgyTranscriptReader.ExtractLatest(hook.TranscriptPath);
+            var (_, preview, _, _) = AgyTranscriptReader.ExtractLatest(hook.TranscriptPath);
             if (preview is null) _agyPreviewRecheck[sessionID] = (hook.TranscriptPath, now.AddMinutes(1));
             else _agyPreviewRecheck.Remove(sessionID);
         }
@@ -1050,7 +1050,7 @@ public sealed class TaskCatalog
 
         if (!string.IsNullOrWhiteSpace(hook.TranscriptPath))
         {
-            var (_, _, tokens) = AgyTranscriptReader.ExtractLatest(hook.TranscriptPath);
+            var (_, _, tokens, _) = AgyTranscriptReader.ExtractLatest(hook.TranscriptPath);
             if (tokens is not null) subagent = subagent with { TokenUsage = tokens };
         }
 
@@ -2427,7 +2427,8 @@ public static class ClaudeEventReducer
         // 转录本那条要过"属于本轮"的闸；过不了就退回 payload 自带的终稿（它一定是本轮的）。
         // **别改成"宽松口径"**：Stop 存在"终稿还没落盘"的竞态，宽松口径会一路往回捞到**更早**的一段
         // 正文并把它钉在第三行（且因为第三行非空，G41 的补读也不会触发）——实测踩过，已回退。
-        var preview = FreshReply(transcript, task.StartedAt) ?? Normalize(hook.LastAssistantMessage);
+        var rawReply = FreshReply(transcript, task.StartedAt) ?? hook.LastAssistantMessage;
+        var preview = Normalize(rawReply);
         var next = task with
         {
             Lifecycle = interrupted ? AgentLifecycle.Interrupted : AgentLifecycle.Succeeded,
@@ -2435,6 +2436,7 @@ public static class ClaudeEventReducer
             CompletedAt = now,
             IsUnread = true,
             Capabilities = [],
+            ResponseBody = rawReply?.Trim(),
         };
         return WithPreview(next, preview);
     }
@@ -2491,6 +2493,11 @@ public static class ClaudeEventReducer
 
         if (transcript?.Tokens is not null) result = result with { TokenUsage = transcript.Tokens };
         if (transcript?.Model is not null) result = result with { ModelName = transcript.Model };
+        if (result.Lifecycle == AgentLifecycle.Succeeded &&
+            FreshReply(transcript, result.StartedAt) is { Length: > 0 } reply)
+        {
+            result = result with { ResponseBody = reply.Trim() };
+        }
 
         // 排队：转录本里最后一条**非系统**队列操作是 enqueue，且时间晚于本轮起点，
         // 就说明"本轮跑着的时候用户又提交了一条"（opencode 的 queued 语义）。
@@ -2742,6 +2749,7 @@ public static class ClaudeEventReducer
             UserPrompt = normalized ?? task.UserPrompt,
             StartedAt = startsTurn ? now : task.StartedAt,
             LatestStep = startsTurn ? null : task.LatestStep,
+            ResponseBody = startsTurn ? null : task.ResponseBody,
             CompletedAt = null,
             Capabilities = [],
         };
@@ -2877,7 +2885,13 @@ public static class OpenCodeEventReducer
                 // 工具活动期间忽略：正文结束帧可能晚于工具 part 约 200ms（实测乱序），
                 // 不拦会把刚写入的命令/工具步骤盖回上一段正文。
                 if (task.Activity is not null and not AgentActivity.Thinking) return task;
-                return Text(hook.Properties, "text") is { } preview ? WithStep(task, Clamp(preview, 220)) : task;
+                var preview = Text(hook.Properties, "text");
+                var fullText = RawText(hook.Properties, "fullText") ?? RawText(hook.Properties, "text");
+                if (fullText is not null)
+                {
+                    task = task with { ResponseBody = fullText.Trim() };
+                }
+                return preview is not null ? WithStep(task, Clamp(preview, 220)) : task;
             case "permission.asked":
                 return task with
                 {
@@ -3251,6 +3265,7 @@ public static class OpenCodeEventReducer
             StartedAt = startsTurn ? now : task.StartedAt,
             // 新一轮开始时清空第三行，让 lifecycle 文案兜底；轮内插入不清。
             LatestStep = startsTurn ? null : task.LatestStep,
+            ResponseBody = startsTurn ? null : task.ResponseBody,
             CompletedAt = null,
             Capabilities = [],
         };
@@ -3379,6 +3394,13 @@ public static class OpenCodeEventReducer
         value.ValueKind is not (JsonValueKind.Null or JsonValueKind.Undefined)
             ? value
             : null;
+
+    private static string? RawText(JsonElement? element, string name)
+    {
+        if (element is not { } value || value.ValueKind != JsonValueKind.Object) return null;
+        if (!value.TryGetProperty(name, out var child) || child.ValueKind != JsonValueKind.String) return null;
+        return child.GetString();
+    }
 
     private static string? Text(JsonElement? element, string name)
     {

@@ -907,10 +907,14 @@ private fun TaskDetails(
     onControl: (String, ControlAction, String?, List<String>?) -> Unit,
 ) {
     var answer by remember(task.id) { mutableStateOf("") }
+    val showResponseBody = showToken &&
+        task.lifecycle == AgentLifecycle.SUCCEEDED &&
+        !task.responseBody.isNullOrBlank()
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .heightIn(max = if (compact) 320.dp else 250.dp)
+            .heightIn(max = if (showResponseBody) (if (compact) 480.dp else 380.dp) else (if (compact) 320.dp else 250.dp))
             .verticalScroll(rememberScrollState())
             .padding(start = if (compact) 68.dp else 82.dp, end = if (compact) 8.dp else 18.dp, bottom = 8.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -932,6 +936,9 @@ private fun TaskDetails(
                     tokenDetailsText(task),
                     AgentGridColors.Cyan,
                 )
+            }
+            if (showResponseBody) {
+                ResponseSection(markdown = task.responseBody!!)
             }
         }
         AnimatedContent(
@@ -1133,6 +1140,30 @@ private fun DetailLine(label: String, value: String, color: Color) {
     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         Text(label, color = color, fontSize = 9.sp, modifier = Modifier.width(58.dp))
         Text(value, color = AgentGridColors.Muted, fontSize = 10.sp)
+    }
+}
+
+@Composable
+private fun ResponseSection(markdown: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Text(
+            "REPLY",
+            color = AgentGridColors.Green,
+            fontSize = 9.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.width(58.dp),
+        )
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .background(AgentGridColors.SurfaceRaised.copy(alpha = 0.6f))
+                .padding(8.dp),
+        ) {
+            MarkdownView(markdown = markdown)
+        }
     }
 }
 

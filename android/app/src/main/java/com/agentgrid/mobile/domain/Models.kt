@@ -145,6 +145,7 @@ data class TaskSnapshot(
     val capabilities: Set<TaskCapability> = emptySet(),
     val modelName: String? = null,
     val promptQueued: Boolean = false,
+    val responseBody: String? = null,
 ) {
     val isTerminal: Boolean
         get() = lifecycle in setOf(
