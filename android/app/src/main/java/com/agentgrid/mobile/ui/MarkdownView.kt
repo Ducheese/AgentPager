@@ -631,13 +631,28 @@ private fun TableBlockView(block: MarkdownBlock.Table) {
         }
     }
 
+    val totalWidth = colWidths.fold(0.dp) { sum, width -> sum + width }
+
+    // 边框和宽度都必须落在 Column 自己身上，不能挂在外层滚动容器上。
+    // `horizontalScroll` 会把内容测得的宽度约束设成**无穷大**，而无穷大约束下 `fillMaxWidth()`
+    // 解析成 constraints.minWidth（= 0）：挂在滚动容器外层的 border 就成了"整块面板宽"的大框，
+    // Column 里那些 fillMaxWidth() 的表头线/行间线宽度则直接塌成 0、整条不可见。
+    // 给 Column 一个显式宽度，等于把约束重新变回有界，fillMaxWidth() 才按表格自己的宽度解析；
+    // 表格比面板窄时边框贴着表格，比面板宽时整体横向滚动。
+    //
+    // 注：这处是读 Compose 语义发现的独立缺陷，**不是** 2026-10-15 那次"表格散架"的成因
+    // （那次是正文换行被 Normalize 抽干，表格压根没走到这里）。修它是因为换行修好之后表格
+    // 真的会走到这个分支，缺陷从不可达变成可达。
     Box(
         modifier = Modifier
             .fillMaxWidth()
-            .border(1.dp, AgentGridColors.Divider)
             .horizontalScroll(rememberScrollState()),
     ) {
-        Column {
+        Column(
+            modifier = Modifier
+                .width(totalWidth)
+                .border(1.dp, AgentGridColors.Divider),
+        ) {
             // 表头
             Row(modifier = Modifier.background(AgentGridColors.SurfaceRaised)) {
                 for (c in 0 until columnCount) {

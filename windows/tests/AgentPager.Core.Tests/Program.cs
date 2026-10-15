@@ -722,6 +722,33 @@ Check(claudeSnapshot.Title == "修复登录流程", $"claude: ai-title from tran
 Check(claudeSnapshot.Tokens is { Input: 150, CachedInput: 30, Output: 40, ReasoningOutput: 5, Total: 220 }, "claude: token usage mapped from message.usage");
 Check(claudeSnapshot.Model == "deepseek-v4.1-flash", $"claude: model label takes last segment (got '{claudeSnapshot.Model}')");
 Check(claudeSnapshot.LatestReply == "已修复登录流程", $"claude: reply preview from transcript (got '{claudeSnapshot.LatestReply}')");
+Check(claudeSnapshot.LatestReplyFull == "已修复登录流程", $"claude: full reply from transcript (got '{claudeSnapshot.LatestReplyFull}')");
+
+// 预览截 120、全文不截 —— 展开后的 REPLY 面板画的是全文，共用截断那份只会显示半句话。
+// 这也正是它必须单独存在一个字段的理由（agy 的 latestResponse / fullResponse 是同一对分工）。
+var longReplyText = new string('字', 300);
+var longReply = ReadTranscript(
+[
+    "{\"type\":\"user\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":\"写长一点\"}}",
+    "{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"" + longReplyText + "\"}]}}",
+]);
+Check(longReply.LatestReply?.Length == 120, $"claude: preview stays truncated to 120 (got {longReply.LatestReply?.Length})");
+Check(longReply.LatestReplyFull?.Length == 300, $"claude: full reply is not truncated (got {longReply.LatestReplyFull?.Length})");
+
+// 正文全文**必须保留换行**。Normalize 会把 \r\n 换成空格再合并，那是给第三行那种单行预览用的；
+// 正文一旦被压平，Markdown 的块级语法就全废 —— 标题、列表、表格**全靠换行划界**。
+// 实测（2026-10-15 真机）：表格在手机上"散架"（管道符和横线原样画出来），根因就是这里被压平。
+// 这条断言存在的意义：上一版测试喂给解析器的是**带换行的原文**，而真实链路早把换行抽干了，
+// 于是测试全绿而线上是坏的 —— 断点必须卡在"读取器吐出来的字符串"上，不是解析器的入参上。
+var multiLine = ReadTranscript(
+[
+    "{\"type\":\"user\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":\"给我张表\"}}",
+    "{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"先说一句。\\n\\n| 甲 | 乙 |\\n|---|---|\\n| 1 | 2 |\"}]}}",
+]);
+Check(multiLine.LatestReply?.Contains('\n') == false, "claude body: third-line preview is still flattened to one line");
+Check(multiLine.LatestReplyFull?.Contains('\n') == true, "claude body: panel body keeps its newlines");
+Check(multiLine.LatestReplyFull == "先说一句。\n\n| 甲 | 乙 |\n|---|---|\n| 1 | 2 |",
+    $"claude body: newlines survive verbatim (got '{multiLine.LatestReplyFull?.Replace("\n", "\\n")}')");
 
 var titled = ClaudeEventReducer.ApplyTranscript(Claude(), claudeSnapshot);
 Check(titled.Title == "demo · 修复登录流程", $"claude: title composed as project · title (got '{titled.Title}')");
@@ -1108,7 +1135,13 @@ noInputCatalog.Accept(C("PermissionRequest", new { session_id = "claude_8", tool
 Check(!noInputCatalog.Projection().Tasks.First(x => x.Id == "claude_8").Capabilities.Contains(TaskCapability.Answer),
     "claude answer: no raw input -> no Answer capability");
 
-// ===================== 22. 中间正文进第三行（B） =====================
+// ===================== 22. 心跳只喂正文面板，不碰第三行（B） =====================
+// 2026-10-15 用户裁定：第三行的语义是"最新一步"，**中途正文不进第三行**。
+//
+// 这里原本有一条"没有工具在跑时把中间正文落进第三行"的路径，已撤掉。理由：Claude 把正文和
+// 工具调用写成**相隔约 2ms 的两行**（实测 15:36:30.048 `[text]` → .050 `[tool_use]`），
+// 于是"最新一行是正文"这个状态几乎不存在 —— 那条路径实际上永远送不出去，留着只会让人
+// 以为它在工作。撤掉之后语义反而干净：第三行只认工具步，中途正文只走展开后的 REPLY 面板。
 var replyCatalog = new TaskCatalog();
 var replyNow = DateTimeOffset.UtcNow;
 var replyPath = Path.Combine(Path.GetTempPath(), "ap-verify-claude-reply-" + Guid.NewGuid().ToString("N") + ".jsonl");
@@ -1120,21 +1153,24 @@ TaskSnapshot ReplyTask() => replyCatalog.Projection().Tasks.First(x => x.Id == "
 File.AppendAllLines(replyPath,
     ["{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"先说一句中间的话\"}]}}"]);
 replyCatalog.Maintain(replyNow.AddSeconds(3));
-Check(ReplyTask().LatestStep == "先说一句中间的话", $"claude reply: mid-turn text reaches the third line (got '{ReplyTask().LatestStep}')");
+Check(ReplyTask().LatestStep is null, $"claude reply: mid-turn text must NOT reach the third line (got '{ReplyTask().LatestStep}')");
+Check(ReplyTask().ResponseBody == "先说一句中间的话", $"claude reply: mid-turn text goes to the panel instead (got '{ReplyTask().ResponseBody}')");
 
-// 工具在跑：新的中间正文不得盖掉工具步
+// 工具在跑：第三行是工具步；正文继续只走面板
 replyCatalog.Accept(C("PreToolUse", new { session_id = "claude_6", transcript_path = replyPath, tool_name = "Bash", tool_input = new { command = "npm test" } }), replyNow.AddSeconds(4));
 File.AppendAllLines(replyPath,
     ["{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"工具跑着的时候写的字\"}]}}"]);
 replyCatalog.Maintain(replyNow.AddSeconds(6));
-Check(ReplyTask().LatestStep == "Bash npm test", $"claude reply: tool step survives while a tool runs (got '{ReplyTask().LatestStep}')");
+Check(ReplyTask().LatestStep == "Bash npm test", $"claude reply: third line holds the tool step (got '{ReplyTask().LatestStep}')");
+Check(ReplyTask().ResponseBody == "工具跑着的时候写的字", $"claude reply: panel still updates while a tool runs (got '{ReplyTask().ResponseBody}')");
 
-// 工具结束：新的正文可以回来（心跳按转录本 mtime 门控，所以这里要再追加一次）
+// 工具结束：正文**不会**回到第三行（面板照旧更新）
 replyCatalog.Accept(C("PostToolUse", new { session_id = "claude_6", transcript_path = replyPath, tool_name = "Bash" }), replyNow.AddSeconds(7));
 File.AppendAllLines(replyPath,
     ["{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"工具跑完之后写的话\"}]}}"]);
 replyCatalog.Maintain(replyNow.AddSeconds(9));
-Check(ReplyTask().LatestStep == "工具跑完之后写的话", $"claude reply: preview resumes after the tool ends (got '{ReplyTask().LatestStep}')");
+Check(ReplyTask().LatestStep == "Bash npm test", $"claude reply: third line does NOT resume with mid-turn text (got '{ReplyTask().LatestStep}')");
+Check(ReplyTask().ResponseBody == "工具跑完之后写的话", $"claude reply: panel tracks the newest text (got '{ReplyTask().ResponseBody}')");
 
 // 残留守卫：回合刚开始时转录本里还没有新一轮的 user 行，倒序扫到的是**上一回合**的正文，
 // 它早于本轮起点，必须被丢弃（实测踩过：第三行"经常残留上一个 reply"）
@@ -1150,6 +1186,9 @@ staleCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_10", prompt
 staleCatalog.Maintain(staleNow.AddSeconds(3));
 Check(staleCatalog.Projection().Tasks.First(x => x.Id == "claude_10").LatestStep is null,
     $"claude reply: previous turn's reply must not leak in (got '{staleCatalog.Projection().Tasks.First(x => x.Id == "claude_10").LatestStep}')");
+// 正文能跨工具步，但**绝不能跨回合** —— 面板上显示上一轮说过的话比空着更糟
+Check(staleCatalog.Projection().Tasks.First(x => x.Id == "claude_10").ResponseBody is null,
+    $"claude body: previous turn's reply must not leak into the panel (got '{staleCatalog.Projection().Tasks.First(x => x.Id == "claude_10").ResponseBody}')");
 
 // 回合内"最新一步是工具调用"时，不得回退去拿更早的正文
 // （用户实测："laststep 工具调用内容无法覆盖上一个 reply"——心跳把工具步盖成了上一段正文）
@@ -1161,6 +1200,11 @@ var toolLatest = ReadTranscript(
 ]);
 Check(toolLatest.LatestReply is null,
     $"claude reply: tool-only latest step yields no reply candidate (got '{toolLatest.LatestReply}')");
+// 正文全文**可以**跨过工具步往回找（与 LatestReply 正相反）。实测（2026-10-15 本机真跑）
+// Claude 把正文和工具调用写成两行：`[text]` 紧跟 `[tool_use]`，倒序扫到的第一条永远是工具调用，
+// 不跨就整个回合拿不到正文——而"说一句就调工具"正是回合中的常态。
+Check(toolLatest.LatestReplyFull == "先看看代码",
+    $"claude reply: full body looks back past the tool step (got '{toolLatest.LatestReplyFull}')");
 
 // 最新一步又是正文时，照常给出候选
 var textLatest = ReadTranscript(
@@ -1171,8 +1215,10 @@ var textLatest = ReadTranscript(
 ]);
 Check(textLatest.LatestReply == "跑完了，接着看",
     $"claude reply: text after a tool still becomes the candidate (got '{textLatest.LatestReply}')");
+Check(textLatest.LatestReplyFull == "跑完了，接着看",
+    $"claude reply: text after a tool becomes the full body too (got '{textLatest.LatestReplyFull}')");
 
-// 端到端：工具跑完后心跳不得把工具步盖成上一段正文
+// 端到端：心跳不写第三行，但面板照收 —— 两者在同一个 Maintain 里分道扬镳
 var clobberCatalog = new TaskCatalog();
 var clobberNow = DateTimeOffset.UtcNow;
 var clobberPath = Path.Combine(Path.GetTempPath(), "ap-verify-claude-clobber-" + Guid.NewGuid().ToString("N") + ".jsonl");
@@ -1183,16 +1229,48 @@ File.WriteAllLines(clobberPath,
 ]);
 clobberCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_11", prompt = "干活", transcript_path = clobberPath }), clobberNow);
 clobberCatalog.Maintain(clobberNow.AddSeconds(3));
-Check(clobberCatalog.Projection().Tasks.First(x => x.Id == "claude_11").LatestStep == "先看看代码",
-    "claude clobber: text shows while the model writes");
+Check(clobberCatalog.Projection().Tasks.First(x => x.Id == "claude_11").LatestStep is null,
+    $"claude clobber: heartbeat leaves the third line alone (got '{clobberCatalog.Projection().Tasks.First(x => x.Id == "claude_11").LatestStep}')");
+Check(clobberCatalog.Projection().Tasks.First(x => x.Id == "claude_11").ResponseBody == "先看看代码",
+    $"claude clobber: the same heartbeat still feeds the panel (got '{clobberCatalog.Projection().Tasks.First(x => x.Id == "claude_11").ResponseBody}')");
 clobberCatalog.Accept(C("PreToolUse", new { session_id = "claude_11", transcript_path = clobberPath, tool_name = "Bash", tool_input = new { command = "ls" } }), clobberNow.AddSeconds(4));
 File.AppendAllLines(clobberPath,
     ["{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\"}]}}"]);
 clobberCatalog.Accept(C("PostToolUse", new { session_id = "claude_11", transcript_path = clobberPath, tool_name = "Bash" }), clobberNow.AddSeconds(5));
 clobberCatalog.Maintain(clobberNow.AddSeconds(8));
 Check(clobberCatalog.Projection().Tasks.First(x => x.Id == "claude_11").LatestStep == "Bash ls",
-    $"claude clobber: heartbeat must not overwrite the tool step with an older reply (got '{clobberCatalog.Projection().Tasks.First(x => x.Id == "claude_11").LatestStep}')");
+    $"claude clobber: the tool step owns the third line (got '{clobberCatalog.Projection().Tasks.First(x => x.Id == "claude_11").LatestStep}')");
+// 数据侧：非完成态也得有 ResponseBody，展开后的 REPLY 面板全靠它显示中途正文。
+// 要紧的是它在工具步顶掉第三行之后**照样留着** —— 这就是"面板比第三行留得住正文"的根据。
+Check(clobberCatalog.Projection().Tasks.First(x => x.Id == "claude_11").Lifecycle == AgentLifecycle.Running,
+    "claude body: the fixture is still mid-turn when the body is asserted");
+Check(clobberCatalog.Projection().Tasks.First(x => x.Id == "claude_11").ResponseBody == "先看看代码",
+    $"claude body: full body lands on the heartbeat and survives the tool step (got '{clobberCatalog.Projection().Tasks.First(x => x.Id == "claude_11").ResponseBody}')");
 File.Delete(clobberPath);
+
+// 这个功能的立身之本：工具**正在跑**的时候，正文照样进面板，而第三行保持工具步不动。
+// 第三行与面板在这里必须分道扬镳 —— 同进同退就等于没做这个功能。
+var activeCatalog = new TaskCatalog();
+var activeNow = DateTimeOffset.UtcNow;
+var activePath = Path.Combine(Path.GetTempPath(), "ap-verify-claude-body-active-" + Guid.NewGuid().ToString("N") + ".jsonl");
+File.WriteAllLines(activePath,
+[
+    "{\"type\":\"user\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":\"干活\"}}",
+]);
+activeCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_12", prompt = "干活", transcript_path = activePath }), activeNow);
+activeCatalog.Accept(C("PreToolUse", new { session_id = "claude_12", transcript_path = activePath, tool_name = "Bash", tool_input = new { command = "ls" } }), activeNow.AddSeconds(1));
+File.AppendAllLines(activePath,
+[
+    "{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"先看一眼目录\"}]}}",
+    "{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\"}]}}",
+]);
+activeCatalog.Maintain(activeNow.AddSeconds(4));
+var activeTask = activeCatalog.Projection().Tasks.First(x => x.Id == "claude_12");
+Check(activeTask.LatestStep == "Bash ls",
+    $"claude body/active: the tool step keeps the third line (got '{activeTask.LatestStep}')");
+Check(activeTask.ResponseBody == "先看一眼目录",
+    $"claude body/active: the panel updates even while a tool is running (got '{activeTask.ResponseBody}')");
+File.Delete(activePath);
 
 // 本轮自己的正文（时间晚于本轮起点）照常生效
 File.AppendAllLines(stalePath,
@@ -1201,18 +1279,73 @@ File.AppendAllLines(stalePath,
     "{\"type\":\"assistant\",\"isSidechain\":false,\"timestamp\":\"" + staleNow.AddSeconds(2).ToString("o") + "\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"这一轮的回复\"}]}}",
 ]);
 staleCatalog.Maintain(staleNow.AddSeconds(6));
-Check(staleCatalog.Projection().Tasks.First(x => x.Id == "claude_10").LatestStep == "这一轮的回复",
-    $"claude reply: current turn's reply still lands (got '{staleCatalog.Projection().Tasks.First(x => x.Id == "claude_10").LatestStep}')");
+Check(staleCatalog.Projection().Tasks.First(x => x.Id == "claude_10").LatestStep is null,
+    $"claude reply: heartbeat still never writes the third line (got '{staleCatalog.Projection().Tasks.First(x => x.Id == "claude_10").LatestStep}')");
+Check(staleCatalog.Projection().Tasks.First(x => x.Id == "claude_10").ResponseBody == "这一轮的回复",
+    $"claude body: current turn's reply reaches the panel (got '{staleCatalog.Projection().Tasks.First(x => x.Id == "claude_10").ResponseBody}')");
 File.Delete(stalePath);
 
-// 回显守卫在正文路径同样生效
+// 回显候选（正文整段包含用户提示词）。
+// 心跳路径现在完全不写第三行了，所以"心跳不放回显"退化成恒真 —— 这条改成钉住那个事实本身。
+//
+// **面板不走回显守卫**（下面第二条断言是刻意的）：候选是"模型真说过的话"，逐字引用用户的
+// 提示词再作答是正常表达，面板把它吞掉反而更糟。第三行才需要这条守卫 —— 那里一行顶一行，
+// 回显会冒充成"进度"，而面板是明确标着 REPLY 的正文区，没有冒名的风险。
 var echoCatalog = new TaskCatalog();
 echoCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_9", prompt = "把构建脚本修一下", transcript_path = replyPath }), replyNow);
 File.AppendAllLines(replyPath,
     ["{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"好，把构建脚本修一下这项工作我这就开始\"}]}}"]);
 echoCatalog.Maintain(replyNow.AddSeconds(3));
 Check(echoCatalog.Projection().Tasks.First(x => x.Id == "claude_9").LatestStep is null,
-    "claude reply: prompt echo rejected on the heartbeat path too");
+    "claude reply: heartbeat never writes the third line (echo or not)");
+Check(echoCatalog.Projection().Tasks.First(x => x.Id == "claude_9").ResponseBody == "好，把构建脚本修一下这项工作我这就开始",
+    $"claude body: panel keeps a reply that quotes the prompt (got '{echoCatalog.Projection().Tasks.First(x => x.Id == "claude_9").ResponseBody}')");
+
+// ============ 等待作答的"顺延补偿"到底会不会毁掉面板上的正文（用户要求复现）============
+// 待验的假设：任务退出等待态时 Upsert 把 StartedAt 往前推 pauseDuration，
+// 于是"提问之前写的那段正文"时间戳落到新起点之前，被回合闸判成上一轮的 → 面板空。
+// 这条复现把每一步都钉住，让代码自己回答，别靠推演。
+var pauseCatalog = new TaskCatalog();
+var pauseNow = DateTimeOffset.UtcNow;
+var pausePath = Path.Combine(Path.GetTempPath(), "ap-verify-claude-pause-" + Guid.NewGuid().ToString("N") + ".jsonl");
+File.WriteAllLines(pausePath,
+    ["{\"type\":\"user\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":\"干活\"}}"]);
+pauseCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_13", prompt = "干活", transcript_path = pausePath }), pauseNow);
+TaskSnapshot PauseTask() => pauseCatalog.Projection().Tasks.First(x => x.Id == "claude_13");
+
+// ① 正文先落进面板。**助手行必须带 timestamp** —— 真转录本每行都有（实测
+// `ts=2026-10-15T15:36:30.048Z`），而回合闸的写法是 `at is not { } at || at >= turnStart`：
+// 没有时间戳就直接放行。fixture 漏了它，这条复现就会假通过。
+File.AppendAllLines(pausePath,
+    ["{\"type\":\"assistant\",\"isSidechain\":false,\"timestamp\":\"" + pauseNow.AddSeconds(3).ToString("o")
+     + "\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"我先问你个问题\"}]}}"]);
+pauseCatalog.Maintain(pauseNow.AddSeconds(3));
+Check(PauseTask().ResponseBody == "我先问你个问题", $"pause (1) body lands before the question (got '{PauseTask().ResponseBody}')");
+var pauseStartedAt = PauseTask().StartedAt;
+
+// ② 进入等待作答
+pauseCatalog.Accept(C("PermissionRequest", new { session_id = "claude_13", tool_name = "AskUserQuestion", tool_input = askInput }), pauseNow.AddSeconds(4));
+Check(PauseTask().Lifecycle == AgentLifecycle.WaitingAnswer, $"pause (2) task waits for an answer (got {PauseTask().Lifecycle})");
+
+// ③ 五分钟后人作答放行 → 看 StartedAt 有没有被推后
+pauseCatalog.Accept(C("PostToolUse", new { session_id = "claude_13", transcript_path = pausePath, tool_name = "AskUserQuestion" }), pauseNow.AddMinutes(5));
+Check(PauseTask().StartedAt > pauseStartedAt,
+    $"pause (3) StartedAt is pushed forward by the wait (was {pauseStartedAt:HH:mm:ss}, now {PauseTask().StartedAt:HH:mm:ss})");
+
+// ④ 被推后之后，提问前那段正文还过不过"属于本轮"的闸？
+var pauseTranscript = ClaudeTranscriptReader.Read(pausePath);
+Check(ClaudeEventReducer.FreshReplyFull(pauseTranscript, PauseTask().StartedAt) is null,
+    "pause (4) the pre-question body no longer passes the turn gate");
+
+// ⑤ 但**已经在面板上的正文没人清它** —— 这是关键：闸管的是"能不能新写入"，不是"要不要擦掉"
+Check(PauseTask().ResponseBody == "我先问你个问题",
+    $"pause (5) a body already on the panel is NOT wiped by the wait (got '{PauseTask().ResponseBody}')");
+
+// ⑥ 心跳再跑一次也不会擦（RefreshClaudeTranscript 只写不清）
+pauseCatalog.Maintain(pauseNow.AddMinutes(5).AddSeconds(3));
+Check(PauseTask().ResponseBody == "我先问你个问题",
+    $"pause (6) the heartbeat does not clear it either (got '{PauseTask().ResponseBody}')");
+File.Delete(pausePath);
 File.Delete(replyPath);
 
 // ===================== 23. 控制消息签名：转义必须与 App 端 kotlinx 逐字节一致 =====================

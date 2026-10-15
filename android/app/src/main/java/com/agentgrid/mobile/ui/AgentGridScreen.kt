@@ -907,9 +907,10 @@ private fun TaskDetails(
     onControl: (String, ControlAction, String?, List<String>?) -> Unit,
 ) {
     var answer by remember(task.id, pending?.summary) { mutableStateOf("") }
-    val showResponseBody = showToken &&
-        task.lifecycle == AgentLifecycle.SUCCEEDED &&
-        !task.responseBody.isNullOrBlank()
+    // 非完成态也显示：第三行会被后续工具步顶掉，展开后的 REPLY 面板是唯一能留住中途正文的地方。
+    // 三家在回合中都会喂 ResponseBody（agy 的 PostInvocation、opencode 的 reply 事件、
+    // Claude 的心跳全文），只是以前这里卡了 SUCCEEDED 才把它挡住。
+    val showResponseBody = showToken && !task.responseBody.isNullOrBlank()
 
     Column(
         modifier = Modifier

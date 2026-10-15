@@ -239,4 +239,47 @@ class MarkdownParserTest {
         assertEquals(0, ordered.items[3].level)
         assertEquals(2, ordered.items[3].number)
     }
+
+    @Test
+    fun `真机 demo 那段正文整段解析成标题列表表格`() {
+        // 2026-10-15：手机上 REPLY 面板里这张表看着是散的，当时的怀疑是"富文本只解析了一半"。
+        // 把那段正文原样钉在这里，是为了把**解析层**排除掉：这条过，就说明块级解析是完整的。
+        //
+        // **但它不覆盖真实链路**：读取器到面板之间还有一段，Claude 侧曾用 Normalize 把换行
+        // 抽干（块级语法全靠换行划界），表格因此根本没走到 TableBlockView。那条由 C# 侧的
+        // "claude body: newlines survive verbatim" 守着 —— 测试的断点必须卡在链路的每一段上。
+        val markdown = """
+            ## 面板里的富文本
+
+            这段如果渲染正确，你应该看到：
+
+            - **加粗**是粗的，不是两个星号
+            - `行内代码` 有底色
+            - 列表是项目符号，不是一列减号
+
+            表格也试一下，看会不会散架：
+
+            | 元素 | 期望 |
+            |---|---|
+            | 标题 | 加粗大字 |
+            | 列表 | 项目符号 |
+            | 表格 | 有边框 |
+
+            这段比第一段长不少，用来确认面板会随正文长度变化重新排版。
+        """.trimIndent()
+
+        val blocks = MarkdownParser.parse(markdown)
+        val kinds = blocks.map { it::class.simpleName }
+        assertEquals(
+            "段落/标题/列表/表格都要认出来，一个都不许退化成普通段落",
+            listOf("Heading", "Paragraph", "BulletList", "Paragraph", "Table", "Paragraph"),
+            kinds,
+        )
+
+        val table = blocks[4] as MarkdownBlock.Table
+        assertEquals(listOf("元素", "期望"), table.headers)
+        assertEquals(3, table.rows.size)
+        assertEquals(listOf("标题", "加粗大字"), table.rows[0])
+        assertEquals(listOf("表格", "有边框"), table.rows[2])
+    }
 }

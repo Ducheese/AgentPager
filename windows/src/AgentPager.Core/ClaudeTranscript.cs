@@ -16,7 +16,16 @@ public sealed record ClaudeTranscriptSnapshot(
     DateTimeOffset? QueuedAt = null,
     string? LatestPrompt = null,
     /// <summary>正文那一条 assistant 行的 timestamp。用来判断它到底属于**本轮**还是上一轮：</summary>
-    DateTimeOffset? LatestReplyAt = null);
+    DateTimeOffset? LatestReplyAt = null,
+    /// <summary>
+    /// 本轮**最近一次说过的正文全文**（不截断），供展开后的 REPLY 面板用。
+    /// 与 <see cref="LatestReply"/> 的取法不同：后者认"最新一步"，最新一步是工具调用就作废；
+    /// 这里可以**跨过工具步往回找** —— "说一句就调工具"是回合中的常态，不跨就永远拿不到正文。
+    /// 仍严格限定在本轮内（不跨回合捡上一轮的），空白表示本轮还没说过话。
+    /// </summary>
+    string? LatestReplyFull = null,
+    /// <summary>上面那条正文的 timestamp，用来判定它属于本轮（与 <see cref="LatestReplyAt"/> 同理）。</summary>
+    DateTimeOffset? LatestReplyFullAt = null);
 
 /// <summary>
 /// Claude Code 转录本（<c>~/.claude/projects/&lt;slug&gt;/&lt;session_id&gt;.jsonl</c>）尾部读取器。
@@ -72,6 +81,11 @@ public static class ClaudeTranscriptReader
         DateTimeOffset? queuedAt = null;
         string? latestPrompt = null;
         DateTimeOffset? replyAt = null;
+        // 正文全文：与 reply **不同**的取法（见 assistant 分支里的说明）——
+        // reply 认"最新一步"，一步是工具调用就作废；这里要的是"本轮最近一次说过的正文"，
+        // 可以跨过工具步往回找。
+        string? bodyReply = null;
+        DateTimeOffset? bodyReplyAt = null;
         // 本回合"最新一步"已经定过没有（倒序扫到的第一条主会话 assistant 行即是）。
         var sawLatestStep = false;
         var queueSettled = false;
@@ -138,6 +152,19 @@ public static class ClaudeTranscriptReader
                                     replyAt = Timestamp(root);
                                 }
                             }
+
+                            // 正文全文（给展开后的 REPLY 面板）：这里**故意不套上面那条"最新一步"规则**。
+                            // 实测（2026-10-15，本机真跑）：Claude 把正文和工具调用写成**两行**——
+                            // `assistant blocks=[text]` 紧跟 `assistant blocks=[tool_use]`——
+                            // 于是倒序扫到的第一条永远是工具调用，reply 直接作废，面板整个回合都拿不到正文。
+                            // 而"说一句就调工具"正是回合中的常态，所以正文必须能跨过工具步往回找。
+                            // 边界仍严格限定在本轮：replySettled 一置位就说明已越过本轮用户输入，
+                            // 再往回全是上一轮的正文（拿时间戳兜底，见 FreshReplyFull）。
+                            if (!replySettled && bodyReply is null && ReadTextReply(root) is { } bodyText)
+                            {
+                                bodyReply = bodyText;
+                                bodyReplyAt = Timestamp(root);
+                            }
                         }
                         break;
                     case "user":
@@ -169,7 +196,13 @@ public static class ClaudeTranscriptReader
             Truncate(Normalize(queuedPrompt), 1000),
             queuedAt,
             Truncate(latestPrompt, 1000),
-            replyAt);
+            replyAt,
+            // **不能过 Normalize**：它把 \r\n 全换成空格再合并，是给第三行那种单行预览用的。
+            // 正文全靠换行划块（标题/列表/表格的分界），压平之后 Markdown 解析器看到的是
+            // 一整段纯文本，管道符和横线原样画出来 —— 实测就是"表格散架"的真正原因。
+            // agy 的 fullResponse、opencode 的 fullText 都是原文，只有这里之前错了。
+            string.IsNullOrWhiteSpace(bodyReply) ? null : bodyReply.Trim(),
+            bodyReplyAt);
     }
 
     /// <summary>行内 ISO 时间戳（Claude 每行都带，形如 2026-10-08T12:34:56.789Z）。</summary>

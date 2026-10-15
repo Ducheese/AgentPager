@@ -85,7 +85,6 @@ public sealed class TaskCatalog
     // 只有 Claude 需要——opencode 的作答按 requestID 定位，不碰原始入参。
     private readonly Dictionary<string, string> _claudeQuestionInputs = new(StringComparer.Ordinal);
     // 是否有工具正在跑：中间正文只在"没有工具在跑"时进第三行（与 opencode 的 reply 守卫同义）。
-    private readonly HashSet<string> _claudeToolActive = new(StringComparer.Ordinal);
     // 拆好的题（Claude 的 tool_input.questions / opencode 的 properties.questions 同形，共用一个解析器）。
     private readonly Dictionary<string, List<QuestionItem>> _questionItems = new(StringComparer.Ordinal);
     // 多题提问的逐题推进：桥把 N 题拆成"手机上一次一题"喂给手机（App 照旧渲染单题卡，
@@ -192,24 +191,6 @@ public sealed class TaskCatalog
         // 每个事件都带 transcript_path：登记下来供 Maintain 心跳复用（标题/Token 刷新）。
         if (!string.IsNullOrWhiteSpace(hook.TranscriptPath))
             _claudeTranscripts[hook.SessionID] = hook.TranscriptPath!;
-
-        // 工具活动跟踪：中间正文（心跳路径）只在没有工具在跑时进第三行。
-        switch (hook.HookEventName)
-        {
-            case "PreToolUse":
-                _claudeToolActive.Add(hook.SessionID);
-                break;
-            case "PostToolUse":
-            case "PostToolUseFailure":
-            case "Stop":
-            case "StopFailure":
-            case "SessionEnd":
-            case "PermissionDenied":
-                // PermissionDenied 也算"这一步结束了"：被 auto 分类器拒掉之后没有工具在跑，
-                // 不清的话中间正文会被这条陈旧标志一直挡在第三行之外。
-                _claudeToolActive.Remove(hook.SessionID);
-                break;
-        }
 
         var transcript = ReadClaudeTranscript(hook);
 
@@ -1412,12 +1393,18 @@ public sealed class TaskCatalog
         var snapshot = ClaudeTranscriptReader.Read(path);
         var updated = ClaudeEventReducer.ApplyTranscript(task, snapshot);
 
-        // 中间正文（B）：模型在工具之间写的正文也进第三行，但**只在没有工具在跑时**——
-        // 工具活动期间整条忽略，免得正文盖掉工具步（opencode 的 reply 守卫同义）。
-        // 回合结束的正文不归这里，仍由 Stop 落最终预览。
-        if (task.Lifecycle == AgentLifecycle.Running && !_claudeToolActive.Contains(task.Id))
-            updated = ClaudeEventReducer.WithPreview(
-                updated, ClaudeEventReducer.FreshReply(snapshot, task.StartedAt));
+        // 心跳**只喂正文面板，不再往第三行送中途正文**（2026-10-15 用户裁定）。
+        //
+        // 为什么撤掉：第三行的语义是"最新一步"，而 Claude 把正文和工具调用写成**相隔约 2ms
+        // 的两行**（实测 15:36:30.048 `[text]` → .050 `[tool_use]`），于是"最新一行是正文"
+        // 这个状态几乎不存在——这条路径实际上永远送不出去，留着只会让人以为它在工作。
+        // 而且就算撞上，第三个障碍（工具活动守卫）还在。撤掉它，第三行只认工具步，
+        // 语义反而更干净。回合终稿仍由 Stop 落（那条是正当的终态预览，不是中途）。
+        if (task.Lifecycle == AgentLifecycle.Running &&
+            ClaudeEventReducer.FreshReplyFull(snapshot, task.StartedAt) is { } body)
+        {
+            updated = updated with { ResponseBody = body };
+        }
 
         if (updated == task) return false;
         Upsert(updated);
@@ -1910,7 +1897,6 @@ public sealed class TaskCatalog
         // opencode 的集合一直有这一步，Claude 的这些漏了——表现为长跑微泄漏，
         // 以及**被裁任务的挂起卡仍留在 _requests 里**（projection 会把它当幽灵卡片发出去）。
         var live = _tasks.Select(task => task.Id).ToHashSet(StringComparer.Ordinal);
-        _claudeToolActive.RemoveWhere(id => !live.Contains(id));
         _claudeRegistrySeen.RemoveWhere(id => !live.Contains(id));
         PruneSessionMap(_openCodeDirectories, live);
         PruneSessionMap(_claudeQueuedText, live);
@@ -2457,6 +2443,15 @@ public static class ClaudeEventReducer
             : null;
 
     /// <summary>
+    /// 同 <see cref="FreshReply"/>，但取全文（不截断），供展开后的 REPLY 面板用。
+    /// "属于本轮"的判定与它完全一致，唯一区别就是不做那 120 字截断。
+    /// </summary>
+    public static string? FreshReplyFull(ClaudeTranscriptSnapshot? transcript, DateTimeOffset turnStart) =>
+        transcript?.LatestReplyFull is { } reply && (transcript.LatestReplyFullAt is not { } at || at >= turnStart)
+            ? reply
+            : null;
+
+    /// <summary>
     /// 正文预览落到第三行，并守住"第三行永不回显第二行"（opencode/agy 都有的守卫，G18）。
     /// 两个调用点：`Stop` 落回合终稿，心跳落回合中的中间正文。
     /// </summary>
@@ -2493,8 +2488,10 @@ public static class ClaudeEventReducer
 
         if (transcript?.Tokens is not null) result = result with { TokenUsage = transcript.Tokens };
         if (transcript?.Model is not null) result = result with { ModelName = transcript.Model };
+        // 取全文那份（不过 Normalize、不截断）。用 FreshReply 会拿 120 字且被压平的单行预览
+        // 覆盖 Stop 已落好的正文 —— 面板上多行正文会当场塌成一行。
         if (result.Lifecycle == AgentLifecycle.Succeeded &&
-            FreshReply(transcript, result.StartedAt) is { Length: > 0 } reply)
+            FreshReplyFull(transcript, result.StartedAt) is { Length: > 0 } reply)
         {
             result = result with { ResponseBody = reply.Trim() };
         }
