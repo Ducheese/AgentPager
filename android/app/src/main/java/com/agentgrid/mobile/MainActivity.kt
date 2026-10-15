@@ -13,13 +13,15 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.agentgrid.mobile.ui.AgentGridScreen
 
+import android.content.res.Configuration
+
 class MainActivity : ComponentActivity() {
     private val viewModel: AgentGridViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        enterTerminalMode()
+        updateSystemBars()
         importPairing(intent)
 
         setContent {
@@ -47,8 +49,28 @@ class MainActivity : ComponentActivity() {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus && viewModel.state.value.terminalMode) {
+        if (hasFocus) {
+            updateSystemBars()
+        }
+    }
+
+    override fun onMultiWindowModeChanged(isInMultiWindowMode: Boolean, newConfig: Configuration) {
+        super.onMultiWindowModeChanged(isInMultiWindowMode, newConfig)
+        updateSystemBars()
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        updateSystemBars()
+    }
+
+    private fun updateSystemBars() {
+        val isLandscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        // 分屏、小窗或竖屏模式下退出全屏沉浸，让系统手柄与系统栏正常可用；全屏横屏下保持沉浸
+        if (!isInMultiWindowMode && isLandscape && viewModel.state.value.terminalMode) {
             enterTerminalMode()
+        } else {
+            exitTerminalMode()
         }
     }
 
@@ -65,7 +87,9 @@ class MainActivity : ComponentActivity() {
         WindowCompat.setDecorFitsSystemWindows(window, true)
         WindowInsetsControllerCompat(window, window.decorView)
             .show(WindowInsetsCompat.Type.systemBars())
-        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        if (!viewModel.state.value.terminalMode) {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
     }
 
     private fun importPairing(intent: android.content.Intent) {

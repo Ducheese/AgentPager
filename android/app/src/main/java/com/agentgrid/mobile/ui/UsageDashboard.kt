@@ -11,6 +11,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -18,6 +20,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -72,44 +75,91 @@ internal fun UsageDashboard(
     val allPoints = activeUsage?.dailyUsage.orEmpty()
 
     BoxWithConstraints(
-        modifier = modifier
-            .fillMaxWidth()
-            .height(310.dp)
-            .padding(horizontal = 36.dp, vertical = 20.dp),
+        modifier = modifier.fillMaxWidth(),
     ) {
-        val quotaWidth = if (maxWidth < 700.dp) 226.dp else 270.dp
+        val isCompact = maxWidth < 600.dp || maxHeight > maxWidth
+        val contentPadding = if (isCompact) {
+            Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
+        } else {
+            Modifier.padding(horizontal = 36.dp, vertical = 20.dp)
+        }
 
-        Row(
-            modifier = Modifier.fillMaxSize(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            QuotaPanel(
-                usage = activeUsage,
-                availableUsages = availableUsages,
-                selectedUsageIndex = selectedProviderIndex,
-                onSelectUsageIndex = { selectedProviderIndex = it },
-                connected = connected,
+        if (isCompact) {
+            // 竖屏、分屏、悬浮小窗：单列垂直流式排布，支持滚动防遮挡
+            Column(
                 modifier = Modifier
-                    .width(quotaWidth)
-                    .fillMaxHeight(),
-            )
+                    .fillMaxWidth()
+                    .then(contentPadding)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(18.dp),
+            ) {
+                QuotaPanel(
+                    usage = activeUsage,
+                    availableUsages = availableUsages,
+                    selectedUsageIndex = selectedProviderIndex,
+                    onSelectUsageIndex = { selectedProviderIndex = it },
+                    connected = connected,
+                    modifier = Modifier.fillMaxWidth(),
+                    compact = true,
+                )
 
-            Box(
-                modifier = Modifier
-                    .padding(horizontal = 24.dp)
-                    .width(1.dp)
-                    .fillMaxHeight()
-                    .background(AgentGridColors.Divider),
-            )
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(1.dp)
+                        .background(AgentGridColors.Divider),
+                )
 
-            HistoryPanel(
-                allPoints = allPoints,
-                selectedRange = selectedRange,
-                onRangeSelected = { selectedRange = it },
+                HistoryPanel(
+                    allPoints = allPoints,
+                    selectedRange = selectedRange,
+                    onRangeSelected = { selectedRange = it },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 180.dp),
+                    compact = true,
+                )
+            }
+        } else {
+            // 宽屏横屏桌面态：保持经典左右双栏
+            val quotaWidth = if (maxWidth < 700.dp) 226.dp else 270.dp
+            Row(
                 modifier = Modifier
-                    .weight(1f)
-                    .fillMaxHeight(),
-            )
+                    .fillMaxWidth()
+                    .then(contentPadding)
+                    .height(310.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                QuotaPanel(
+                    usage = activeUsage,
+                    availableUsages = availableUsages,
+                    selectedUsageIndex = selectedProviderIndex,
+                    onSelectUsageIndex = { selectedProviderIndex = it },
+                    connected = connected,
+                    modifier = Modifier
+                        .width(quotaWidth)
+                        .fillMaxHeight(),
+                    compact = false,
+                )
+
+                Box(
+                    modifier = Modifier
+                        .padding(horizontal = 24.dp)
+                        .width(1.dp)
+                        .fillMaxHeight()
+                        .background(AgentGridColors.Divider),
+                )
+
+                HistoryPanel(
+                    allPoints = allPoints,
+                    selectedRange = selectedRange,
+                    onRangeSelected = { selectedRange = it },
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight(),
+                    compact = false,
+                )
+            }
         }
     }
 }
@@ -122,6 +172,7 @@ private fun QuotaPanel(
     onSelectUsageIndex: (Int) -> Unit,
     connected: Boolean,
     modifier: Modifier = Modifier,
+    compact: Boolean = false,
 ) {
     val isAgy = usage?.planType?.contains("Antigravity", ignoreCase = true) == true
     val windows = usage?.windows.orEmpty()
@@ -148,7 +199,7 @@ private fun QuotaPanel(
 
     Column(
         modifier = modifier,
-        verticalArrangement = Arrangement.SpaceBetween,
+        verticalArrangement = if (compact) Arrangement.spacedBy(14.dp) else Arrangement.SpaceBetween,
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
@@ -441,6 +492,7 @@ private fun HistoryPanel(
     selectedRange: UsageRange,
     onRangeSelected: (UsageRange) -> Unit,
     modifier: Modifier = Modifier,
+    compact: Boolean = false,
 ) {
     val visiblePoints = remember(allPoints, selectedRange) {
         UsagePresentation.pointsForRange(allPoints, selectedRange)
@@ -454,7 +506,7 @@ private fun HistoryPanel(
 
     Column(
         modifier = modifier,
-        verticalArrangement = Arrangement.SpaceBetween,
+        verticalArrangement = if (compact) Arrangement.spacedBy(14.dp) else Arrangement.SpaceBetween,
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -527,7 +579,7 @@ private fun HistoryPanel(
                 points = rangePoints,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(132.dp),
+                    .height(if (compact) 116.dp else 132.dp),
             )
         }
     }

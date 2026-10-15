@@ -22,6 +22,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -35,6 +36,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -177,80 +179,132 @@ private fun PairingScreen(
     onPair: (String) -> Unit,
 ) {
     var manualText by remember { mutableStateOf("") }
-    Row(
+
+    BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
-            .background(AgentGridColors.Background)
-            .padding(28.dp),
-        // 横屏下拉开取景框与操作说明，避免两块内容视觉粘连。
-        horizontalArrangement = Arrangement.spacedBy(48.dp),
+            .background(AgentGridColors.Background),
     ) {
-        Box(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxHeight()
-                .background(AgentGridColors.Surface),
-        ) {
-            QRCodeScanner(onResult = onPair, modifier = Modifier.fillMaxSize())
-        }
-        Column(
-            modifier = Modifier
-                .weight(0.92f)
-                .fillMaxHeight(),
-            verticalArrangement = Arrangement.Center,
-        ) {
-            Text(
-                "AGENTPAGER",
-                color = AgentGridColors.Text,
-                fontSize = 30.sp,
-                fontWeight = FontWeight.Bold,
-                letterSpacing = 2.sp,
-            )
-            Spacer(Modifier.height(10.dp))
-            Text("扫描 Mac 上的二维码", color = AgentGridColors.Cyan, fontSize = 16.sp)
-            Spacer(Modifier.height(8.dp))
-            Text(
-                "在 Mac 上打开 AgentGrid Bridge → 连接，\n扫描其中显示的二维码",
-                color = AgentGridColors.Muted,
-                fontSize = 12.sp,
-                lineHeight = 18.sp,
-            )
-            Spacer(Modifier.height(18.dp))
-            OutlinedTextField(
-                value = manualText,
-                onValueChange = { manualText = it },
-                label = { Text("无法扫码？粘贴 Mac 端配对文本") },
-                minLines = 3,
-                modifier = Modifier.fillMaxWidth(),
-            )
-            Spacer(Modifier.height(10.dp))
-            Button(
-                onClick = { onPair(manualText) },
-                enabled = manualText.isNotBlank(),
-                shape = RectangleShape,
+        val isCompact = maxWidth < 600.dp || maxHeight > maxWidth
+
+        if (isCompact) {
+            // 竖屏、分屏、悬浮小窗：单列垂直居中排布，带滚动防键盘遮挡
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(20.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(14.dp),
             ) {
-                Text("连接 Bridge")
-            }
-            AnimatedVisibility(
-                visible = state.pairingError != null,
-                enter = fadeIn(tween(180)) +
-                    scaleIn(
-                        initialScale = 0.985f,
-                        animationSpec = tween(210),
-                    ),
-                exit = fadeOut(tween(120)) +
-                    scaleOut(
-                        targetScale = 0.985f,
-                        animationSpec = tween(170),
-                    ),
-            ) {
-                Column {
-                    Spacer(Modifier.height(10.dp))
+                Text(
+                    "AGENTPAGER",
+                    color = AgentGridColors.Text,
+                    fontSize = 24.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 2.sp,
+                )
+                Box(
+                    modifier = Modifier
+                        .size(190.dp)
+                        .background(AgentGridColors.Surface),
+                ) {
+                    QRCodeScanner(onResult = onPair, modifier = Modifier.fillMaxSize())
+                }
+                Text("扫描 Bridge 上的二维码", color = AgentGridColors.Cyan, fontSize = 14.sp)
+                Text(
+                    "在电脑上打开 AgentPager Bridge → 扫描二维码",
+                    color = AgentGridColors.Muted,
+                    fontSize = 11.sp,
+                )
+                OutlinedTextField(
+                    value = manualText,
+                    onValueChange = { manualText = it },
+                    label = { Text("无法扫码？粘贴配对文本") },
+                    minLines = 2,
+                    maxLines = 4,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Button(
+                    onClick = { onPair(manualText) },
+                    enabled = manualText.isNotBlank(),
+                    shape = RectangleShape,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text("连接 Bridge")
+                }
+                AnimatedVisibility(visible = state.pairingError != null) {
                     Text(
                         state.pairingError.orEmpty(),
                         color = AgentGridColors.Red,
                         fontSize = 12.sp,
                     )
+                }
+            }
+        } else {
+            // 宽屏横屏桌面态：左右并排
+            Row(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(28.dp),
+                horizontalArrangement = Arrangement.spacedBy(48.dp),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight()
+                        .background(AgentGridColors.Surface),
+                ) {
+                    QRCodeScanner(onResult = onPair, modifier = Modifier.fillMaxSize())
+                }
+                Column(
+                    modifier = Modifier
+                        .weight(0.92f)
+                        .fillMaxHeight(),
+                    verticalArrangement = Arrangement.Center,
+                ) {
+                    Text(
+                        "AGENTPAGER",
+                        color = AgentGridColors.Text,
+                        fontSize = 30.sp,
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 2.sp,
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Text("扫描 Bridge 上的二维码", color = AgentGridColors.Cyan, fontSize = 16.sp)
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "在电脑上打开 AgentPager Bridge → 连接，\n扫描其中显示的二维码",
+                        color = AgentGridColors.Muted,
+                        fontSize = 12.sp,
+                        lineHeight = 18.sp,
+                    )
+                    Spacer(Modifier.height(18.dp))
+                    OutlinedTextField(
+                        value = manualText,
+                        onValueChange = { manualText = it },
+                        label = { Text("无法扫码？粘贴配对文本") },
+                        minLines = 3,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    Button(
+                        onClick = { onPair(manualText) },
+                        enabled = manualText.isNotBlank(),
+                        shape = RectangleShape,
+                    ) {
+                        Text("连接 Bridge")
+                    }
+                    AnimatedVisibility(visible = state.pairingError != null) {
+                        Column {
+                            Spacer(Modifier.height(10.dp))
+                            Text(
+                                state.pairingError.orEmpty(),
+                                color = AgentGridColors.Red,
+                                fontSize = 12.sp,
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -298,14 +352,19 @@ private fun TaskTerminal(
         soundTracker.nextCue(tasks, soundEnabled)?.let(sound::play)
     }
 
-    Box(
+    BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
             .background(AgentGridColors.Background),
     ) {
+        val isCompact = maxWidth < 600.dp || maxHeight > maxWidth
+        val isVeryNarrow = maxWidth < 400.dp
+
         TopControls(
-            windows = if (showDashboard) {
+            windows = if (showDashboard || isVeryNarrow) {
                 emptyList()
+            } else if (isCompact) {
+                state.usage?.windows.orEmpty().take(1)
             } else {
                 state.usage?.windows.orEmpty()
             },
@@ -340,7 +399,13 @@ private fun TaskTerminal(
                     )
                 ).using(SizeTransform(clip = false))
             },
-            modifier = Modifier.align(Alignment.Center),
+            modifier = if (isCompact) {
+                Modifier
+                    .fillMaxSize()
+                    .padding(top = 46.dp, bottom = 12.dp)
+            } else {
+                Modifier.align(Alignment.Center)
+            },
             label = "任务态与状态态切换",
         ) { isDashboardVisible ->
             if (isDashboardVisible) {
@@ -354,8 +419,11 @@ private fun TaskTerminal(
                     state = taskListState,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 20.dp)
-                        .heightIn(max = 306.dp),
+                        .padding(horizontal = if (isCompact) 12.dp else 20.dp)
+                        .then(
+                            if (isCompact) Modifier.fillMaxHeight()
+                            else Modifier.heightIn(max = 306.dp)
+                        ),
                     verticalArrangement = Arrangement.spacedBy(0.dp),
                 ) {
                     item(key = TaskListAnchorKey) {
@@ -402,6 +470,7 @@ private fun TaskTerminal(
                             dimmed = projection.urgentTaskID != null &&
                                 projection.urgentTaskID != task.id,
                             showDivider = index < visibleTasks.lastIndex,
+                            compact = isCompact,
                             onClick = {
                                 val willExpand = expandedTaskID != task.id
                                 expandedTaskID = if (willExpand) task.id else null
@@ -575,6 +644,7 @@ private fun TaskRow(
     autoVisible: Boolean,
     dimmed: Boolean,
     showDivider: Boolean,
+    compact: Boolean = false,
     onClick: () -> Unit,
     onControl: (String, ControlAction, String?, List<String>?) -> Unit,
 ) {
@@ -592,7 +662,7 @@ private fun TaskRow(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .height(78.dp)
+                .height(if (compact) 72.dp else 78.dp)
                 .clickable(onClick = onClick),
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -610,20 +680,20 @@ private fun TaskRow(
                     it.alpha = rowAlpha
                 },
                 modifier = Modifier
-                    .size(70.dp)
+                    .size(if (compact) 60.dp else 70.dp)
                     .semantics { contentDescription = "任务状态 ${statusText(task.lifecycle)}" },
             )
 
             Column(
                 modifier = Modifier
                     .weight(1f)
-                    .padding(start = 8.dp, end = 14.dp),
+                    .padding(start = if (compact) 6.dp else 8.dp, end = if (compact) 8.dp else 14.dp),
                 verticalArrangement = Arrangement.spacedBy(2.dp),
             ) {
                 Text(
                     task.title,
                     color = AgentGridColors.Text.copy(alpha = rowAlpha),
-                    fontSize = 15.sp,
+                    fontSize = if (compact) 14.sp else 15.sp,
                     fontWeight = FontWeight.Bold,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
@@ -646,7 +716,7 @@ private fun TaskRow(
                 }
             }
 
-            TaskMeta(task = task, alpha = rowAlpha)
+            TaskMeta(task = task, alpha = rowAlpha, compact = compact)
         }
 
         AnimatedVisibility(
@@ -676,6 +746,7 @@ private fun TaskRow(
                 task = task,
                 pending = pending,
                 showToken = expanded,
+                compact = compact,
                 onControl = onControl,
             )
         }
@@ -684,7 +755,7 @@ private fun TaskRow(
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(start = 78.dp, end = 4.dp)
+                    .padding(start = if (compact) 68.dp else 78.dp, end = 4.dp)
                     .height(1.dp)
                     .background(AgentGridColors.Divider.copy(alpha = 0.85f)),
             )
@@ -744,7 +815,7 @@ private fun CommandTicker(
 }
 
 @Composable
-private fun TaskMeta(task: TaskSnapshot, alpha: Float) {
+private fun TaskMeta(task: TaskSnapshot, alpha: Float, compact: Boolean = false) {
     val elapsed by produceState(
         initialValue = task.elapsedAt(System.currentTimeMillis()),
         task.id,
@@ -761,31 +832,39 @@ private fun TaskMeta(task: TaskSnapshot, alpha: Float) {
         }
     }
     Column(
-        modifier = Modifier.widthIn(min = 166.dp, max = 210.dp),
+        modifier = if (compact) {
+            Modifier.wrapContentWidth(Alignment.End)
+        } else {
+            Modifier.widthIn(min = 166.dp, max = 210.dp)
+        },
         horizontalAlignment = Alignment.End,
-        verticalArrangement = Arrangement.spacedBy(7.dp),
+        verticalArrangement = Arrangement.spacedBy(if (compact) 4.dp else 7.dp),
     ) {
         Row(
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             MetaTag(agentBadge(task.source), agentBadgeColor(task.source), alpha)
-            MetaTag(
-                task.modelName ?: agentOriginLabel(task.source),
-                AgentGridColors.Muted,
-                alpha,
-                modifier = Modifier.weight(1f, fill = false),
-            )
+            if (!compact) {
+                MetaTag(
+                    task.modelName ?: agentOriginLabel(task.source),
+                    AgentGridColors.Muted,
+                    alpha,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+            }
         }
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
+            horizontalArrangement = Arrangement.spacedBy(if (compact) 6.dp else 10.dp),
         ) {
-            Text(
-                formatTokens(task.tokenUsage?.total),
-                color = AgentGridColors.Muted.copy(alpha = alpha),
-                fontSize = 9.sp,
-            )
+            if (!compact) {
+                Text(
+                    formatTokens(task.tokenUsage?.total),
+                    color = AgentGridColors.Muted.copy(alpha = alpha),
+                    fontSize = 9.sp,
+                )
+            }
             Text(
                 formatElapsed(elapsed),
                 color = AgentGridColors.Muted.copy(alpha = alpha),
@@ -824,21 +903,29 @@ private fun TaskDetails(
     task: TaskSnapshot,
     pending: PendingRequest?,
     showToken: Boolean,
+    compact: Boolean = false,
     onControl: (String, ControlAction, String?, List<String>?) -> Unit,
 ) {
     var answer by remember(task.id) { mutableStateOf("") }
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .heightIn(max = 250.dp)
+            .heightIn(max = if (compact) 320.dp else 250.dp)
             .verticalScroll(rememberScrollState())
-            .padding(start = 82.dp, end = 18.dp, bottom = 8.dp),
+            .padding(start = if (compact) 68.dp else 82.dp, end = if (compact) 8.dp else 18.dp, bottom = 8.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         if (task.subagents.isNotEmpty()) {
             SubagentPanel(task.subagents, agentBadge(task.source).uppercase())
         }
         if (showToken) {
+            if (compact) {
+                DetailLine(
+                    "MODEL",
+                    task.modelName ?: agentOriginLabel(task.source),
+                    agentBadgeColor(task.source),
+                )
+            }
             task.tokenUsage?.let {
                 DetailLine(
                     "TOKEN",
