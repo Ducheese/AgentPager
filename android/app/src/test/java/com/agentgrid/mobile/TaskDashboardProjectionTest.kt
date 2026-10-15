@@ -142,7 +142,7 @@ class TaskDashboardProjectionTest {
     }
 
     @Test
-    fun `全部终态只返回一次九十秒绝对切换时间`() {
+    fun `全部终态始终保持任务态不自动切换Dashboard`() {
         val completedAt = NOW - 30_000
         val completed = task(
             "done",
@@ -160,8 +160,8 @@ class TaskDashboardProjectionTest {
         )
 
         assertFalse(waiting.dashboardVisible)
-        assertEquals(NOW + 60_000, waiting.nextDashboardAt)
-        assertTrue(expired.dashboardVisible)
+        assertNull(waiting.nextDashboardAt)
+        assertFalse(expired.dashboardVisible)
         assertNull(expired.nextDashboardAt)
     }
 
@@ -202,7 +202,7 @@ class TaskDashboardProjectionTest {
 
         val projection = project(listOf(completed))
 
-        assertEquals(NOW + 100_000, projection.nextDashboardAt)
+        assertNull(projection.nextDashboardAt)
         assertFalse(projection.dashboardVisible)
     }
 

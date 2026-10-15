@@ -104,8 +104,7 @@ object TaskDashboardProjector {
             now = now,
             idleDelayMillis = idleDelayMillis,
         )
-        val automaticDashboardVisible =
-            nextDashboardAt == null && orderedTasks.none { !it.isTerminal }
+        val automaticDashboardVisible = orderedTasks.isEmpty()
         val focusedTaskID = preferredFocusedTaskID
             ?.takeIf { preferred -> orderedTasks.any { it.id == preferred } }
             ?: previous?.focusedTaskID
@@ -149,12 +148,8 @@ object TaskDashboardProjector {
         now: Long,
         idleDelayMillis: Long,
     ): Long? {
-        if (tasks.any { !it.isTerminal }) return null
-        val lastFinishedAt = tasks.maxOfOrNull {
-            it.completedAt ?: it.updatedAt
-        } ?: return null
-        val transitionAt = lastFinishedAt + idleDelayMillis
-        return transitionAt.takeIf { it > now }
+        // 去除空闲 90 秒自动切换到 Dashboard 额度面板的原作者设计，始终保持在任务态
+        return null
     }
 
     private val taskComparator =

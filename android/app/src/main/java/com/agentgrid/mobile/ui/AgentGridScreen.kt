@@ -906,7 +906,7 @@ private fun TaskDetails(
     compact: Boolean = false,
     onControl: (String, ControlAction, String?, List<String>?) -> Unit,
 ) {
-    var answer by remember(task.id) { mutableStateOf("") }
+    var answer by remember(task.id, pending?.summary) { mutableStateOf("") }
     val showResponseBody = showToken &&
         task.lifecycle == AgentLifecycle.SUCCEEDED &&
         !task.responseBody.isNullOrBlank()
@@ -927,7 +927,7 @@ private fun TaskDetails(
                 DetailLine(
                     "MODEL",
                     task.modelName ?: agentOriginLabel(task.source),
-                    agentBadgeColor(task.source),
+                    AgentGridColors.Cyan,
                 )
             }
             task.tokenUsage?.let {
@@ -1021,17 +1021,22 @@ private fun TaskDetails(
                         )
                         PixelButton("发送回答", AgentGridColors.Yellow) {
                             if (picked.isNotEmpty() || answer.isNotBlank()) {
+                                val toSend = answer.ifBlank { null }
+                                val optionsToSend = picked
+                                answer = ""
+                                picked = emptyList()
                                 onControl(
                                     task.id,
                                     ControlAction.ANSWER,
-                                    answer.ifBlank { null },
-                                    picked,
+                                    toSend,
+                                    optionsToSend,
                                 )
                             }
                         }
                     } else {
                         targetPending.options.forEach { option ->
                             PixelButton(option, AgentGridColors.Cyan) {
+                                answer = ""
                                 onControl(task.id, ControlAction.ANSWER, option, null)
                             }
                         }
@@ -1043,7 +1048,9 @@ private fun TaskDetails(
                         )
                         PixelButton("发送回答", AgentGridColors.Yellow) {
                             if (answer.isNotBlank()) {
-                                onControl(task.id, ControlAction.ANSWER, answer, null)
+                                val toSend = answer
+                                answer = ""
+                                onControl(task.id, ControlAction.ANSWER, toSend, null)
                             }
                         }
                     }
