@@ -46,6 +46,7 @@ internal object ControlSigner {
             ControlAction.MUTE -> "mute"
             ControlAction.MARK_READ -> "markRead"
             ControlAction.PIN -> "pin"
+            ControlAction.PROMPT -> "prompt"
         }
         val escapedAction = json.encodeToString(action)
         val escapedTask = json.encodeToString(payload.taskID)

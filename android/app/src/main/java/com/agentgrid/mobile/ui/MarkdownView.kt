@@ -362,6 +362,10 @@ object MarkdownParser {
             while (end < text.length && text[end] !in "`[*_~|") {
                 end++
             }
+            // **必须保证 i 前进**：走到这里说明 text[i] 是上面某一类的漏网口 —— 反引号没有配对的
+            // 收尾（`` ` `` 落单），或者 `[` 后面不是 `](`（例如 GitHub 告警写法 `> [!WARNING]`）。
+            // 这两种情况 while 一次都不进、end 停在 i，于是空 Text token 无限堆积 → OOM 闪退。
+            if (end == i) end = i + 1
             tokens.add(InlineToken.Text(text.substring(i, end)))
             i = end
         }

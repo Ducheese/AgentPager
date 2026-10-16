@@ -216,7 +216,7 @@ Claude 侧工具名（2.1.236 实测存在于二进制；`Agent` = 派子代理�
 
 ## 六、手机控制
 
-Claude 是四条来源里**唯一有双向能力**的一条，两个动作都是真的能改变 Claude 行为的：
+Claude 是四条来源里**唯一有双向能力**的一条，三个动作都是真的能改变 Claude 行为的：
 
 - **权限批准/拒绝**：`PermissionRequest` 设 `Capabilities=[Approve,Deny]` → App 渲染允许/拒绝 → `Perform` 校验能力位后 `resolver.Resolve` 写回 hook stdout。回包形状与官方 zod 联合体逐字对齐。
 - **多题在手机上一次一题（桥端逐题推进）**：一次带 N 题的提问，桥**只把当前这一题**放进待处理请求（`第 i/N 题： <题目>` + **该题自己的选项按钮**），App 照旧渲染单题那张卡 → **零协议改动、零 App 改动**；答完一题自动推进到下一题，第三行跟着当前题走，攒齐后一次性回填 `updatedInput.answers{q1:…, q2:…}`（`updatedInput.answers` 本来就是"问题全文 → 答案"的 map）。
@@ -228,6 +228,11 @@ Claude 是四条来源里**唯一有双向能力**的一条，两个动作都是
   机制与证据见 notes §八。**一条待处理请求只承载一题的选项**——多题由桥逐题推进（见上），协议与 App 都不需要知道"这是多题"。
   **前提**：必须是我们**持有 hook 连接**的那条路（`PermissionRequest`）。只走 `PreToolUse`（权限没触发询问）时不发 `Answer`，否则 App 会画出一个送不出去的输入框。
   **竞态**：用户随时可能在终端抢先作答——那之后 hook 的答案就作废（正常现象）。
+- **远程发提示词（续聊）**：给"没在运行"的 Claude 任务发一条 prompt → 桥端直投（`ControlAction.Prompt` → `ClaudePromptDispatcher` → `CanReceivePrompt` 放行才发，见 notes §九）：
+  - **路由**：会话在注册表里活着 → 原生 messaging socket 直投；被 `/resume` 切走（parked，注册表无条目但**宿主进程还活着**）→ `claude --resume <id> -p` 回退子进程续接，**全量继承宿主进程环境**（provider/模型随原对话；三枚身份变量 `CLAUDE_CODE_MESSAGING_SOCKET/TOKEN/ENTRYPOINT` 无条件剔除；宿主环境读不到则 WARN 降级、照常启动）。
+  - **送达确认**：45 s 内未见该会话任何 hook 事件 → 静默重投一次；再 45 s 无音讯 → 第三行落 `⚠ 远程注入未确认送达（会话无响应）`（诚实标记，不静默）。任一 hook 事件到达即清账。
+  - **复活语义**：turn 重新起跑（Running/thinking）、`UserPrompt`=本条、**不排队**（不回写 `queued`）、清空上一轮 `LatestStep/ResponseBody`；对**运行中**任务发的 prompt 仍走"排队稍后投递"，两路互不覆盖。
+  - **关门条件**：挂起请求中 / WaitingApproval / WaitingAnswer / Offline / Interrupted 不发；parked 的判活依据是宿主台账（`HostPids`，只认 `kind=interactive + entrypoint=cli` 的注册条目，见 notes §九）。
 - **问答的通知渠道**（`elicitation_*` 类 MCP 输入）维持只读提醒：置顶 + 提示音 + QUESTION 卡片，作答留在终端。
 - `Capabilities` 是 App 唯一的分层依据；其余三条来源恒空。
 
@@ -240,6 +245,8 @@ Claude 是四条来源里**唯一有双向能力**的一条，两个动作都是
 3. **正文预览非必要走 hook**：`MessageDisplay` 每个 delta 批次都会拉起一次 hook 子进程（`forceSyncExecution: true`，超时上限 10 s），对终端渲染有侵入风险；从转录本尾部异步摘取正文是更省的一条路（与 agy 同构）。二选一或双通道，`待实测` 开销后再定。
 4. **每事件冷启 exe**：现状每次 hook 都冷启约 220 MB 的自包含 .NET 进程（与 Codex 同一份 exe），agy 已用 Node 胶水脚本规避（判例 #1 实测 300~800 ms/次），Claude 的 hook 频率更高（每次工具调用 2 次）——通道层问题，见 notes 文 G22。
 5. **`stop_hook_active`** 仅表示"Stop hook 因上一次阻止而重入"，与状态映射无关，忽略。
+6. **宿主台账是内存态**：`HostPids` 桥重启即空——重启前已切走的 parked 会话退化成"10 分钟静默兜底判离线"；判离线时 `Forget` 清账，防 PID 复用把死宿主"复活"成 parked（`ClaudeHooks.cs:551-580`）。
+7. **送达确认是"事件回音"而非真送达**：90 s 内没收到该会话任何 hook 事件才写 ⚠——慢回合只要中途有 hook 事件就不会误报；⚠ 也只说明"没收到回音"，不代表 prompt 一定没跑。
 
 ---
 

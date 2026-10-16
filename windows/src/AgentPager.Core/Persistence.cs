@@ -43,6 +43,41 @@ public sealed class TaskSnapshotPersistence(string? filePath = null)
     }
 }
 
+/// <summary>
+/// 桥端排队文本的一条。与 dispatcher 内存条目一一对应（enqueuedAt 供 TTL 用）。
+/// </summary>
+public sealed record QueuedPromptRecord(string Prompt, string? Cwd, DateTimeOffset EnqueuedAt);
+
+/// <summary>
+/// 桥端待办队列的持久化（独立文件）。claude 与 agy 各一份实例（路径不同），
+/// 形状都是 会话 → 有序条目。
+/// 不能塞进 tasks.json 的任务行里——重启时非终态行整行丢弃（见 Load 注释），
+/// 排队恰恰只发生在 running 任务上，塞进去等于没存。
+/// </summary>
+public sealed class PromptQueuePersistence(string? filePath = null)
+{
+    private readonly string _filePath = filePath ?? Path.Combine(AgentPagerPaths.DataRoot, "queued-prompts.json");
+
+    public Dictionary<string, List<QueuedPromptRecord>> Load()
+    {
+        try
+        {
+            if (!File.Exists(_filePath)) return new(StringComparer.Ordinal);
+            return JsonSerializer.Deserialize<Dictionary<string, List<QueuedPromptRecord>>>(File.ReadAllText(_filePath), WireJson.Options)
+                ?? new(StringComparer.Ordinal);
+        }
+        catch { return new(StringComparer.Ordinal); }
+    }
+
+    public void Save(Dictionary<string, List<QueuedPromptRecord>> queues)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(_filePath)!);
+        var temporary = _filePath + ".tmp";
+        File.WriteAllText(temporary, JsonSerializer.Serialize(queues, WireJson.Options));
+        File.Move(temporary, _filePath, true);
+    }
+}
+
 public sealed class CodexSessionTitleReader(string? indexPath = null)
 {
     private readonly string _indexPath = indexPath ?? Path.Combine(CodexPaths.Home, "session_index.jsonl");

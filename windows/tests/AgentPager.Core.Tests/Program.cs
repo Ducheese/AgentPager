@@ -393,21 +393,21 @@ Check(!json.Contains("\"OpenCode\""), "wire has no PascalCase enum leakage");
 var temp = Path.Combine(Path.GetTempPath(), "ap-verify-plugins-" + Guid.NewGuid().ToString("N"));
 var installer = new OpenCodePluginConfiguration(temp);
 Check(installer.Status == OpenCodePluginStatus.NotInstalled, "status: 未安装");
-Check(OpenCodePluginConfiguration.EmbeddedVersion == 19, $"embedded plugin version = 19 (got {OpenCodePluginConfiguration.EmbeddedVersion})");
+Check(OpenCodePluginConfiguration.EmbeddedVersion == 21, $"embedded plugin version = 21 (got {OpenCodePluginConfiguration.EmbeddedVersion})");
 var first = installer.Install();
 Check(first.Changed && File.Exists(Path.Combine(temp, "plugins", "agentpager-opencode.js")), "install writes plugin");
 Check(installer.Status == OpenCodePluginStatus.Installed && installer.IsInstalled(), "status: 已写入（与内置一致）");
-Check(installer.InstalledVersion == 19, "installed version = 19");
+Check(installer.InstalledVersion == 21, "installed version = 21");
 var second = installer.Install();
 Check(!second.Changed, "reinstall is idempotent");
 var pluginPath = Path.Combine(temp, "plugins", "agentpager-opencode.js");
 var content = File.ReadAllText(pluginPath);
 Check(content.Contains("Managed by AgentPager (OpenCode)"), "managed marker present");
-Check(content.Contains("agentpager-opencode v19"), "version header present");
+Check(content.Contains("agentpager-opencode v21"), "version header present");
 Check(content.Contains("hook_source: \"opencode\"") && content.Contains("49361"), "plugin content sane");
 File.WriteAllText(pluginPath, content.Replace("const MAX_TEXT = 1000", "const MAX_TEXT = 500"));
 Check(installer.Status == OpenCodePluginStatus.Outdated, "status: 待更新（内容与内置不一致）");
-Check(installer.InstalledVersion == 19, "outdated file still reports v19");
+Check(installer.InstalledVersion == 21, "outdated file still reports v21");
 var repair = installer.Install();
 Check(repair.Changed && installer.Status == OpenCodePluginStatus.Installed, "repair restores 已写入");
 var uninstalled = installer.Uninstall();
@@ -1006,6 +1006,65 @@ var restored = ClaudeEventReducer.ApplyTranscript(
 Check(!restored.PromptQueued && restored.UserPrompt == "本轮真正的提示词",
     $"claude: drained queue restores the real prompt (got '{restored.UserPrompt}')");
 
+// 复现 0fb27147：任何投递（管道注入/CLI）都在转录本里留下 enqueue+dequeue 对，dequeue 行
+// **没有 content 字段**——旧模型跳过它、倒扫到 enqueue，把"已跑完"读成"仍在排队"，第二行
+// 被注入文本永久冒充（实测踩过）。成对抵消后必须判"没有排队"，且不得再触发排队还原。
+var pairNow = DateTimeOffset.UtcNow;
+var pipePair = ReadTranscript(
+[
+    "{\"type\":\"queue-operation\",\"operation\":\"enqueue\",\"timestamp\":\"" + pairNow.AddMilliseconds(1).ToString("o") + "\",\"content\":\"注入测试\"}",
+    "{\"type\":\"queue-operation\",\"operation\":\"dequeue\",\"timestamp\":\"" + pairNow.AddMilliseconds(8).ToString("o") + "\"}",
+]);
+Check(pipePair.QueuedAt is null && pipePair.QueuedPrompt is null,
+    $"claude: enqueue+dequeue pair reads as drained (got '{pipePair.QueuedPrompt}')");
+var afterPair = ClaudeEventReducer.ApplyTranscript(
+    Claude() with { StartedAt = pairNow, PromptQueued = true, UserPrompt = "注入测试" },
+    pipePair);
+Check(!afterPair.PromptQueued, "claude: drained pair never leaves the queued flag stuck");
+
+// 两条消息先后排空（两对 enqueue/dequeue 交错）：全抵消后同样判"没有排队"
+var twoPairs = ReadTranscript(
+[
+    "{\"type\":\"queue-operation\",\"operation\":\"enqueue\",\"timestamp\":\"" + pairNow.AddSeconds(1).ToString("o") + "\",\"content\":\"第一条\"}",
+    "{\"type\":\"queue-operation\",\"operation\":\"dequeue\",\"timestamp\":\"" + pairNow.AddSeconds(2).ToString("o") + "\"}",
+    "{\"type\":\"queue-operation\",\"operation\":\"enqueue\",\"timestamp\":\"" + pairNow.AddSeconds(3).ToString("o") + "\",\"content\":\"第二条\"}",
+    "{\"type\":\"queue-operation\",\"operation\":\"dequeue\",\"timestamp\":\"" + pairNow.AddSeconds(4).ToString("o") + "\"}",
+]);
+Check(twoPairs.QueuedAt is null && twoPairs.QueuedPrompt is null, "claude: two drained pairs cancel out");
+
+// 抵账只吃掉配对取走的旧 enqueue：后面新排的那条仍算"在队里"（正向对照）
+var stillQueued = ReadTranscript(
+[
+    "{\"type\":\"queue-operation\",\"operation\":\"enqueue\",\"timestamp\":\"" + pairNow.AddSeconds(5).ToString("o") + "\",\"content\":\"旧条\"}",
+    "{\"type\":\"queue-operation\",\"operation\":\"dequeue\",\"timestamp\":\"" + pairNow.AddSeconds(6).ToString("o") + "\"}",
+    "{\"type\":\"queue-operation\",\"operation\":\"enqueue\",\"timestamp\":\"" + pairNow.AddSeconds(7).ToString("o") + "\",\"content\":\"新条\"}",
+]);
+Check(stillQueued.QueuedPrompt == "新条" && stillQueued.QueuedAt is not null,
+    $"claude: unmatched newest enqueue stays queued (got '{stillQueued.QueuedPrompt}')");
+
+// 裸 remove（无 content）与 popAll 都是排空信号：旧模型对前者完全瞎（remove 行无 content 被跳过）
+var bareRemove = ReadTranscript(
+[
+    "{\"type\":\"queue-operation\",\"operation\":\"enqueue\",\"content\":\"裸移除\"}",
+    "{\"type\":\"queue-operation\",\"operation\":\"remove\"}",
+]);
+Check(bareRemove.QueuedPrompt is null && bareRemove.QueuedAt is null, "claude: bare remove drains the queue");
+var popAll = ReadTranscript(
+[
+    "{\"type\":\"queue-operation\",\"operation\":\"enqueue\",\"content\":\"被清空\"}",
+    "{\"type\":\"queue-operation\",\"operation\":\"popAll\"}",
+]);
+Check(popAll.QueuedPrompt is null && popAll.QueuedAt is null, "claude: popAll drains the queue");
+
+// 斜杠命令自己的 enqueue/dequeue 对同样抵账：不能因它停在"排队中"，也不能冒名顶到第二行
+var slashPair = ReadTranscript(
+[
+    "{\"type\":\"queue-operation\",\"operation\":\"enqueue\",\"content\":\"/context\"}",
+    "{\"type\":\"queue-operation\",\"operation\":\"dequeue\"}",
+]);
+Check(slashPair.QueuedPrompt is null && slashPair.QueuedAt is null,
+    "claude: slash enqueue+dequeue pair reads as drained");
+
 // ---- 离线：10 分钟静默兜底（G23）----
 claude.Accept(C("UserPromptSubmit", new { prompt = "长跑任务" }), claudeNow.AddSeconds(22));
 claude.Maintain(claudeNow.AddMinutes(2));
@@ -1062,6 +1121,8 @@ Check(ours["args"]!.AsArray()[0]!.GetValue<string>().Replace('\\', '/').EndsWith
     "claude: exec form passes the script path as an argument");
 Check(!installedSettings.ToJsonString().Contains("--hook --source claude", StringComparison.Ordinal),
     "claude: legacy exe-form hooks replaced");
+Check(installedSettings["crossSessionInbound"]?.GetValue<string>() == "accept",
+    "claude: crossSessionInbound is configured to accept");
 
 Check(!claudeHooks.Install().Changed, "claude: install is idempotent");
 
@@ -1073,6 +1134,14 @@ Check(claudeHooks.IsInstalled(), "claude: outdated still counts as installed (ho
 Check(claudeHooks.InstalledVersion == 0, $"claude: installed version read from the script header (got {claudeHooks.InstalledVersion})");
 Check(claudeHooks.Install().Changed, "claude: reinstall repairs the stale script");
 Check(claudeHooks.Status == ClaudeHookStatus.Installed, "claude: repaired back to installed");
+
+// 缺少 crossSessionInbound 配置也视作待更新
+var noInboundSettings = JsonNode.Parse(File.ReadAllText(claudeHooks.SettingsPath))!.AsObject();
+noInboundSettings.Remove("crossSessionInbound");
+File.WriteAllText(claudeHooks.SettingsPath, noInboundSettings.ToJsonString());
+Check(claudeHooks.Status == ClaudeHookStatus.Outdated, "claude: missing crossSessionInbound reads as outdated");
+Check(claudeHooks.Install().Changed, "claude: reinstall repairs missing crossSessionInbound");
+Check(claudeHooks.Status == ClaudeHookStatus.Installed, "claude: repaired back to installed with crossSessionInbound");
 
 var uninstall = claudeHooks.Uninstall();
 Check(uninstall.Changed, "claude: uninstall reports a change");
@@ -1125,7 +1194,7 @@ var answerAck = answerCatalog.Perform(
 Check(answerAck.Result == ControlResult.Accepted, $"claude answer: phone answer accepted (got {answerAck.Result}/{answerAck.Reason})");
 Check(recorder.Written is [{ Labels.Count: 0, Text: "就用 A" }], "claude answer: the free text reaches the resolver as text (not as a label)");
 Check(JsonNode.Parse(recorder.RawInput!)!["questions"] is JsonArray { Count: 1 }, "claude answer: raw tool input passed back whole");
-Check(AnswerTask().Capabilities.Count == 0 && AnswerTask().Lifecycle == AgentLifecycle.Running,
+Check(!AnswerTask().Capabilities.Contains(TaskCapability.Answer) && AnswerTask().Lifecycle == AgentLifecycle.Running,
     "claude answer: capability cleared and the turn resumes");
 Check(answerCatalog.Projection().PendingRequests.Count == 0, "claude answer: question card cleared");
 
@@ -1415,7 +1484,7 @@ Check(subPerm.Projection().PendingRequests.Count == 1, "subagent permission: ano
 
 subPerm.Accept(C("PostToolUse", new { session_id = "claude_20", agent_id = "a1", agent_type = "Explore", tool_name = "Bash" }), gapNow.AddSeconds(4));
 Check(subPerm.Projection().PendingRequests.Count == 0, "subagent permission: its own tool completion releases the card");
-Check(SubPermTask().Lifecycle == AgentLifecycle.Running && SubPermTask().Capabilities.Count == 0,
+Check(SubPermTask().Lifecycle == AgentLifecycle.Running && !SubPermTask().Capabilities.Contains(TaskCapability.Approve),
     $"subagent permission: parent returns to running (got {SubPermTask().Lifecycle})");
 
 // ── 子代理问问题：卡片类型同样要跟对（不能给允许/拒绝） ──
@@ -2330,7 +2399,7 @@ Check(denyAck.Result == ControlResult.Accepted, $"deny: accepted (got {denyAck.R
 Check(DenyTask().Lifecycle == AgentLifecycle.Running, $"deny: the task keeps running, it is not killed (got {DenyTask().Lifecycle})");
 Check(DenyTask().Activity == AgentActivity.Thinking, "deny: back to thinking");
 Check(DenyTask().LatestStep == "✗ 已拒绝 rm -rf build", $"deny: the refusal shows on the third line (got '{DenyTask().LatestStep}')");
-Check(!DenyTask().Capabilities.Any(), "deny: capabilities cleared");
+Check(!DenyTask().Capabilities.Contains(TaskCapability.Approve), "deny: capabilities cleared");
 // 之后代理自己结束 → 才是终态（不会被前面的拒绝卡在"已中断"）
 denyCatalog.Accept(C("Stop", new { session_id = "claude_deny", last_assistant_message = "那我不删了" }), denyT0.AddSeconds(3));
 Check(DenyTask().Lifecycle == AgentLifecycle.Succeeded, $"deny: the agent's own end signal decides the terminal state (got {DenyTask().Lifecycle})");
@@ -2357,7 +2426,7 @@ var expired = holdTimeoutCatalog.ExpireStaleWaits(TimeSpan.FromMinutes(10), hold
 Check(expired.Count == 1 && expired[0] == "claude_timeout", $"hold timeout: the stale wait is handed back (got {expired.Count})");
 Check(TimeoutTask().Lifecycle == AgentLifecycle.Running && TimeoutTask().Activity == AgentActivity.Thinking,
     $"hold timeout: back to running/thinking, not dead (got {TimeoutTask().Lifecycle}/{TimeoutTask().Activity})");
-Check(!TimeoutTask().Capabilities.Any(), "hold timeout: capabilities cleared");
+Check(!TimeoutTask().Capabilities.Contains(TaskCapability.Approve), "hold timeout: capabilities cleared");
 Check(!holdTimeoutCatalog.Projection().PendingRequests.Any(r => r.TaskID == "claude_timeout"), "hold timeout: the card is dropped");
 // 计时顺延：等待的 10 分钟不计入净耗时（离开等待态时 Upsert 自动补偿）
 Check(TimeoutTask().StartedAt >= holdT0.AddMinutes(10), $"hold timeout: the wait is excluded from the clock (got {TimeoutTask().StartedAt:HH:mm:ss})");
@@ -2613,6 +2682,623 @@ Check(CommandCodeUsageLoader.ParseWindows("{}", null, DateTimeOffset.Now).Count 
 Check(CommandCodeUsageLoader.ParseDaily(null, DateTimeOffset.Now).Count == 0, "cmdc: missing summary yields no daily points");
 Check(CommandCodeUsageLoader.SubscriptionPeriodEnd("not json") is null, "cmdc: malformed subscription json is tolerated");
 
+// ---------------------------------------------------------------------------
+// 远程 Prompt 全链路单测（OpenCode / ClaudeCode / Antigravity）
+// ---------------------------------------------------------------------------
+// 1. OpenCode 运行中 Prompt 下发 -> 队列标记
+var opencodeCatalog = new TaskCatalog();
+var remoteOcT0 = DateTimeOffset.UtcNow;
+opencodeCatalog.Accept(H("session.created", new { id = "oc-1", directory = "F:/Git/repo" }), remoteOcT0);
+opencodeCatalog.Accept(H("chat.message", new { sessionID = "oc-1", text = "初始提示词" }), remoteOcT0.AddSeconds(1));
+var ocRec = new RecordingResolver();
+var ocAck = opencodeCatalog.Perform(Guid.NewGuid(), new ControlPayload("oc-1", ControlAction.Prompt, "追加命令：查一下状态"), ocRec);
+Check(ocAck.Result == ControlResult.Accepted, "prompt: opencode running prompt accepted");
+Check(ocRec.PromptSessionID == "oc-1" && ocRec.PromptSource == AgentSource.OpenCode && ocRec.PromptText == "追加命令：查一下状态" && ocRec.PromptIsRunning == true, "prompt: opencode resolver recorded running");
+var ocTask = opencodeCatalog.Projection().Tasks.First(t => t.Id == "oc-1");
+Check(ocTask.PromptQueued && ocTask.UserPrompt == "追加命令：查一下状态", "prompt: opencode queued state set");
+
+// 2. OpenCode 空闲态下发 Prompt -> 唤醒新一轮
+opencodeCatalog.Accept(H("session.idle", new { sessionID = "oc-1" }), remoteOcT0.AddSeconds(2));
+var ocAck2 = opencodeCatalog.Perform(Guid.NewGuid(), new ControlPayload("oc-1", ControlAction.Prompt, "开启下一轮新需求"), ocRec);
+Check(ocAck2.Result == ControlResult.Accepted, "prompt: opencode idle prompt accepted");
+var ocTask2 = opencodeCatalog.Projection().Tasks.First(t => t.Id == "oc-1");
+Check(ocTask2.Lifecycle == AgentLifecycle.Running && !ocTask2.PromptQueued && ocTask2.UserPrompt == "开启下一轮新需求", "prompt: opencode idle prompt starts new turn");
+
+// 3. Claude Code Prompt 下发与存活性一票否决门禁
+var claudeCatalog = new TaskCatalog();
+claudeCatalog.ClaudeRegistryScanner = () => new Dictionary<string, ClaudeSessionRegistry.Entry>
+{
+    ["cc-1"] = new("cc-1", null, null, "busy", null, null, Environment.ProcessId, null)
+};
+claudeCatalog.Accept(C("SessionStart", new { session_id = "cc-1" }));
+claudeCatalog.Accept(C("UserPromptSubmit", new { session_id = "cc-1", prompt = "第一问" }));
+Check(claudeCatalog.Projection().Tasks.First(t => t.Id == "cc-1").Capabilities.Contains(TaskCapability.Prompt), "prompt: claude has prompt capability when process alive");
+var ccRec = new RecordingResolver();
+var ccAck = claudeCatalog.Perform(Guid.NewGuid(), new ControlPayload("cc-1", ControlAction.Prompt, "帮我看看编译错误"), ccRec);
+Check(ccAck.Result == ControlResult.Accepted, "prompt: claude prompt accepted");
+Check(ccRec.PromptSessionID == "cc-1" && ccRec.PromptSource == AgentSource.ClaudeCode && ccRec.PromptText == "帮我看看编译错误", "prompt: claude resolver recorded");
+
+// 3.1 Claude Code 前台进程死亡 -> 能力位一票否决
+claudeCatalog.ClaudeRegistryScanner = () => new();
+Check(!claudeCatalog.Projection().Tasks.First(t => t.Id == "cc-1").Capabilities.Contains(TaskCapability.Prompt), "prompt: claude loses prompt capability when process dead");
+var ccDeadAck = claudeCatalog.Perform(Guid.NewGuid(), new ControlPayload("cc-1", ControlAction.Prompt, "死进程不可发"), ccRec);
+Check(ccDeadAck.Result == ControlResult.Unsupported, "prompt: rejected when claude process dead");
+
+// 3.2 OpenCode 控制通道断开 -> 能力位一票否决
+var ocDisconnectedCatalog = new TaskCatalog();
+ocDisconnectedCatalog.HasOpenCodeControl = () => false;
+ocDisconnectedCatalog.Accept(H("session.idle", new { sessionID = "oc-dead" }));
+Check(!ocDisconnectedCatalog.Projection().Tasks.First(t => t.Id == "oc-dead").Capabilities.Contains(TaskCapability.Prompt), "prompt: opencode loses prompt capability when control channel broken");
+var ocDeadAck = ocDisconnectedCatalog.Perform(Guid.NewGuid(), new ControlPayload("oc-dead", ControlAction.Prompt, "通道断开不可发"), ocRec);
+Check(ocDeadAck.Result == ControlResult.Unsupported, "prompt: rejected when opencode channel broken");
+
+// 4. Antigravity Prompt 下发与工作区记录
+var remoteAgyCatalog = new TaskCatalog();
+remoteAgyCatalog.Accept(new AgyHookPayload("PreInvocation", ConversationId: "agy-1", WorkspacePaths: ["F:\\Git\\agy-proj"]));
+var agyRec = new RecordingResolver();
+var agyAck = remoteAgyCatalog.Perform(Guid.NewGuid(), new ControlPayload("agy-1", ControlAction.Prompt, "重构一下模型层"), agyRec);
+Check(agyAck.Result == ControlResult.Accepted, "prompt: agy running prompt accepted");
+Check(agyRec.PromptSessionID == "agy-1" && agyRec.PromptWorkspace == "F:\\Git\\agy-proj" && agyRec.PromptIsRunning == true, "prompt: agy workspace passed to resolver");
+
+// 5. AgyCliDispatcher 队列测试（pull 模型：Stop 问桥要、给一条出一条；spawn drain 已删）
+{
+    AgyCliDispatcher.QueueOrExecute("agy-q1", "排队执行的指令", "F:\\Git\\proj", isRunning: true);
+    AgyCliDispatcher.QueueOrExecute("agy-q1", "排队第二条", "F:\\Git\\proj", isRunning: true);
+    Check(AgyCliDispatcher.HasQueued("agy-q1"), "agy dispatcher: prompt queued when running");
+    Check(AgyCliDispatcher.TryTakeQueued("agy-q1") == "排队执行的指令", "agy dispatcher: handover takes the head");
+    Check(AgyCliDispatcher.QueuedCount("agy-q1") == 1, "agy dispatcher: one left after handover");
+    Check(AgyCliDispatcher.TryTakeQueued("agy-q1") == "排队第二条", "agy dispatcher: FIFO order on handover");
+    Check(!AgyCliDispatcher.HasQueued("agy-q1"), "agy dispatcher: queue is empty after handover");
+    Check(AgyCliDispatcher.TryTakeQueued("agy-q1") is null, "agy dispatcher: empty handover takes nothing");
+}
+
+// 5.1 ClaudePromptDispatcher 队列测试
+var prevClaudeStarter = ClaudePeerClient.ProcessStarter;
+try
+{
+    ClaudePeerClient.ProcessStarter = _ => null;
+    ClaudePromptDispatcher.QueueOrExecute("claude-q1", "排队注入的指令1", "F:\\Git\\proj", isRunning: true);
+    ClaudePromptDispatcher.QueueOrExecute("claude-q1", "排队注入的指令2", "F:\\Git\\proj", isRunning: true);
+    Check(ClaudePromptDispatcher.HasQueued("claude-q1"), "claude dispatcher: prompt queued when running");
+    Check(ClaudePromptDispatcher.QueuedCount("claude-q1") == 2, "claude dispatcher: queue count is 2");
+    Check(ClaudePromptDispatcher.TryDrainQueued("claude-q1"), "claude dispatcher: first prompt drained");
+    Check(ClaudePromptDispatcher.QueuedCount("claude-q1") == 1, "claude dispatcher: queue count is 1 after first drain");
+    Check(ClaudePromptDispatcher.TryDrainQueued("claude-q1"), "claude dispatcher: second prompt drained");
+    Check(!ClaudePromptDispatcher.HasQueued("claude-q1"), "claude dispatcher: queue is empty after draining all");
+}
+finally
+{
+    ClaudePeerClient.ProcessStarter = prevClaudeStarter;
+}
+
+// 5.1b 桥端队列硬化（2026-10-17）：drain 发送失败保留队头 / TTL / 离线与回收清队列。
+// drain 发送失败必须保留队头等下个 Stop 重试（旧实现先出队再发送，失败=静默丢）。
+var failPrevStarter = ClaudePeerClient.ProcessStarter;
+var failPrevScanner = ClaudePeerClient.RegistryScanner;
+try
+{
+    ClaudePeerClient.RegistryScanner = () => new();
+    ClaudePeerClient.ProcessStarter = _ => throw new InvalidOperationException("通道已断");
+    ClaudePromptDispatcher.QueueOrExecute("claude-qf", "发不出去的那条", null, isRunning: true);
+    Check(!ClaudePromptDispatcher.TryDrainQueued("claude-qf"), "claude queue: failed drain keeps the head");
+    Check(ClaudePromptDispatcher.QueuedCount("claude-qf") == 1, "claude queue: nothing dequeued on failure");
+}
+finally
+{
+    ClaudePeerClient.ProcessStarter = failPrevStarter;
+    ClaudePeerClient.RegistryScanner = failPrevScanner;
+}
+// 通道恢复后下个 Stop 放行同一条（还躺在内存里）。
+var recoverPrevStarter = ClaudePeerClient.ProcessStarter;
+var recoverPrevScanner = ClaudePeerClient.RegistryScanner;
+try
+{
+    ClaudePeerClient.RegistryScanner = () => new();
+    ClaudePeerClient.ProcessStarter = _ => null;
+    Check(ClaudePromptDispatcher.TryDrainQueued("claude-qf"), "claude queue: retry after recovery drains");
+    Check(!ClaudePromptDispatcher.HasQueued("claude-qf"), "claude queue: empty after recovered drain");
+}
+finally
+{
+    ClaudePeerClient.ProcessStarter = recoverPrevStarter;
+    ClaudePeerClient.RegistryScanner = recoverPrevScanner;
+}
+
+// TTL：超期条目在 sweep/drain 时就地丢弃，不能无限期卡住队头。
+ClaudePromptDispatcher.QueueOrExecute("claude-qt", "过期的那条", null, isRunning: true);
+Check(ClaudePromptDispatcher.SweepExpired("claude-qt", ClaudePromptDispatcher.QueueEntryTtl, now: DateTimeOffset.UtcNow + TimeSpan.FromMinutes(31)) == 1,
+    "claude queue: expired entry swept");
+Check(!ClaudePromptDispatcher.HasQueued("claude-qt"), "claude queue: swept queue reads empty");
+ClaudePromptDispatcher.QueueOrExecute("claude-qt2", "新鲜的那条", null, isRunning: true);
+Check(ClaudePromptDispatcher.SweepExpired("claude-qt2", ClaudePromptDispatcher.QueueEntryTtl) == 0,
+    "claude queue: fresh entry survives sweep");
+Check(ClaudePromptDispatcher.ClearQueued("claude-qt2") == 1, "claude queue: clear returns dropped count");
+Check(ClaudePromptDispatcher.ClearQueued("claude-qt2") == 0, "claude queue: clearing an empty queue drops nothing");
+
+// 离线清队列：会话死掉时桥端排队文本不可能再放行，连徽章一起熄灭（旧实现两边都留）。
+// 注：RecordingResolver 只记录不转发，这里用 QueueOrExecute 按生产路径（HookTcpServer）真实入队。
+var qoCatalog = new TaskCatalog
+{
+    ClaudeRegistryScanner = () => new Dictionary<string, ClaudeSessionRegistry.Entry>
+    {
+        ["claude-qo"] = new("claude-qo", null, null, "idle", null, null, Environment.ProcessId, null),
+    },
+};
+var qoT0 = DateTimeOffset.UtcNow;
+qoCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude-qo", prompt = "在跑的活" }), qoT0);
+var qoAck = qoCatalog.Perform(Guid.NewGuid(), new ControlPayload("claude-qo", ControlAction.Prompt, "排队那条"), new RecordingResolver());
+Check(qoAck.Result == ControlResult.Accepted, "claude queue: prompt queued while running");
+ClaudePromptDispatcher.QueueOrExecute("claude-qo", "排队那条", null, isRunning: true);
+Check(ClaudePromptDispatcher.HasQueued("claude-qo"), "claude queue: bridge holds the text");
+// 11 分钟无音讯 + 注册表/宿主双无（静态 Scan 里没有 claude-qo）= 离线。
+qoCatalog.Maintain(qoT0.AddMinutes(11));
+var qoTask = qoCatalog.Projection().Tasks.First(t => t.Id == "claude-qo");
+Check(qoTask.Lifecycle == AgentLifecycle.Offline, $"claude queue: dead session goes offline (got {qoTask.Lifecycle})");
+Check(!ClaudePromptDispatcher.HasQueued("claude-qo"), "claude queue: offline drops the bridge queue");
+Check(!qoTask.PromptQueued, "claude queue: offline clears the queued badge");
+
+// 任务回收清队列：终态 30 分钟后 Normalize 回收任务，桥端队列不能留下僵尸。
+var purgeCatalog = new TaskCatalog
+{
+    ClaudeRegistryScanner = () => new Dictionary<string, ClaudeSessionRegistry.Entry>
+    {
+        ["claude-qp"] = new("claude-qp", null, null, "idle", null, null, Environment.ProcessId, null),
+    },
+};
+var purgeT0 = DateTimeOffset.UtcNow;
+purgeCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude-qp", prompt = "在跑的活" }), purgeT0);
+var purgeAck = purgeCatalog.Perform(Guid.NewGuid(), new ControlPayload("claude-qp", ControlAction.Prompt, "没等到的那条"), new RecordingResolver());
+Check(purgeAck.Result == ControlResult.Accepted, "claude queue: prompt queued before the turn ends");
+ClaudePromptDispatcher.QueueOrExecute("claude-qp", "没等到的那条", null, isRunning: true);
+Check(ClaudePromptDispatcher.HasQueued("claude-qp"), "claude queue: bridge holds the text before purge");
+purgeCatalog.Accept(C("Stop", new { session_id = "claude-qp" }), purgeT0.AddSeconds(2));
+purgeCatalog.Maintain(purgeT0.AddMinutes(33));
+Check(!purgeCatalog.Projection().Tasks.Any(t => t.Id == "claude-qp"), "claude queue: terminal task purged after 30 minutes");
+Check(!ClaudePromptDispatcher.HasQueued("claude-qp"), "claude queue: purge drops the bridge queue");
+
+// 持久化 round-trip：导出 → 清空 → 导入恢复，顺序不变（FIFO），drain 照常工作。
+var persistPrevStarter = ClaudePeerClient.ProcessStarter;
+var persistPrevScanner = ClaudePeerClient.RegistryScanner;
+try
+{
+    ClaudePeerClient.RegistryScanner = () => new();
+    var drainedTexts = new List<string>();
+    ClaudePeerClient.ProcessStarter = psi => { drainedTexts.Add(psi.ArgumentList[3]); return null; };
+    ClaudePromptDispatcher.QueueOrExecute("claude-qx", "持久第一条", null, isRunning: true);
+    ClaudePromptDispatcher.QueueOrExecute("claude-qx", "持久第二条", null, isRunning: true);
+    var exported = ClaudePromptDispatcher.ExportQueues();
+    Check(exported.TryGetValue("claude-qx", out var expItems) && expItems.Count == 2 &&
+          expItems[0].Prompt == "持久第一条" && expItems[1].Prompt == "持久第二条",
+        "claude queue: export keeps order");
+    Check(ClaudePromptDispatcher.ClearQueued("claude-qx") == 2, "claude queue: cleared before import");
+    Check(ClaudePromptDispatcher.ImportQueues(exported) == 2, "claude queue: import restores all");
+    Check(ClaudePromptDispatcher.TryDrainQueued("claude-qx"), "claude queue: drain after import works");
+    Check(drainedTexts.Count == 1 && drainedTexts[0] == "持久第一条",
+        $"claude queue: FIFO order preserved across restart (got '{string.Join("|", drainedTexts)}')");
+    Check(ClaudePromptDispatcher.ClearQueued("claude-qx") == 1, "claude queue: cleanup");
+}
+finally
+{
+    ClaudePeerClient.ProcessStarter = persistPrevStarter;
+    ClaudePeerClient.RegistryScanner = persistPrevScanner;
+}
+
+// 导入即过期：重启间隔里超 TTL 的不等下次 Stop，直接丢弃记数。
+var staleState = new Dictionary<string, List<QueuedPromptRecord>>(StringComparer.Ordinal)
+{
+    ["claude-qy"] = new()
+    {
+        new("过期的那条", null, DateTimeOffset.UtcNow - TimeSpan.FromMinutes(31)),
+        new("新鲜的那条", null, DateTimeOffset.UtcNow),
+    },
+};
+Check(ClaudePromptDispatcher.ImportQueues(staleState) == 1, "claude queue: import drops expired entries");
+Check(ClaudePromptDispatcher.QueuedCount("claude-qy") == 1 &&
+      ClaudePromptDispatcher.PeekLastText("claude-qy") == "新鲜的那条",
+    "claude queue: only the fresh entry survives import");
+Check(ClaudePromptDispatcher.ClearQueued("claude-qy") == 1, "claude queue: cleanup");
+
+// 徽章自愈：重启后任务行是 hook 重建的（徽章没了），队列还在——Maintain 补回徽章。
+var healCatalog = new TaskCatalog();
+var healT0 = DateTimeOffset.UtcNow;
+healCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude-qh", prompt = "重建的那轮" }), healT0);
+ClaudePromptDispatcher.QueueOrExecute("claude-qh", "恢复的那条", null, isRunning: true);
+Check(!healCatalog.Projection().Tasks.First(t => t.Id == "claude-qh").PromptQueued,
+    "claude queue: rebuilt task starts without the badge");
+healCatalog.Maintain(healT0.AddSeconds(5));
+var healTask = healCatalog.Projection().Tasks.First(t => t.Id == "claude-qh");
+Check(healTask.PromptQueued && healTask.UserPrompt == "恢复的那条",
+    $"claude queue: maintain heals the badge from the queue (queued={healTask.PromptQueued} / '{healTask.UserPrompt}')");
+Check(ClaudePromptDispatcher.ClearQueued("claude-qh") == 1, "claude queue: cleanup");
+
+// 文件 round-trip（独立文件，不进 tasks.json：非终态行重启时整行丢弃，塞进去等于没存）。
+var qpPath = Path.Combine(Path.GetTempPath(), "ap-queue-persist-" + Guid.NewGuid().ToString("N") + ".json");
+try
+{
+    var qpStore = new PromptQueuePersistence(qpPath);
+    qpStore.Save(new Dictionary<string, List<QueuedPromptRecord>>(StringComparer.Ordinal)
+    {
+        ["claude-qz"] = new() { new("落盘那条", @"F:\Git\demo", DateTimeOffset.UtcNow) },
+    });
+    var qpLoaded = qpStore.Load();
+    Check(qpLoaded.TryGetValue("claude-qz", out var qpItems) && qpItems.Count == 1 &&
+          qpItems[0].Prompt == "落盘那条" && qpItems[0].Cwd == @"F:\Git\demo",
+        "claude queue: file round-trip keeps text and cwd");
+}
+finally
+{
+    try { File.Delete(qpPath); } catch { }
+}
+
+// 5.1c agy pull 模型（Stop 回包交接；spawn drain 已删）。
+// 回包形状：block + 原文 reason（探针实证：agy 以 SYSTEM_MESSAGE 同一进程续跑）。
+{
+    var pullBytes = AgyHookOutput.PullPrompt("顺手看看日志");
+    var pullDoc = JsonDocument.Parse(System.Text.Encoding.UTF8.GetString(pullBytes));
+    Check(pullDoc.RootElement.GetProperty("decision").GetString() == "block" &&
+          pullDoc.RootElement.GetProperty("reason").GetString() == "顺手看看日志",
+        "agy pull: handover reply is block + raw prompt");
+}
+
+// Stop 保徽章：有排队就留（跟进回合靠 wasQueued 保计时），无排队照旧清。
+var agyStopCatalog = new TaskCatalog();
+var agyStopT0 = DateTimeOffset.UtcNow;
+agyStopCatalog.Accept(A("PreInvocation", new { conversationId = "agy-qs" }), agyStopT0);
+var agyStopAck = agyStopCatalog.Perform(Guid.NewGuid(), new ControlPayload("agy-qs", ControlAction.Prompt, "排队那条"), new RecordingResolver());
+Check(agyStopAck.Result == ControlResult.Accepted, "agy pull: prompt queued while running");
+AgyCliDispatcher.QueueOrExecute("agy-qs", "排队那条", null, isRunning: true);
+agyStopCatalog.Accept(A("Stop", new { conversationId = "agy-qs" }), agyStopT0.AddSeconds(2));
+var agyStopTask = agyStopCatalog.Projection().Tasks.First(t => t.Id == "agy-qs");
+Check(agyStopTask.PromptQueued, "agy pull: Stop keeps the badge while the queue is pending");
+Check(AgyCliDispatcher.HasQueued("agy-qs"), "agy pull: Stop does not consume (consumed at handover reply)");
+AgyCliDispatcher.ClearQueued("agy-qs");
+
+var agyStopEmptyCatalog = new TaskCatalog();
+agyStopEmptyCatalog.Accept(A("PreInvocation", new { conversationId = "agy-qe" }), agyStopT0);
+agyStopEmptyCatalog.Accept(A("Stop", new { conversationId = "agy-qe" }), agyStopT0.AddSeconds(2));
+Check(!agyStopEmptyCatalog.Projection().Tasks.First(t => t.Id == "agy-qe").PromptQueued,
+    "agy pull: Stop without queue clears the badge as before");
+
+// TTL：超期未被 pull 的就地丢弃。
+AgyCliDispatcher.QueueOrExecute("agy-qt", "过期的那条", null, isRunning: true);
+Check(AgyCliDispatcher.SweepExpired("agy-qt", AgyCliDispatcher.QueueEntryTtl, now: DateTimeOffset.UtcNow + TimeSpan.FromMinutes(31)) == 1,
+    "agy queue: expired entry swept");
+Check(!AgyCliDispatcher.HasQueued("agy-qt"), "agy queue: swept queue reads empty");
+
+// 任务回收清队列（与 claude 同款；排队文本只活内存，任务没了 pull 无从谈起）。
+var agyPurgeCatalog = new TaskCatalog();
+var agyPurgeT0 = DateTimeOffset.UtcNow;
+agyPurgeCatalog.Accept(A("PreInvocation", new { conversationId = "agy-qp" }), agyPurgeT0);
+agyPurgeCatalog.Perform(Guid.NewGuid(), new ControlPayload("agy-qp", ControlAction.Prompt, "没等到的那条"), new RecordingResolver());
+AgyCliDispatcher.QueueOrExecute("agy-qp", "没等到的那条", null, isRunning: true);
+agyPurgeCatalog.Accept(A("Stop", new { conversationId = "agy-qp" }), agyPurgeT0.AddSeconds(2));
+agyPurgeCatalog.Maintain(agyPurgeT0.AddMinutes(33));
+Check(!agyPurgeCatalog.Projection().Tasks.Any(t => t.Id == "agy-qp"), "agy queue: terminal task purged after 30 minutes");
+Check(!AgyCliDispatcher.HasQueued("agy-qp"), "agy queue: purge drops the bridge queue");
+
+// 持久化 round-trip：顺序不变；导入即过期直接丢。
+AgyCliDispatcher.QueueOrExecute("agy-qx", "持久第一条", null, isRunning: true);
+AgyCliDispatcher.QueueOrExecute("agy-qx", "持久第二条", null, isRunning: true);
+var agyExported = AgyCliDispatcher.ExportQueues();
+Check(agyExported.TryGetValue("agy-qx", out var agyExpItems) && agyExpItems.Count == 2 &&
+      agyExpItems[0].Prompt == "持久第一条" && agyExpItems[1].Prompt == "持久第二条",
+    "agy queue: export keeps order");
+Check(AgyCliDispatcher.ClearQueued("agy-qx") == 2, "agy queue: cleared before import");
+Check(AgyCliDispatcher.ImportQueues(agyExported) == 2, "agy queue: import restores all");
+Check(AgyCliDispatcher.TryTakeQueued("agy-qx") == "持久第一条", "agy queue: FIFO order preserved across restart");
+Check(AgyCliDispatcher.ClearQueued("agy-qx") == 1, "agy queue: cleanup");
+var agyStale = new Dictionary<string, List<QueuedPromptRecord>>(StringComparer.Ordinal)
+{
+    ["agy-qy"] = new()
+    {
+        new("过期的那条", null, DateTimeOffset.UtcNow - TimeSpan.FromMinutes(31)),
+        new("新鲜的那条", null, DateTimeOffset.UtcNow),
+    },
+};
+Check(AgyCliDispatcher.ImportQueues(agyStale) == 1, "agy queue: import drops expired entries");
+Check(AgyCliDispatcher.PeekLastText("agy-qy") == "新鲜的那条", "agy queue: only the fresh entry survives import");
+Check(AgyCliDispatcher.ClearQueued("agy-qy") == 1, "agy queue: cleanup");
+
+// 徽章自愈：重启后任务行是 hook 重建的（徽章没了），队列还在——Maintain 补回。
+var agyHealCatalog = new TaskCatalog();
+var agyHealT0 = DateTimeOffset.UtcNow;
+agyHealCatalog.Accept(A("PreInvocation", new { conversationId = "agy-qh" }), agyHealT0);
+AgyCliDispatcher.QueueOrExecute("agy-qh", "恢复的那条", null, isRunning: true);
+Check(!agyHealCatalog.Projection().Tasks.First(t => t.Id == "agy-qh").PromptQueued,
+    "agy queue: rebuilt task starts without the badge");
+agyHealCatalog.Maintain(agyHealT0.AddSeconds(5));
+var agyHealTask = agyHealCatalog.Projection().Tasks.First(t => t.Id == "agy-qh");
+Check(agyHealTask.PromptQueued && agyHealTask.UserPrompt == "恢复的那条",
+    $"agy queue: maintain heals the badge from the queue (queued={agyHealTask.PromptQueued} / '{agyHealTask.UserPrompt}')");
+Check(AgyCliDispatcher.ClearQueued("agy-qh") == 1, "agy queue: cleanup");
+
+// ---------------------------------------------------------------------------
+// 5.2 远程注入第二条腿（2026-10-16 探针定案）：宿主台账 / parked 存活 / env 全量继承 / 送达确认
+// ---------------------------------------------------------------------------
+
+// T1-T2 台账：Observe 只登记"活着的正主"（kind=interactive 且 entrypoint=cli 且有 pid），
+// 在位宿主不被新行改写（prefer-alive-incumbent），死了才换人；Forget 清账。
+var prevAliveChecker = ClaudeSessionRegistry.ProcessAliveChecker;
+try
+{
+    var obsAlive = new HashSet<int> { 1111, 2222 };
+    ClaudeSessionRegistry.ProcessAliveChecker = pid => obsAlive.Contains(pid);
+    ClaudeSessionRegistry.Observe(
+    [
+        new ClaudeSessionRegistry.Entry("obs-cli", null, null, "idle", null, null, 1111, null, Kind: "interactive", Entrypoint: "cli"),
+        new ClaudeSessionRegistry.Entry("obs-sdk", null, null, "idle", null, null, 3333, null, Kind: "interactive", Entrypoint: "sdk-cli"),
+        new ClaudeSessionRegistry.Entry("obs-nopid", null, null, "idle", null, null, null, null, Kind: "interactive", Entrypoint: "cli"),
+    ]);
+    Check(ClaudeSessionRegistry.HostPidOf("obs-cli") == 1111, "hostpids: cli host recorded");
+    Check(ClaudeSessionRegistry.HostPidOf("obs-sdk") is null, "hostpids: sdk-cli injection child ignored");
+    Check(ClaudeSessionRegistry.HostPidOf("obs-nopid") is null, "hostpids: pid-less row ignored");
+
+    ClaudeSessionRegistry.Observe(
+    [
+        new ClaudeSessionRegistry.Entry("obs-cli", null, null, "idle", null, null, 2222, null, Kind: "interactive", Entrypoint: "cli"),
+    ]);
+    Check(ClaudeSessionRegistry.HostPidOf("obs-cli") == 1111, "hostpids: alive incumbent is not overwritten");
+
+    obsAlive.Remove(1111);
+    ClaudeSessionRegistry.Observe(
+    [
+        new ClaudeSessionRegistry.Entry("obs-cli", null, null, "idle", null, null, 2222, null, Kind: "interactive", Entrypoint: "cli"),
+    ]);
+    Check(ClaudeSessionRegistry.HostPidOf("obs-cli") == 2222, "hostpids: dead incumbent is replaced");
+
+    ClaudeSessionRegistry.Forget("obs-cli");
+    Check(ClaudeSessionRegistry.HostPidOf("obs-cli") is null, "hostpids: forget drops the record");
+}
+finally
+{
+    ClaudeSessionRegistry.ProcessAliveChecker = prevAliveChecker;
+    ClaudeSessionRegistry.Forget("obs-cli");
+    ClaudeSessionRegistry.Forget("obs-sdk");
+    ClaudeSessionRegistry.Forget("obs-nopid");
+}
+
+// T3 parked：注册表里没有、但宿主进程活着 —— 能力保留、不吃 10 分钟兜底；
+// Forget 后（宿主真死）下一次 Maintain 立刻按常规判定转 Offline。
+var parkedCatalog = new TaskCatalog();
+var parkedT0 = DateTimeOffset.UtcNow;
+ClaudeSessionRegistry.Observe(
+[
+    new ClaudeSessionRegistry.Entry("parked-1", null, null, "idle", null, null, Environment.ProcessId, null, Kind: "interactive", Entrypoint: "cli"),
+]);
+try
+{
+    parkedCatalog.Accept(C("SessionStart", new { session_id = "parked-1" }), parkedT0);
+    parkedCatalog.Accept(C("UserPromptSubmit", new { session_id = "parked-1", prompt = "被 /resume 切走的会话" }), parkedT0.AddSeconds(1));
+    Check(parkedCatalog.Projection().Tasks.First(t => t.Id == "parked-1").Capabilities.Contains(TaskCapability.Prompt),
+        "parked: host alive keeps prompt capability without a registry entry");
+
+    parkedCatalog.Maintain(parkedT0.AddMinutes(11));
+    Check(parkedCatalog.Projection().Tasks.First(t => t.Id == "parked-1").Lifecycle != AgentLifecycle.Offline,
+        "parked: survives the 10-minute offline fallback while the host is alive");
+
+    ClaudeSessionRegistry.Forget("parked-1");
+    parkedCatalog.Maintain(parkedT0.AddMinutes(12));
+    Check(parkedCatalog.Projection().Tasks.First(t => t.Id == "parked-1").Lifecycle == AgentLifecycle.Offline,
+        "parked: host gone -> next maintain goes offline");
+}
+finally
+{
+    ClaudeSessionRegistry.Forget("parked-1");
+}
+
+// T4 ClaudeHostEnvironment：PEB 读取器的最小实证（读自己进程；真跨进程已在探针实测 69 项）。
+var pebProbe = "AGENTPAGER_PEB_PROBE_" + Guid.NewGuid().ToString("N")[..8];
+Environment.SetEnvironmentVariable(pebProbe, "peb-ok");
+try
+{
+    var pebEnv = ClaudeHostEnvironment.Read(Environment.ProcessId);
+    if (Environment.Is64BitProcess)
+        Check(pebEnv is not null && pebEnv.TryGetValue(pebProbe, out var pebValue) && pebValue == "peb-ok",
+            "host environment: PEB reader sees a just-set variable of the live host process");
+    else
+        Check(pebEnv is null, "host environment: 32-bit bridge degrades to null (documented)");
+}
+finally
+{
+    Environment.SetEnvironmentVariable(pebProbe, null);
+}
+
+// T5 身份三枚：大小写不敏感地常备剔除（socket / token / entrypoint）。
+Check(ClaudePeerClient.HostEnvironmentExclusions.Count == 3 &&
+      ClaudePeerClient.HostEnvironmentExclusions.Contains("claude_code_messaging_socket") &&
+      ClaudePeerClient.HostEnvironmentExclusions.Contains("claude_code_messaging_token") &&
+      ClaudePeerClient.HostEnvironmentExclusions.Contains("CLAUDE_CODE_ENTRYPOINT"),
+    "claude env: identity exclusions complete and case-insensitive");
+
+// T6 前置：启动器解析（2026-10-17 真机定案修复）。Windows 上 npm 只落 claude.cmd shim，
+// 没有 claude.exe；FileName="claude" 必被 CreateProcess 拒（v81 真机实测：CLI 回退腿从未
+// 启动过）。解析器必须按 npm 布局找到包体内的原生 claude.exe。
+var resolvedClaudeExe = ClaudePeerClient.ResolveCliExecutable();
+Check(File.Exists(resolvedClaudeExe),
+    $"claude launcher: resolver finds a real executable on this machine (got '{resolvedClaudeExe}')");
+
+// T6 CLI 回退子进程的启动环境：宿主（此处用测试进程代理）整套环境叠加、身份三枚无条件剔除、
+// 参数与工作目录照旧（claude --resume <id> -p <prompt>，cwd 用会话记录的那个）。
+var envProbe = "AGENTPAGER_ENV_PROBE_" + Guid.NewGuid().ToString("N")[..8];
+var prevEnvProbe = Environment.GetEnvironmentVariable(envProbe);
+var prevEnvToken = Environment.GetEnvironmentVariable("CLAUDE_CODE_MESSAGING_TOKEN");
+var prevEnvEntrypoint = Environment.GetEnvironmentVariable("CLAUDE_CODE_ENTRYPOINT");
+var prevProvBase = Environment.GetEnvironmentVariable("ANTHROPIC_BASE_URL");
+var prevProvModel = Environment.GetEnvironmentVariable("ANTHROPIC_MODEL");
+var prevEnvStarter = ClaudePeerClient.ProcessStarter;
+var prevEnvScanner = ClaudePeerClient.RegistryScanner;
+try
+{
+    Environment.SetEnvironmentVariable(envProbe, "host-ok");
+    Environment.SetEnvironmentVariable("CLAUDE_CODE_MESSAGING_TOKEN", "parent-token");
+    Environment.SetEnvironmentVariable("CLAUDE_CODE_ENTRYPOINT", "cli");
+    ClaudeSessionRegistry.Observe(
+    [
+        new ClaudeSessionRegistry.Entry("env-1", null, null, "idle", null, null, Environment.ProcessId, null, Kind: "interactive", Entrypoint: "cli"),
+    ]);
+
+    System.Diagnostics.ProcessStartInfo? envStartInfo = null;
+    ClaudePeerClient.RegistryScanner = () => new();
+    ClaudePeerClient.ProcessStarter = psi => { envStartInfo = psi; return null; };
+    Check(ClaudePromptDispatcher.QueueOrExecute("env-1", "继承宿主环境", @"F:\Git\demo", isRunning: false),
+        "claude env: direct dispatch started via CLI fallback");
+
+    var envSi = envStartInfo;
+    Check(envSi is not null &&
+          envSi.FileName == resolvedClaudeExe &&
+          envSi.WorkingDirectory == @"F:\Git\demo" &&
+          envSi.ArgumentList.Count == 4 &&
+          envSi.ArgumentList[0] == "--resume" && envSi.ArgumentList[1] == "env-1" &&
+          envSi.ArgumentList[2] == "-p" && envSi.ArgumentList[3] == "继承宿主环境",
+        "claude env: child launched as claude --resume <id> -p <prompt> in the session cwd");
+
+    Check(envSi is not null && envSi.Environment.TryGetValue(envProbe, out var envValue) && envValue == "host-ok",
+        "claude env: host environment carried into the child");
+
+    Check(envSi is not null &&
+          !envSi.Environment.ContainsKey("CLAUDE_CODE_MESSAGING_TOKEN") &&
+          !envSi.Environment.ContainsKey("CLAUDE_CODE_ENTRYPOINT"),
+        "claude env: identity variables stripped even when present in the parent");
+
+    // 用户裁定（2026-10-17 重申，防压缩丢失）：注入过程不得碰提供商/模型设置，通通继承原对话。
+    // 锁死：provider/模型变量必须原样带进子进程（与身份三枚的剔除对照；参数个数锁在上面）。
+    Environment.SetEnvironmentVariable("ANTHROPIC_BASE_URL", "https://provider.example/v1");
+    Environment.SetEnvironmentVariable("ANTHROPIC_MODEL", "opus");
+    System.Diagnostics.ProcessStartInfo? provStartInfo = null;
+    ClaudePeerClient.ProcessStarter = psi => { provStartInfo = psi; return null; };
+    Check(ClaudePromptDispatcher.QueueOrExecute("env-1", "再来一条", @"F:\Git\demo", isRunning: false),
+        "claude env: provider inheritance dispatch started");
+    Check(provStartInfo is not null &&
+          provStartInfo.Environment.TryGetValue("ANTHROPIC_BASE_URL", out var provBase) && provBase == "https://provider.example/v1" &&
+          provStartInfo.Environment.TryGetValue("ANTHROPIC_MODEL", out var provModel) && provModel == "opus" &&
+          !provStartInfo.ArgumentList.Any(a => a.StartsWith("--model", StringComparison.Ordinal)),
+        "claude env: provider/model settings inherited untouched, no --model flag");
+}
+finally
+{
+    ClaudePeerClient.ProcessStarter = prevEnvStarter;
+    ClaudePeerClient.RegistryScanner = prevEnvScanner;
+    Environment.SetEnvironmentVariable(envProbe, prevEnvProbe);
+    Environment.SetEnvironmentVariable("CLAUDE_CODE_MESSAGING_TOKEN", prevEnvToken);
+    Environment.SetEnvironmentVariable("CLAUDE_CODE_ENTRYPOINT", prevEnvEntrypoint);
+    Environment.SetEnvironmentVariable("ANTHROPIC_BASE_URL", prevProvBase);
+    Environment.SetEnvironmentVariable("ANTHROPIC_MODEL", prevProvModel);
+    ClaudeSessionRegistry.Forget("env-1");
+}
+
+// T6b 重投强制换腿（2026-10-17 真机定案）：skipPipe=true 时即使注册表里有"活管道"条目也
+// 必须直接走 CLI——parked 会话的陈旧管道"收得下字节却无人消费"，首投可能已被它静默吞掉，
+// 重投再走它等于白费第二次机会。这里用一条真实存在但无人喂数据的命名管道当"陈旧管道"：
+// 若 skipPipe 失效，连接会成功（accept 完成）且 CLI 腿被跳过，断言当场抓现行。
+var skipPipeName = "agentpager-skip-test-" + Guid.NewGuid().ToString("N")[..8];
+var prevSkipStarter = ClaudePeerClient.ProcessStarter;
+var prevSkipScanner = ClaudePeerClient.RegistryScanner;
+try
+{
+    using var skipServer = new System.IO.Pipes.NamedPipeServerStream(
+        skipPipeName, System.IO.Pipes.PipeDirection.InOut, 1,
+        System.IO.Pipes.PipeTransmissionMode.Byte, System.IO.Pipes.PipeOptions.Asynchronous);
+    var skipAccept = skipServer.WaitForConnectionAsync();
+
+    System.Diagnostics.ProcessStartInfo? skipStartInfo = null;
+    ClaudePeerClient.ProcessStarter = psi => { skipStartInfo = psi; return null; };
+    ClaudePeerClient.RegistryScanner = () => new()
+    {
+        ["skip-1"] = new("skip-1", null, null, "idle", null,
+            MessagingSocketPath: @"\\.\pipe\" + skipPipeName,
+            Pid: Environment.ProcessId, Cwd: @"F:\Git\demo", Kind: "interactive", Entrypoint: "cli"),
+    };
+    var skipLogs = new List<(string Level, string Message)>();
+    var skipOk = ClaudePeerClient.SendPrompt("skip-1", "重投强制换腿", skipPipe: true,
+        log: (level, message) => skipLogs.Add((level, message)));
+
+    Check(skipOk && skipStartInfo is not null &&
+          skipStartInfo.ArgumentList.Count == 4 && skipStartInfo.ArgumentList[1] == "skip-1",
+        "claude retry: skipPipe dispatches straight to the CLI leg");
+    Check(skipLogs.All(entry => !entry.Message.Contains("管道注入")),
+        "claude retry: skipPipe never touches the pipe (no pipe success or error logged)");
+    Check(!skipAccept.IsCompleted,
+        "claude retry: skipPipe leaves a live pipe untouched (no connection made)");
+}
+finally
+{
+    ClaudePeerClient.ProcessStarter = prevSkipStarter;
+    ClaudePeerClient.RegistryScanner = prevSkipScanner;
+}
+
+// T7 送达确认：直接投递（非运行中）登记；45s 无音讯 -> 静默重投一次；再 45s -> 诚实落
+// "未确认"；期间任意 hook 事件到达即清账（在途不重投）。
+var delCatalog = new TaskCatalog
+{
+    ClaudeRegistryScanner = () => new Dictionary<string, ClaudeSessionRegistry.Entry>
+    {
+        ["del-1"] = new("del-1", null, null, "idle", null, null, Environment.ProcessId, null),
+        ["del-2"] = new("del-2", null, null, "idle", null, null, Environment.ProcessId, null),
+    },
+};
+var delT0 = DateTimeOffset.UtcNow;
+foreach (var delID in new[] { "del-1", "del-2" })
+{
+    delCatalog.Accept(C("SessionStart", new { session_id = delID }), delT0);
+    delCatalog.Accept(C("UserPromptSubmit", new { session_id = delID, prompt = "原有对话" }), delT0.AddSeconds(1));
+    delCatalog.Accept(C("Stop", new { session_id = delID }), delT0.AddSeconds(2));
+}
+var delRec = new RecordingResolver();
+var delAck1 = delCatalog.Perform(Guid.NewGuid(), new ControlPayload("del-1", ControlAction.Prompt, "继续看看"), delRec);
+Check(delAck1.Result == ControlResult.Accepted && delRec.PromptIsRunning == false,
+    "delivery: finished (succeeded) session takes the direct path");
+var delTask1 = delCatalog.Projection().Tasks.First(t => t.Id == "del-1");
+Check(delTask1.Lifecycle == AgentLifecycle.Running && !delTask1.PromptQueued && delTask1.UserPrompt == "继续看看",
+    "delivery: revival restarts the turn without queuing");
+var delAck2 = delCatalog.Perform(Guid.NewGuid(), new ControlPayload("del-2", ControlAction.Prompt, "第二条"), delRec);
+Check(delAck2.Result == ControlResult.Accepted, "delivery: second session delivered directly");
+delCatalog.Accept(C("PostToolUse", new { session_id = "del-2" }), delT0.AddSeconds(10));
+
+var delPrevStarter = ClaudePeerClient.ProcessStarter;
+var delPrevScanner = ClaudePeerClient.RegistryScanner;
+try
+{
+    var delSends = 0;
+    ClaudePeerClient.RegistryScanner = () => new();
+    ClaudePeerClient.ProcessStarter = _ => { delSends++; return null; };
+
+    delCatalog.Maintain(delT0.AddSeconds(50));
+    Check(delSends == 1, $"delivery: silent retry once after the first timeout (sends={delSends})");
+    Check(delCatalog.Projection().Tasks.First(t => t.Id == "del-1").LatestStep != "⚠ 远程注入未确认送达（会话无响应）",
+        "delivery: retry does not write the warning yet");
+    Check(delCatalog.Projection().Tasks.First(t => t.Id == "del-2").LatestStep != "⚠ 远程注入未确认送达（会话无响应）",
+        "delivery: acked session is not retried");
+
+    delCatalog.Maintain(delT0.AddSeconds(100));
+    Check(delSends == 1, "delivery: no second retry after the retried flag is set");
+    Check(delCatalog.Projection().Tasks.First(t => t.Id == "del-1").LatestStep == "⚠ 远程注入未确认送达（会话无响应）",
+        "delivery: second timeout writes the honest warning");
+
+    delCatalog.Maintain(delT0.AddSeconds(150));
+    Check(delSends == 1 && delCatalog.Projection().Tasks.First(t => t.Id == "del-2").LatestStep != "⚠ 远程注入未确认送达（会话无响应）",
+        "delivery: settled sessions stay quiet on later maintains");
+}
+finally
+{
+    ClaudePeerClient.ProcessStarter = delPrevStarter;
+    ClaudePeerClient.RegistryScanner = delPrevScanner;
+}
+
+// 6. 异常与边界分支
+var emptyAck = opencodeCatalog.Perform(Guid.NewGuid(), new ControlPayload("oc-1", ControlAction.Prompt, "   "), ocRec);
+Check(emptyAck.Result == ControlResult.Unsupported, "prompt: empty prompt rejected");
+
+var waitCatalog = new TaskCatalog();
+var waitT0 = DateTimeOffset.UtcNow;
+waitCatalog.Accept(H("session.created", new { id = "oc-wait", directory = "F:/Git/repo" }), waitT0);
+waitCatalog.Accept(H("chat.message", new { sessionID = "oc-wait", text = "做个操作" }), waitT0.AddSeconds(1));
+waitCatalog.Accept(new OpenCodeHookPayload("permission.asked", JsonSerializer.SerializeToElement(new { sessionID = "oc-wait", id = "req-1", permission = "bash" }, WireJson.Options), "approval"), waitT0.AddSeconds(2));
+var waitAck = waitCatalog.Perform(Guid.NewGuid(), new ControlPayload("oc-wait", ControlAction.Prompt, "打断一下"), ocRec);
+Check(waitAck.Result == ControlResult.Unsupported, "prompt: rejected while waiting approval");
+
+var failAck = opencodeCatalog.Perform(Guid.NewGuid(), new ControlPayload("oc-1", ControlAction.Prompt, "正常指令"), new NullResolver());
+Check(failAck.Result == ControlResult.Rejected, "prompt: delivery failure returns Rejected");
+
 Console.WriteLine();
 Console.WriteLine(failures.Count == 0 ? "ALL CHECKS PASSED" : $"FAILURES: {string.Join(", ", failures)}");
 return failures.Count == 0 ? 0 : 1;
@@ -2623,6 +3309,8 @@ sealed class AllowResolver : ICodexPermissionResolver
     public bool Resolve(string sessionID, CodexPermissionDecision decision) => true;
 
     public bool ResolveQuestion(string sessionID, string? rawToolInput, IReadOnlyList<QuestionAnswer> answers) => true;
+
+    public bool DispatchPrompt(string sessionID, AgentSource source, string prompt, string? workspaceDir = null, bool isRunning = false) => true;
 }
 
 sealed class NullResolver : ICodexPermissionResolver
@@ -2630,6 +3318,8 @@ sealed class NullResolver : ICodexPermissionResolver
     public bool Resolve(string sessionID, CodexPermissionDecision decision) => false;
 
     public bool ResolveQuestion(string sessionID, string? rawToolInput, IReadOnlyList<QuestionAnswer> answers) => false;
+
+    public bool DispatchPrompt(string sessionID, AgentSource source, string prompt, string? workspaceDir = null, bool isRunning = false) => false;
 }
 
 /// <summary>记下作答回填内容的桩：验证"整份带回原始 tool_input + 按题序的答案"。</summary>
@@ -2637,6 +3327,11 @@ sealed class RecordingResolver : ICodexPermissionResolver
 {
     public string? RawInput;
     public IReadOnlyList<QuestionAnswer>? Written;
+    public string? PromptSessionID;
+    public AgentSource? PromptSource;
+    public string? PromptText;
+    public string? PromptWorkspace;
+    public bool? PromptIsRunning;
 
     public bool Resolve(string sessionID, CodexPermissionDecision decision) => true;
 
@@ -2644,6 +3339,16 @@ sealed class RecordingResolver : ICodexPermissionResolver
     {
         RawInput = rawToolInput;
         Written = answers;
+        return true;
+    }
+
+    public bool DispatchPrompt(string sessionID, AgentSource source, string prompt, string? workspaceDir = null, bool isRunning = false)
+    {
+        PromptSessionID = sessionID;
+        PromptSource = source;
+        PromptText = prompt;
+        PromptWorkspace = workspaceDir;
+        PromptIsRunning = isRunning;
         return true;
     }
 }

@@ -27,6 +27,7 @@ const received = []
 let replyDecision = "allow"
 let questionAnswers = [["A"]]
 const holds = () => received.filter((i) => i.payload?.hold)
+const controlSockets = []
 const server = net.createServer((socket) => {
   let buffer = ""
   socket.on("data", (chunk) => {
@@ -38,7 +39,8 @@ const server = net.createServer((socket) => {
       if (line.trim()) {
         const envelope = JSON.parse(line)
         received.push(envelope)
-        if (envelope.payload?.hold === "question") socket.write(JSON.stringify({ answers: questionAnswers }) + "\n")
+        if (envelope.payload?.event === "control.attach") controlSockets.push(socket)
+        else if (envelope.payload?.hold === "question") socket.write(JSON.stringify({ answers: questionAnswers }) + "\n")
         else if (envelope.payload?.hold) socket.write(JSON.stringify({ decision: replyDecision }) + "\n")
         else socket.write("\n")
       }
@@ -48,17 +50,16 @@ const server = net.createServer((socket) => {
 await new Promise((resolve) => server.listen(TEST_PORT, "127.0.0.1", resolve))
 
 const clientCalls = []
-// 装好的 1.18.35 给插件的是 SDK 生成的那版客户端：方法名 postSessionIdPermissionsPermissionId。
-// （新版封装是 permission.reply —— 插件按"运行时可用的那个"挑，两条路各测一次。）
 const lowLevelCalls = []
+const promptAsyncCalls = []
 const fakeClient = {
   postSessionIdPermissionsPermissionId: async (args) => {
     clientCalls.push(args)
     if (process.env.AP_TEST_REPLY_THROWS === "1") throw new Error("模板未替换：/session/{sessionID}/...")
   },
-  // 1.18.35 的插件 client 上**没有** question 分组（二进制实测：内部类 R7 只有 permission 那个
-  // 扁平方法 + 一堆分组属性），所以作答走它自己的底层请求器——每个生成方法体都是
-  // `this._client.post({url, path, body, headers})`，插件照抄这个调用约定。
+  promptAsync: async (args) => {
+    promptAsyncCalls.push(args)
+  },
   _client: {
     post: async (args) => { lowLevelCalls.push(args) },
   },
@@ -267,7 +268,19 @@ check(holds().length === beforeChild, "child session permissions are never held"
 check(!events("question.asked").some((i) => i.payload.properties.sessionID === "ses_child3"),
   "child session questions are never forwarded")
 
-// 7. dispose 只列自有会话
+// 7. 远程 Prompt：通过常驻控制通道接收指令并调用 promptAsync
+check(controlSockets.length > 0, "control channel attached to bridge")
+if (controlSockets.length > 0) {
+  const ctrl = controlSockets[0]
+  ctrl.write(JSON.stringify({ action: "prompt", sessionID: "ses_t", text: "远程注入的提示词" }) + "\n")
+  await new Promise((r) => setTimeout(r, 100))
+  check(promptAsyncCalls.length === 1 &&
+    promptAsyncCalls[0].path?.sessionID === "ses_t" &&
+    promptAsyncCalls[0].body?.parts?.[0]?.text === "远程注入的提示词",
+    "remote prompt executes via client.promptAsync")
+}
+
+// 8. dispose 只列自有会话
 await plugin.dispose()
 await flush()
 check(events("plugin.dispose").some((item) => item.payload.properties.sessionID === "ses_t"), "dispose lists own session")

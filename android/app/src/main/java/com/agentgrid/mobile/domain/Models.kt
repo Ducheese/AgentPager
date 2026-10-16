@@ -91,6 +91,9 @@ enum class TaskCapability {
 
     @SerialName("retry")
     RETRY,
+
+    @SerialName("prompt")
+    PROMPT,
 }
 
 @Serializable
@@ -307,6 +310,9 @@ enum class ControlAction {
 
     @SerialName("pin")
     PIN,
+
+    @SerialName("prompt")
+    PROMPT,
 }
 
 @Serializable

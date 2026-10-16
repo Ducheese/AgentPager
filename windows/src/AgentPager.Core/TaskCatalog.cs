@@ -40,6 +40,11 @@ public interface ICodexPermissionResolver
     /// `tool_input`，只塞答案会把问题本身抹掉）；opencode 按 requestID 定位，传 null 即可。
     /// </summary>
     bool ResolveQuestion(string sessionID, string? rawToolInput, IReadOnlyList<QuestionAnswer> answers);
+
+    /// <summary>
+    /// 把手机上下发的远程 Prompt 投递至对应 Agent 的通信信道。
+    /// </summary>
+    bool DispatchPrompt(string sessionID, AgentSource source, string prompt, string? workspaceDir = null, bool isRunning = false);
 }
 
 /// <summary>
@@ -77,6 +82,15 @@ public sealed class TaskCatalog
     private readonly Dictionary<string, string> _claudeQueuedText = new(StringComparer.Ordinal);
     // Claude Code：会话 → 转录本路径（每个 hook 事件都带 transcript_path），供 Maintain 心跳复用。
     private readonly Dictionary<string, string> _claudeTranscripts = new(StringComparer.Ordinal);
+    // Claude Code：会话 → 工作目录（hook 载荷里的 cwd）。远程注入的 CLI 回退子进程拿它当
+    // 工作目录——--resume 的转录本按会话定位不受进程 cwd 影响，但子进程里工具的相对路径、
+    // 以及"回退进程该从哪个目录看这个项目"要吃的就是它。
+    private readonly Dictionary<string, string> _claudeCwds = new(StringComparer.Ordinal);
+    // Claude Code：远程注入的投递确认台账（会话 → 待确认记录）。投递成功 ≠ 送达：socket
+    // 写入没有 ack、回退子进程可能根本起不来（静默丢件的两条来路）。登记后等该会话的
+    // **任一 hook 事件**（Accept 里清账）；超时重投一次；再超时把"未确认"写进第三行——不静默。
+    // 只在直接投递（非运行中）路径登记：排队消息的投递时机在桥端队列里，v1 不追踪（docs 备录）。
+    private readonly Dictionary<string, PendingClaudeDelivery> _claudeDeliveries = new(StringComparer.Ordinal);
     // 转录本 mtime 门控：文件没变就不重读（照抄 agy 的 DB mtime 门控思路）。
     private readonly Dictionary<string, DateTime> _claudeTranscriptMtimes = new(StringComparer.Ordinal);
     // 在 ~/.claude/sessions 里见过该会话：只有见过才敢用"文件消失"判离线（注册并非所有模式都开）。
@@ -93,9 +107,14 @@ public sealed class TaskCatalog
     // 为什么值得做：手机端协议里 options 是扁平列表，多题无法按题归属；而"拆轮提问"只存在于
     // 对话上下文里——换个 session 就没人记得了，只有写在桥里才是稳定的。
     private readonly Dictionary<string, QuestionProgress> _questionProgress = new(StringComparer.Ordinal);
+    // Antigravity：会话 → 工作区目录（hook.WorkspacePaths[0]）。
+    private readonly Dictionary<string, string> _agyWorkspaces = new(StringComparer.Ordinal);
 
     /// <summary>逐题推进状态：当前第几题 + 已收集的答案（按题序）。</summary>
     private sealed record QuestionProgress(int Index, List<QuestionAnswer> Answers);
+
+    /// <summary>一条等确认的远程注入：原文 + 重投用 cwd + 截止时刻 + 是否已重投过。</summary>
+    private sealed record PendingClaudeDelivery(string Prompt, string? Cwd, DateTimeOffset Deadline, bool Retried);
 
     /// <summary>
     /// 拆好的一道题：全文 / 短标签（header 优先）/ 纯 label / 带注解的显示文本 / 可否多选。
@@ -119,6 +138,9 @@ public sealed class TaskCatalog
     private readonly int _capacity;
     private ulong _revision;
 
+    public Func<bool>? HasOpenCodeControl { get; set; }
+    public Func<Dictionary<string, ClaudeSessionRegistry.Entry>>? ClaudeRegistryScanner { get; set; }
+
     public TaskCatalog(IEnumerable<TaskSnapshot>? restoring = null, int capacity = 20)
     {
         _tasks = restoring?.ToList() ?? [];
@@ -129,12 +151,59 @@ public sealed class TaskCatalog
 
     public TaskCatalogProjection Projection(string? focusedTaskIDOverride = null)
     {
-        var tasks = _tasks.OrderByDescending(task => task.UpdatedAt).ToList();
+        var rawTasks = _tasks.OrderByDescending(task => task.UpdatedAt).ToList();
+        var claudeRegistry = ClaudeRegistryScanner?.Invoke() ?? ClaudeSessionRegistry.Scan();
+        ClaudeSessionRegistry.Observe(claudeRegistry.Values);
+
+        var tasks = new List<TaskSnapshot>(rawTasks.Count);
+        foreach (var task in rawTasks)
+        {
+            var capabilities = new HashSet<TaskCapability>(task.Capabilities);
+            if (CanReceivePrompt(task, claudeRegistry))
+            {
+                capabilities.Add(TaskCapability.Prompt);
+            }
+            else
+            {
+                capabilities.Remove(TaskCapability.Prompt);
+            }
+            tasks.Add(task with { Capabilities = capabilities });
+        }
+
         return new(
             _revision,
             tasks,
             focusedTaskIDOverride ?? tasks.MaxBy(task => (task.EffectivePriority, task.UpdatedAt))?.Id,
             _requests.Values.OrderBy(request => request.TaskID).ToList());
+    }
+
+    private bool CanReceivePrompt(TaskSnapshot task, Dictionary<string, ClaudeSessionRegistry.Entry>? claudeRegistry = null)
+    {
+        if (_requests.ContainsKey(task.Id)) return false;
+        if (task.Lifecycle is AgentLifecycle.WaitingApproval or AgentLifecycle.WaitingAnswer) return false;
+        if (task.Lifecycle is AgentLifecycle.Offline or AgentLifecycle.Interrupted) return false;
+
+        switch (task.Source)
+        {
+            case AgentSource.OpenCode:
+                return HasOpenCodeControl?.Invoke() != false;
+
+            case AgentSource.ClaudeCode:
+                var registry = claudeRegistry ?? ClaudeRegistryScanner?.Invoke() ?? ClaudeSessionRegistry.Scan();
+                if (registry.TryGetValue(task.Id, out var entry) &&
+                    (entry.Pid is null || ClaudeSessionRegistry.ProcessAliveChecker(entry.Pid.Value)))
+                    return true;
+                // parked：注册表里没了（被 /resume 切走），但宿主进程还在——远程注入靠 CLI
+                // 回退子进程唤醒原会话（探针 Test Z 实证：--resume 续写转录本、hooks 照发）。
+                return ClaudeSessionRegistry.HostPidOf(task.Id) is { } hostPid &&
+                       ClaudeSessionRegistry.ProcessAliveChecker(hostPid);
+
+            case AgentSource.Antigravity:
+                return task.Lifecycle == AgentLifecycle.Running;
+
+            default:
+                return false;
+        }
     }
 
     public bool Accept(CodexHookPayload hook, DateTimeOffset? receivedAt = null)
@@ -191,6 +260,15 @@ public sealed class TaskCatalog
         // 每个事件都带 transcript_path：登记下来供 Maintain 心跳复用（标题/Token 刷新）。
         if (!string.IsNullOrWhiteSpace(hook.TranscriptPath))
             _claudeTranscripts[hook.SessionID] = hook.TranscriptPath!;
+
+        // SessionStart 载荷里的 cwd：CLI 回退子进程的工作目录（工具相对路径从这解析）。
+        // 其余事件偶尔也带 cwd 照收（同一会话的 cwd 不随回合变，覆盖无害）。
+        if (!string.IsNullOrWhiteSpace(hook.Cwd))
+            _claudeCwds[hook.SessionID] = hook.Cwd!;
+
+        // 任一事件到达 = 该会话活着、且投出去的 Prompt 已被某个进程接管（回退子进程只会
+        // 在真跑起来后才发 hook）——清掉投递确认，不再重投。
+        _claudeDeliveries.Remove(hook.SessionID);
 
         var transcript = ReadClaudeTranscript(hook);
 
@@ -728,6 +806,9 @@ public sealed class TaskCatalog
         var sessionID = hook.SessionID;
         if (string.IsNullOrWhiteSpace(sessionID)) return false;
 
+        if (hook.WorkspacePaths is { Length: > 0 } paths && !string.IsNullOrWhiteSpace(paths[0]))
+            _agyWorkspaces[sessionID] = paths[0];
+
         // 1. 查询会话元数据（SQLite，mtime 门控缓存，A2）：会话真实标题与父会话 ID
         var dbInfo = LookupAgyConversation(sessionID);
 
@@ -1087,20 +1168,22 @@ public sealed class TaskCatalog
     private readonly Dictionary<string, (List<string> Roles, DateTimeOffset Deadline)> _agySpawningParents = new();
 
 
-    public bool Maintain(DateTimeOffset? now = null)
+    public bool Maintain(DateTimeOffset? now = null, Action<string, string>? log = null)
     {
         var currentTime = now ?? DateTimeOffset.UtcNow;
-        var changed = CheckAgyQueuedPrompts(currentTime);
+        var changed = CheckAgyQueuedPrompts(currentTime, log);
         changed = CheckSilentOffline(currentTime) || changed;
         changed = CheckSubagentSilence(currentTime) || changed;
         changed = CheckAgyPreviewRecheck(currentTime) || changed;
         changed = MaintainAgyDatabase(currentTime) || changed;
         changed = CheckClaudePreviewRecheck(currentTime) || changed;
-        changed = CheckClaudeRuntime(currentTime) || changed;
+        changed = CheckClaudeRuntime(currentTime, log) || changed;
+        changed = CheckClaudeDeliveries(currentTime) || changed;
+        changed = CheckClaudeQueueHealth(currentTime, log) || changed;
         foreach (var key in _agySpawningParents.Where(p => currentTime > p.Value.Deadline).Select(p => p.Key).ToList())
             _agySpawningParents.Remove(key);
         var before = _tasks.Count + _tasks.Sum(task => task.Subagents.Count);
-        Normalize(currentTime);
+        Normalize(currentTime, log);
         if (changed || before != _tasks.Count + _tasks.Sum(task => task.Subagents.Count))
         {
             Changed();
@@ -1269,14 +1352,33 @@ public sealed class TaskCatalog
         return value;
     }
 
-    private bool CheckAgyQueuedPrompts(DateTimeOffset now)
+    private bool CheckAgyQueuedPrompts(DateTimeOffset now, Action<string, string>? log = null)
     {
         var changed = false;
+        // 全局 TTL 清扫：任务行已不在的僵尸条目也清（与 claude 的 CheckClaudeQueueHealth 同构）。
+        AgyCliDispatcher.SweepAllExpired(AgyCliDispatcher.QueueEntryTtl, log, now);
         for (var i = 0; i < _tasks.Count; i++)
         {
             var task = _tasks[i];
             if (task.Source != AgentSource.Antigravity) continue;
-            if (AgyEventReducer.DetectQueuedPrompt(task.Id, task) is not { } queued) continue;
+            if (AgyEventReducer.DetectQueuedPrompt(task.Id, task) is not { } queued)
+            {
+                // 徽章自愈：重启后任务行是 hook 重建的（徽章没了），队列还在（持久化恢复的）——
+                // 补回 PromptQueued=true + UserPrompt=最新排队（与入队登记同一语义），只补一次。
+                if (!task.IsTerminal && task.Lifecycle != AgentLifecycle.Offline &&
+                    !task.PromptQueued && AgyCliDispatcher.HasQueued(task.Id))
+                {
+                    _tasks[i] = task with
+                    {
+                        UserPrompt = AgyCliDispatcher.PeekLastText(task.Id) ?? task.UserPrompt,
+                        PromptQueued = true,
+                        UpdatedAt = now,
+                    };
+                    log?.Invoke("INFO", $"[Antigravity] 桥端队列非空，补回排队徽章（会话 {task.Id}）");
+                    changed = true;
+                }
+                continue;
+            }
             if (!task.PromptQueued || task.UserPrompt != queued.Prompt)
             {
                 _tasks[i] = task with
@@ -1330,13 +1432,14 @@ public sealed class TaskCatalog
     /// ② 兜底：非终态且静默 ≥10 分钟且没有工具活动（与 agy 的 A4 同一条规则）——
     ///    覆盖强杀、注册未开、注册表被清空等所有拿不到正判的情况。
     /// </summary>
-    private bool CheckClaudeRuntime(DateTimeOffset now)
+    private bool CheckClaudeRuntime(DateTimeOffset now, Action<string, string>? log = null)
     {
         var claude = _tasks.Where(task => task.Source == AgentSource.ClaudeCode).ToList();
         if (claude.Count == 0) return false;
 
         var changed = false;
         var registry = ClaudeSessionRegistry.Scan();
+        ClaudeSessionRegistry.Observe(registry.Values);
 
         foreach (var task in claude)
         {
@@ -1346,6 +1449,14 @@ public sealed class TaskCatalog
             {
                 _claudeRegistrySeen.Add(task.Id);
             }
+            else if (ClaudeSessionRegistry.HostPidOf(task.Id) is { } hostPid &&
+                     ClaudeSessionRegistry.ProcessAliveChecker(hostPid))
+            {
+                // parked：被 /resume 切走后注册表里没有它，但宿主进程还活着——会话能被远程
+                // 唤醒，不算离线，也不吃下面的 10 分钟兜底（那是给"进程已死"准备的）。
+                // 转录本照刷（标题/Token/挂起卡都还有效）。这条必须排在线性 seen 判定的
+                // **前面**，否则"见过 + 注册表消失"的唯一后果就是把活跃会话误判成离线。
+            }
             else if (_claudeRegistrySeen.Contains(task.Id) ||
                      now - task.UpdatedAt > TimeSpan.FromMinutes(10))
             {
@@ -1353,6 +1464,16 @@ public sealed class TaskCatalog
                 // （权限挂起中被杀 = 死会话带死卡）。
                 DropClaudeRequest(task.Id);
                 _claudePreviewRecheck.Remove(task.Id);
+                _claudeDeliveries.Remove(task.Id);
+                // 桥端队列一并丢弃：排队文本只活在 dispatcher 内存里，会话已死就不可能再放行，
+                // 不清会留下僵尸条目——同 sessionId 复活再跑出 Stop 时僵尸文本会被打进新回合。
+                // 徽章同步熄灭：离线任务不再刷转录本，PromptQueued=true 会永久钉在手机上。
+                var dropped = ClaudePromptDispatcher.ClearQueued(task.Id);
+                if (dropped > 0)
+                    log?.Invoke("WARN", $"[ClaudeCode] 会话离线，桥端队列 {dropped} 条未投递 Prompt 已丢弃（会话 {task.Id}）");
+                // 宿主记录一并丢弃：PID 会被系统复用，留着一张"老宿主 PID"的纸
+                // 会把复用该 PID 的无关进程错认成"宿主还在"，死会话永久 parked。
+                ClaudeSessionRegistry.Forget(task.Id);
                 Upsert(task with
                 {
                     Lifecycle = AgentLifecycle.Offline,
@@ -1361,12 +1482,91 @@ public sealed class TaskCatalog
                     CompletedAt = task.CompletedAt ?? now,
                     Subagents = SubagentSweep.Finalize(task.Subagents),
                     Capabilities = [],
+                    PromptQueued = false,
                 });
                 changed = true;
                 continue;
             }
 
+            // 桥端队列 TTL：放出去那条回合没有 Stop，队头不能无限期卡住。
+            // 只记 WARN（SweepExpired 内），changed 不置位——丢队列不算任务状态变化。
+            ClaudePromptDispatcher.SweepExpired(task.Id, ClaudePromptDispatcher.QueueEntryTtl, log, now);
+
             if (RefreshClaudeTranscript(task, now)) changed = true;
+        }
+
+        return changed;
+    }
+
+    /// <summary>注入投递确认的等待时限：首查 45 秒、重投后再给 45 秒。hook 事件在子进程里
+    /// 是"接管即发"（UserPromptSubmit 在模型开工前），正常几秒内到；45 秒远大于 claude
+    /// 冷启动 + 大会话 resume 的成本，超时说明是没送到而不是慢。</summary>
+    private static readonly TimeSpan ClaudeDeliveryTimeout = TimeSpan.FromSeconds(45);
+
+    /// <summary>
+    /// 桥端队列自检（每轮 Maintain 跑一次）：
+    /// ① 全局 TTL 清扫——任务行已不在的僵尸条目（重启后会话再没事件）只有这里能清，
+    ///    任务还在的由 CheckClaudeRuntime 逐任务 Sweep；
+    /// ② 徽章自愈——重启后任务行是 hook 重建的、徽章没了但队列还在（持久化恢复的），
+    ///    补回 PromptQueued=true + UserPrompt=最新排队（与入队登记同一语义）。
+    ///    只补一次（补完徽章为 true 就不再进分支），不产生保存 churn。
+    /// </summary>
+    private bool CheckClaudeQueueHealth(DateTimeOffset now, Action<string, string>? log)
+    {
+        var changed = false;
+        ClaudePromptDispatcher.SweepAllExpired(ClaudePromptDispatcher.QueueEntryTtl, log, now);
+        foreach (var task in _tasks.Where(task =>
+            task.Source == AgentSource.ClaudeCode &&
+            !task.IsTerminal &&
+            task.Lifecycle != AgentLifecycle.Offline &&
+            !task.PromptQueued &&
+            ClaudePromptDispatcher.HasQueued(task.Id)).ToList())
+        {
+            Upsert(task with
+            {
+                PromptQueued = true,
+                UserPrompt = ClaudePromptDispatcher.PeekLastText(task.Id) ?? task.UserPrompt,
+                UpdatedAt = now,
+            });
+            log?.Invoke("INFO", $"[ClaudeCode] 桥端队列非空，补回排队徽章（会话 {task.Id}）");
+            changed = true;
+        }
+        return changed;
+    }
+
+    /// <summary>
+    /// 远程注入的送达确认（见 _claudeDeliveries 注释）：到期未收到该会话任何 hook 事件
+    /// 就重投一次——**固定走 CLI 腿**（skipPipe，2026-10-17 真机定案：管道"写进去就算成功"，
+    /// parked 会话的陈旧管道收得下字节却无人消费，首投可能已被静默吞掉；重投必须换腿），
+    /// 再到期仍无音讯，把"未确认"诚实写进第三行并从台账出列。不静默。
+    /// </summary>
+    private bool CheckClaudeDeliveries(DateTimeOffset now)
+    {
+        if (_claudeDeliveries.Count == 0) return false;
+
+        var changed = false;
+        foreach (var (sessionID, delivery) in _claudeDeliveries.Where(pair => now > pair.Value.Deadline).ToList())
+        {
+            if (!delivery.Retried &&
+                ClaudePromptDispatcher.QueueOrExecute(sessionID, delivery.Prompt, delivery.Cwd, isRunning: false, skipPipe: true))
+            {
+                _claudeDeliveries[sessionID] = delivery with
+                {
+                    Retried = true,
+                    Deadline = now + ClaudeDeliveryTimeout,
+                };
+                continue;
+            }
+
+            _claudeDeliveries.Remove(sessionID);
+            var task = _tasks.FirstOrDefault(value => value.Id == sessionID);
+            if (task is null || task.IsTerminal || task.Lifecycle == AgentLifecycle.Offline) continue;
+            Upsert(task with
+            {
+                LatestStep = "⚠ 远程注入未确认送达（会话无响应）",
+                UpdatedAt = now,
+            });
+            changed = true;
         }
 
         return changed;
@@ -1456,6 +1656,8 @@ public sealed class TaskCatalog
             _requests.Remove(task.Id);
             _questionItems.Remove(task.Id);
             _questionProgress.Remove(task.Id);
+            AgyCliDispatcher.ClearQueued(task.Id);
+            ClaudePromptDispatcher.ClearQueued(task.Id);
 
             _tasks[i] = task with
             {
@@ -1465,6 +1667,7 @@ public sealed class TaskCatalog
                 CompletedAt = task.CompletedAt ?? now,
                 Subagents = SubagentSweep.Finalize(task.Subagents),
                 Capabilities = [],
+                PromptQueued = false,
             };
             changed = true;
         }
@@ -1703,6 +1906,64 @@ public sealed class TaskCatalog
                     Changed();
                     return new(requestID, ControlResult.Accepted, null);
                 }
+            case ControlAction.Prompt:
+                {
+                    var promptText = control.Value?.Trim();
+                    if (string.IsNullOrEmpty(promptText))
+                        return new(requestID, ControlResult.Unsupported, "Prompt 内容为空");
+
+                    if (!CanReceivePrompt(task))
+                        return new(requestID, ControlResult.Unsupported, "当前任务状态不支持远程 Prompt");
+
+                    var workspaceDir = task.Source switch
+                    {
+                        AgentSource.Antigravity => _agyWorkspaces.GetValueOrDefault(task.Id),
+                        AgentSource.ClaudeCode => _claudeCwds.GetValueOrDefault(task.Id),
+                        _ => null,
+                    };
+
+                    var isRunning = task.Lifecycle == AgentLifecycle.Running;
+                    if (!resolver.DispatchPrompt(task.Id, task.Source, promptText, workspaceDir, isRunning))
+                        return new(requestID, ControlResult.Rejected, "Prompt 投递失败或通道已失效");
+
+                    var now = DateTimeOffset.UtcNow;
+                    if (isRunning)
+                    {
+                        if (task.Source == AgentSource.ClaudeCode)
+                            _claudeQueuedText[task.Id] = promptText;
+
+                        Upsert(task with
+                        {
+                            PromptQueued = true,
+                            UserPrompt = promptText,
+                            UpdatedAt = now,
+                        });
+                    }
+                    else
+                    {
+                        // 直接投递（非运行中）：登记送达确认。回退子进程/宿主的第一个 hook 事件
+                        // 到达即清账；超时重投一次，再超时写"未确认"（见 CheckClaudeDeliveries）。
+                        // 排队路径（isRunning==true）不登记：投递时机在桥端队列里，v1 备录。
+                        if (task.Source == AgentSource.ClaudeCode)
+                            _claudeDeliveries[task.Id] = new(promptText, workspaceDir, now + ClaudeDeliveryTimeout, false);
+
+                        Upsert(task with
+                        {
+                            Lifecycle = AgentLifecycle.Running,
+                            Activity = AgentActivity.Thinking,
+                            UserPrompt = promptText,
+                            PromptQueued = false,
+                            StartedAt = now,
+                            LatestStep = null,
+                            ResponseBody = null,
+                            CompletedAt = null,
+                            UpdatedAt = now,
+                            Capabilities = [],
+                        });
+                    }
+                    Changed();
+                    return new(requestID, ControlResult.Accepted, null);
+                }
             case ControlAction.Mute:
                 Upsert(task with { IsMuted = !task.IsMuted });
                 break;
@@ -1845,12 +2106,23 @@ public sealed class TaskCatalog
         });
     }
 
-    private void Normalize(DateTimeOffset now)
+    private void Normalize(DateTimeOffset now, Action<string, string>? log = null)
     {
-        _tasks.RemoveAll(task =>
+        bool IsPurged(TaskSnapshot task) =>
             task.Id.StartsWith("agentgrid-", StringComparison.Ordinal) && now - task.UpdatedAt >= TimeSpan.FromMinutes(1) ||
             task.Lifecycle == AgentLifecycle.Offline && task.UserPrompt is null && task.Subagents.Count == 0 && now - task.UpdatedAt >= TimeSpan.FromMinutes(1) ||
-            task.IsTerminal && now - (task.CompletedAt ?? task.UpdatedAt) > TimeSpan.FromMinutes(30));
+            task.IsTerminal && now - (task.CompletedAt ?? task.UpdatedAt) > TimeSpan.FromMinutes(30);
+        // 任务回收时连桥端队列一起清（claude 同款；排队文本只活在 dispatcher 内存里，
+        // 任务没了就不可能再被 pull，不清会留下僵尸条目）。
+        foreach (var victim in _tasks.Where(task => task.Source is AgentSource.ClaudeCode or AgentSource.Antigravity && IsPurged(task)).ToList())
+        {
+            var (dropped, label) = victim.Source == AgentSource.ClaudeCode
+                ? (ClaudePromptDispatcher.ClearQueued(victim.Id), "ClaudeCode")
+                : (AgyCliDispatcher.ClearQueued(victim.Id), "Antigravity");
+            if (dropped > 0)
+                log?.Invoke("WARN", $"[{label}] 任务回收，桥端队列 {dropped} 条未投递 Prompt 已丢弃（会话 {victim.Id}）");
+        }
+        _tasks.RemoveAll(task => IsPurged(task));
         for (var index = 0; index < _tasks.Count; index++)
         {
             var task = _tasks[index];
@@ -1902,6 +2174,8 @@ public sealed class TaskCatalog
         PruneSessionMap(_claudeQueuedText, live);
         PruneSessionMap(_claudeTranscripts, live);
         PruneSessionMap(_claudeTranscriptMtimes, live);
+        PruneSessionMap(_claudeCwds, live);
+        PruneSessionMap(_claudeDeliveries, live);
         PruneSessionMap(_claudeQuestionInputs, live);
         PruneSessionMap(_questionItems, live);
         PruneSessionMap(_questionProgress, live);
@@ -2744,6 +3018,7 @@ public static class ClaudeEventReducer
             Lifecycle = AgentLifecycle.Running,
             Activity = AgentActivity.Thinking,
             UserPrompt = normalized ?? task.UserPrompt,
+            PromptQueued = ClaudePromptDispatcher.HasQueued(task.Id),
             StartedAt = startsTurn ? now : task.StartedAt,
             LatestStep = startsTurn ? null : task.LatestStep,
             ResponseBody = startsTurn ? null : task.ResponseBody,

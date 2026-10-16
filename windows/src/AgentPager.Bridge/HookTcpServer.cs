@@ -19,6 +19,8 @@ public sealed class HookTcpServer(
     private readonly Func<bool> _isPhoneConnected = isPhoneConnected ?? (() => true);
 
     private readonly ConcurrentDictionary<string, (TcpClient Client, HookSource Source)> _pending = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<TcpClient, byte> _openCodeControlClients = new();
+    public bool HasOpenCodeControlClients => !_openCodeControlClients.IsEmpty;
     private TcpListener? _listener;
     private CancellationTokenSource? _cancellation;
     private Task? _acceptTask;
@@ -109,6 +111,89 @@ public sealed class HookTcpServer(
         }
     }
 
+    public bool DispatchPrompt(string sessionID, AgentSource source, string prompt, string? workspaceDir = null, bool isRunning = false)
+    {
+        switch (source)
+        {
+            case AgentSource.OpenCode:
+                return DispatchOpenCodePrompt(sessionID, prompt);
+
+            case AgentSource.ClaudeCode:
+                return ClaudePromptDispatcher.QueueOrExecute(sessionID, prompt, workspaceDir, isRunning, log.Write);
+
+            case AgentSource.Antigravity:
+                return AgyCliDispatcher.QueueOrExecute(sessionID, prompt, workspaceDir, isRunning, log.Write);
+
+            default:
+                log.Write("WARN", $"[Prompt] 不支持的 Agent 来源：{source}");
+                return false;
+        }
+    }
+
+    private void RegisterOpenCodeControlClient(TcpClient client)
+    {
+        _openCodeControlClients.TryAdd(client, 0);
+        log.Write("INFO", "[OpenCode] 常驻控制通道已连接");
+        _ = Task.Run(async () =>
+        {
+            var buffer = new byte[1024];
+            try
+            {
+                var stream = client.GetStream();
+                while (await stream.ReadAsync(buffer) > 0)
+                {
+                    // 保持连接，持续读取
+                }
+            }
+            catch { }
+            finally
+            {
+                _openCodeControlClients.TryRemove(client, out _);
+                client.Dispose();
+                log.Write("INFO", "[OpenCode] 常驻控制通道已断开");
+            }
+        });
+    }
+
+    private bool DispatchOpenCodePrompt(string sessionID, string prompt)
+    {
+        var clients = _openCodeControlClients.Keys.ToList();
+        if (clients.Count == 0)
+        {
+            log.Write("WARN", $"[OpenCode] 没有可用的常驻控制连接，无法下发 Prompt（会话 {sessionID}）");
+            return false;
+        }
+
+        var json = JsonSerializer.Serialize(new { action = "prompt", sessionID, text = prompt }) + "\n";
+        var bytes = Encoding.UTF8.GetBytes(json);
+        var successCount = 0;
+
+        foreach (var client in clients)
+        {
+            try
+            {
+                if (client.Connected)
+                {
+                    client.GetStream().Write(bytes);
+                    successCount++;
+                }
+            }
+            catch (Exception ex)
+            {
+                log.Write("WARN", $"[OpenCode] 向控制通道发送失败：{ex.Message}");
+                _openCodeControlClients.TryRemove(client, out _);
+                client.Dispose();
+            }
+        }
+
+        if (successCount > 0)
+        {
+            log.Write("INFO", $"[OpenCode] Prompt 已下发至 {successCount} 个控制连接（会话 {sessionID}）");
+            return true;
+        }
+        return false;
+    }
+
     /// <summary>是否还攥着某会话的待决连接（权限/作答等待中）。</summary>
     public bool HasPending(string sessionID) => _pending.ContainsKey(sessionID);
 
@@ -150,6 +235,12 @@ public sealed class HookTcpServer(
             using var reader = new StreamReader(stream, Encoding.UTF8, false, 4096, leaveOpen: true);
             var line = await reader.ReadLineAsync(cancellationToken);
             if (line is null) { client.Dispose(); return; }
+
+            if (line.Contains("\"control.attach\""))
+            {
+                RegisterOpenCodeControlClient(client);
+                return;
+            }
 
             var envelope = DecodeEnvelope(line);
             if (envelope is null)
@@ -202,7 +293,36 @@ public sealed class HookTcpServer(
             }
 
             await hookHandler(envelope);
-            await stream.WriteAsync("\n"u8.ToArray(), cancellationToken);
+            if (envelope is HookEnvelope.Antigravity agyStop &&
+                agyStop.Hook.EffectiveEvent == "Stop" &&
+                agyStop.Hook.PullPrompt == true)
+            {
+                // Stop-pull 交接（pull 模型）：脚本问桥要排队，有货给一条（同时出队，
+                // 发一条清一条，下个 Stop 再来拿也不会重发），无货给空行。
+                // v3 及更早脚本不带 pull 标记 → 走旧分支（空行），队里东西靠 TTL 兜底。
+                var taken = AgyCliDispatcher.TryTakeQueued(sessionID);
+                if (taken is { Length: > 0 } prompt)
+                {
+                    try
+                    {
+                        await stream.WriteAsync(AgyHookOutput.PullPrompt(prompt), cancellationToken);
+                        log.Write("INFO", $"[Antigravity] Stop 接单排队的 Prompt（会话 {sessionID}，剩余排队 {AgyCliDispatcher.QueuedCount(sessionID)}）");
+                    }
+                    catch (Exception error) when (error is IOException or OperationCanceledException)
+                    {
+                        AgyCliDispatcher.Requeue(sessionID, prompt);
+                        log.Write("WARN", $"[Antigravity] Stop 交接回包写失败，已重回队尾（会话 {sessionID}）：{error.Message}");
+                    }
+                }
+                else
+                {
+                    await stream.WriteAsync("\n"u8.ToArray(), cancellationToken);
+                }
+            }
+            else
+            {
+                await stream.WriteAsync("\n"u8.ToArray(), cancellationToken);
+            }
             client.Dispose();
         }
         catch (Exception error) when (error is IOException or JsonException or OperationCanceledException)
@@ -258,6 +378,8 @@ public sealed class HookTcpServer(
         _listener?.Stop();
         foreach (var entry in _pending.Values) entry.Client.Dispose();
         _pending.Clear();
+        foreach (var c in _openCodeControlClients.Keys) c.Dispose();
+        _openCodeControlClients.Clear();
         if (_acceptTask is not null)
             try { await _acceptTask; } catch (OperationCanceledException) { }
         _cancellation?.Dispose();

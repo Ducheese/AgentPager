@@ -350,3 +350,66 @@ if(g.behavior==="allow"){
 - **实测记录（2026-10-08，v42 + 选项按钮版 APK）**：手机点选项 → 桥日志 `作答已回填（10 字）` → 转录本的 `toolResult` 为 `answers{"<问题全文>":"<label 原样>"}`、`response` 为空 → **终端全程没弹对话框**，模型直接拿到答案。也就是说 ① 带 `answers` 的入参确实能跳过终端对话框、② `answers` 的 key 用问题全文精确匹配 ✓ 都实锤了。那条被攥住 13 秒的 hook 也正常退场（无残留 node 进程）✓
 - **仍未实测**：与"用户同时在终端作答"的竞态下 UI 表现（罕见，且两条路都只是"谁先到谁生效"，不是缺陷）。
 - **另一条路（原生外部客户端）存在但不是给我们的**：Claude Code 有 `toolUseContext.requestDialog` + `hasExternalRacer` 的外部抢答架构（`permission_bridge_relay`、`answered elsewhere — dismissing`），但判据是 `e.bridgeCallbacks || (e.channelCallbacks && !tool.requiresUserInteraction?.())` —— **requiresUserInteraction 的工具只认 `bridgeCallbacks`**，那是 SDK / 远程客户端形态，AgentPager 不是那种客户端，接进去代价远大于 hook 方案。
+
+---
+
+## 九、专题：远程注入第二条腿 —— parked 会话可发可回 & 宿主环境全量继承（2026-10-16 探针定案 → feat/remote-prompt 实现，行为待实测）
+
+**问题**：给 Claude 任务远程发提示词原先只有一条腿——"注册表里活着 + messaging socket 直投"。两个缺口：① **parked 会话**（被 `/resume` 切走的会话会从 `~/.claude/sessions/` 消失，但宿主进程与对话实体都还在）会被判成"不可发/离线"，手机发不进去；② 就算拿 `claude --resume <id> -p <prompt>` 回退子进程续聊，子进程是**一套干净环境**（没有宿主的登录态与 provider 配置）——发出去的 prompt 跑在错误环境里（Not logged in / 换了模型）。
+
+### 探针定案（谜团清单，全部实测）
+
+1. **PS 5.1 `Start-Process -ArgumentList` 不加引号**（数组也会 join 后裸拼，`-p` 的提示词被拆碎）是早期"回退子进程行为诡异"的根因。生产代码绕开 PowerShell，直接用 .NET `ProcessStartInfo.ArgumentList`（逐参数传递，无引号问题）。
+2. **headless（`-p`）模式下 hooks 正常工作**：`claude --resume <id> -p` 子进程照样触发我们注册的 14 组 hook——回退子进程的回合也能被桥看到，送达确认能收到回音。
+3. **宿主环境（PEB dump，实测 69 个变量）**带第三方代理配置：`ANTHROPIC_BASE_URL=http://127.0.0.1:3050`、`ANTHROPIC_MODEL=deepseek/deepseek-v4.1-flash[1m]`，外加三枚身份变量 `CLAUDE_CODE_MESSAGING_SOCKET` / `CLAUDE_CODE_MESSAGING_TOKEN` / `CLAUDE_CODE_ENTRYPOINT`。
+4. **注册表实测**（`~/.claude/sessions/*.json`）：宿主会话 `kind:"interactive"` + `entrypoint:"cli"`；`-p` 回退子进程也注册 `kind=interactive` 但 `entrypoint:"sdk-cli"`——**必须两个字段配对过滤**，否则短命子进程会顶掉真宿主台账，子进程一退就误判宿主已死。
+5. **Test Z（决定性）**：把宿主环境复刻给子进程后 `claude --resume 3ff5666f -p "…"` **EXIT 0** 正常应答；不复刻（裸跑）**Not logged in、EXIT 1**。
+
+### 设计裁定（锁死项）
+
+| 项 | 裁定 |
+|---|---|
+| 宿主台账 | `ClaudeSessionRegistry.HostPids`（`ClaudeHooks.cs:551`）：`Observe`（:567）只收 `kind=="interactive" && entrypoint=="cli"` 且带 pid 的注册条目；**prefer-alive-incumbent**（原宿主活着不被改写，死 pid 才换人）；`Forget`（:558）在判离线时清账（`TaskCatalog.cs:1450`）——防 PID 复用把死宿主"复活"成 parked |
+| parked 可发 | 注册表无条目 ≠ 离线：宿主 pid 还活着即 `CanReceivePrompt`（`TaskCatalog.cs:196-199`），能力位保留 prompt、**不吃** 10 分钟静默兜底 |
+| env 全量继承 | PEB 读宿主进程环境（`ClaudeHostEnvironment.Read(pid)`）全量叠加到回退子进程（`ClaudePeerClient.ApplyHostEnvironment`，:95）；三枚身份变量**无条件剔除**（:26 `HostEnvironmentExclusions`，不 quirk-过滤）；宿主环境读不到 → WARN + 以桥自身环境照常启动（降级不阻断；32 位桥没有 x64 PEB 读取） |
+| 送达确认 | 直接投递（非运行中）登记 pending 45 s（`TaskCatalog.cs:1879-1885`）；到期静默重投一次（与首发同一条路，socket/回退自动选，:1487-1495）；再 45 s 仍无音讯 → **第三行诚实落** `⚠ 远程注入未确认送达（会话无响应）`（:1503）并从台账出列。**任意 hook 事件到达即清账**（:269-271）。不静默 |
+| 直接投递的复活语义 | 非运行中任务：turn 重新起跑（Running/thinking）、`UserPrompt`=本条、`PromptQueued=false`、`LatestStep/ResponseBody/CompletedAt` 清空（:1887-1899）——**不排队、不覆盖已 queued**；排队路径（isRunning）不登记送达（投递时机在桥端队列，v1 备录） |
+
+### 实现落点
+
+- `windows/src/AgentPager.Core/ClaudeHooks.cs`：`Entry` 扩 `Kind/Entrypoint`（:533-543）、`Scan` 解析新字段、宿主台账三件套（:551-580）。
+- `windows/src/AgentPager.Core/ClaudeHostEnvironment.cs`：**新建**——x64 Windows PEB 环境读取器（`Read(int pid)`；失败返回 null）。
+- `windows/src/AgentPager.Core/ClaudePeerClient.cs`：`RegistryScanner` 测试钩子（:15）、`SendPrompt` 带 sessionID 路由并组装回退子进程（:34）、`ApplyHostEnvironment` 调用点（:75）。
+- `windows/src/AgentPager.Core/TaskCatalog.cs`：`CanReceivePrompt`（:180-207）、`Projection` 动态能力位（:161-171）、`CheckClaudeDeliveries`（:1473-1510）、`Maintain` 接入（:1181）、Prompt 控制块（:1846-1903）。
+- `windows/src/AgentPager.Core/ClaudePromptDispatcher.cs`：`QueueOrExecute` 直投带 cwd（:9-25）。
+
+### 测试（已全绿）
+
+`windows/tests/AgentPager.Core.Tests/Program.cs` 5.2 块（"远程注入第二条腿"）五组断言：宿主台账（sdk-cli 子进程不顶真宿主 / 无 pid 不收 / prefer-alive-incumbent / Forget 清账）、parked（宿主活→不吃 10 分钟兜底 / Forget 后→离线）、PEB 自读（读到刚 set 的变量）、env 剔除（三枚大小写不敏感）、送达确认（45 s 静默重投一次 / 二次超时落 ⚠ 且不再重发 / 事件到达清账 / 直接投递复活不排队）。两套件（Core.Tests `dotnet run` + `opencode-plugin.test.mjs`）均 ALL CHECKS PASSED。
+
+### 边界（接受）
+
+- **桥重启后宿主台账为空**：重启前已切走的 parked 会话退化成"10 分钟兜底判离线"（源码注释明文接受）。
+- 送达确认的"未确认"是**事件回音**语义：90 s 内没收到该会话任何 hook 事件才写 ⚠——正常回合几秒内就有回音，几乎不会误报。
+- `--resume` 跨项目目录的具体行为只有探针证据支持，以用户实测为准。
+
+### 验收要点（发版实测）
+
+1. 对一个已被 `/resume` 切走（或任务此刻显示"空闲/已完成"）的 Claude 会话从手机发提示词 → 回合照常起跑；该 prompt 跑在**宿主环境**（provider/模型与原对话一致），全程不碰电脑。
+2. 正常发一条 → 无 ⚠、无重复回合；发完静默 90 s+ 的极端场景才会出现 ⚠（诚实标记，不是丢件）。
+3. 运行中任务发 prompt 仍走"排队稍后投递"（与现有排队行为一致，两路互不覆盖）。
+
+### 补记（2026-10-17）：提供商铁律重申 + 桥端队列硬化 + pipe-to-running 实验证伪
+
+**提供商/模型设置铁律（用户裁定，2026-10-16 下达、2026-10-17 重申，防压缩丢失）**：
+注入过程不得碰提供商/模型设置，通通继承原对话。三处锁死，缺一不可——
+① 管道帧纯文本（`ClaudePeerClient.cs:221-228`：只有 `session_id + message + priority + msg_id`，无模型字段）；
+② CLI 参数冻结 4 个（`--resume <id> -p <prompt>`，单测断 `ArgumentList.Count == 4`）；
+③ 环境全量继承、仅剔 3 枚身份变量（`HostEnvironmentExclusions`，单测断 `Count == 3`；另有 provider 继承单测断 `ANTHROPIC_BASE_URL/MODEL` 原样进子进程且无 `--model` 参数）。
+opencode 对照：立即转发、对端自判排队（`HookTcpServer.cs:118-119`，`isRunning` 根本不看）。
+
+**桥端队列设计定案（与 opencode 不对齐是故意的）**：
+`pipe-to-running` 实验证伪——scratch 会话（`3d7eb0ce`，ping 长任务）事中 pipe 注入：原生队列事中 `enqueue`（17:43:20）→ 跑完 `remove`（17:45:51）**无用户消息、无动作**（`summary.md` 未被追加）。原生队列会吞事中消息，直投路线不可靠，桥端代管队列保留。
+硬化清单（无静默丢件）：drain 先发后出队、失败保留下个 Stop 重试（`ClaudePromptDispatcher.cs:TryDrainQueued`）；
+TTL 30 分钟（drain/逐任务 Sweep/全局 `SweepAllExpired` 三层）；离线清队列+徽章同步熄灭（`TaskCatalog.cs:1452`）；任务回收清队列（`Normalize`）；重启持久化（`queued-prompts.json` 独立文件——tasks.json 非终态行整行丢弃，塞进去等于没存；启动 `ImportQueues` + `Maintain` 徽章自愈 `CheckClaudeQueueHealth`）。
+残余已知风险：drain 时刻恰撞上 `/resume` 切走（300 ms 窗口 + 管道假成功）仍可能丢一条——记为技术债，有实锤再修。

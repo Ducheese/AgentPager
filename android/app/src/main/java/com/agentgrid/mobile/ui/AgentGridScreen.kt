@@ -1058,6 +1058,38 @@ private fun TaskDetails(
                 }
             }
         }
+        if (pending == null && TaskCapability.PROMPT in task.capabilities) {
+            var promptText by remember(task.id) { mutableStateOf("") }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                OutlinedTextField(
+                    value = promptText,
+                    onValueChange = { promptText = it },
+                    modifier = Modifier.weight(1f),
+                    placeholder = {
+                        Text(
+                            if (task.lifecycle == AgentLifecycle.RUNNING) "追加 Prompt (排队)..." else "输入 Prompt 发起任务...",
+                            color = AgentGridColors.Muted,
+                            fontSize = 12.sp,
+                        )
+                    },
+                    maxLines = 3,
+                )
+                PixelButton(
+                    if (task.lifecycle == AgentLifecycle.RUNNING) "排队" else "发送",
+                    AgentGridColors.Cyan,
+                ) {
+                    if (promptText.isNotBlank()) {
+                        val toSend = promptText.trim()
+                        promptText = ""
+                        onControl(task.id, ControlAction.PROMPT, toSend, null)
+                    }
+                }
+            }
+        }
     }
 }
 

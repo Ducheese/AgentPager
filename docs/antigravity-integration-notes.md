@@ -178,3 +178,28 @@
 
 > 产物：bridge `dist\opencode-main-baseline-vN\AgentPagerBridge.exe`；Antigravity 钩子脚本 `~/.gemini/config/agentpager-antigravity.js`；APK 已拷 `…\AgentPager-debug.apk`。
 > 你要做：① 退出旧 bridge → 启动 vN；② 检查 bridge 面板「ANTIGRAVITY: 已写入 vN」；③ 启动 `agy` 发送提示词。验证点：任务行即时出现、耗时起算、工具步粘滞显示、`ask_question` 提问卡片置顶、Token 明细可点开查阅。
+
+---
+
+## 七、专题：远程 prompt 改 pull 模型（Stop 回包交接，2026-10-17 实证 → 落地）
+
+**为什么推翻 spawn 投递**：`agy --conversation -p` 起子进程有两处结构性毛病——输出直接丢弃（`CreateNoWindow`，终端看不见是必然的）+ 与 GUI 手里的会话抢 conversation（锁 contention 高度可疑）。用户拍板：走 hook 通道（作答同款思路），Stop 回包带排队。
+
+**探针实证**（scratch 临时工作区 + 自有 `.agents/hooks.json`，用户配置零触碰）：
+- R1（`{}`）：turn 照常结束；Stop 在 `-p` 下 firing；项目级 hooks.json 生效；转录本在 `brain/<id>/.system_generated/logs/transcript_full.jsonl`。
+- R2/R3（`{"decision":"block","reason":"…"}`，纯文本轮 + 工具轮）：跟进回合在**同一进程**内开跑（MANGO + 10×PINEAPPLE），reason 以 `SYSTEM_MESSAGE` 进模型（转录本原话 "Stop hook blocked termination"）。
+- 刹车天然有：连续 10 次跟进后第 11 次 block 被吞、进程干净退出（发一条清一条的生产逻辑下连锁不可能发生，万一没清也有这道底）。
+- `--conversation <全新ID>` 只会 warning 然后开新会话（只认已存在的续聊）。
+
+**落地形态**（队列语义不动，只换投递腿）：
+- 胶水 v4：Stop 时问桥要排队（信封带 `pullPrompt` 版本门），有货原样打印回包、无货/超时/桥不在线打 `{}`，4 秒自收 + 幂等 `finish`（单测钉死双行事故）；installer 里 Stop 超时 5→30 秒。
+- 桥侧 Stop 信封同步回包：有货出队（发一条清一条）+ `AgyHookOutput.PullPrompt`（原文装入，不加前缀），无货空行；写失败重回队尾。spawn drain 与 `TryDrainQueued` 已删（旧逻辑清干净）。
+- 徽章/计时走现成：Stop 保徽章当且仅当队里还有货（`HasQueued` 守卫），跟进回合 PreInvocation 靠 `wasQueued` 保计时 + `:497` 清徽章——转录本复写与计时都不用动。
+- 硬化（与 claude 同规格）：TTL 30 分钟（三层 sweep）+ 离线/回收清队列记 WARN + 重启持久化（`agy-queued-prompts.json` 独立文件）+ 徽章自愈 + 提供商铁律（pull 在同一进程续跑，天然满足；idle 腿仍是 CLI，见下）。
+- e2e 实证（scratch essay 长任务 + 文件播种 + 重启验证 import）：import→徽章自愈→Stop 交接（"剩余排队 0"）→跟进回合 `PULL-RECEIVED` 落盘→徽章清除，全链条通。
+
+**残余与待办**：
+- idle 投递仍是 CLI 子进程（没 turn 就没 hook 可挂，pull 无从谈起）：不继承原会话环境、硬编码 `--mode accept-edits`——提供商铁律在这里仍是缺口，待定。
+- 升级窗口：v3 脚本无 pull 标记，v85 桥给空回包（不丢件）；队里东西靠 TTL 兜底。生产切流 = 点"安装或修复"升 v4。
+- open cosmetic：重启恢复窗口内徽章自愈 15 秒打 5 次（疑 turn 收尾工具 hook 交错，正确性无影响，待查）。
+- drain-撞-resume 的 300ms 竞态在 pull 下不存在（无 spawn 时钟），已消除一类。

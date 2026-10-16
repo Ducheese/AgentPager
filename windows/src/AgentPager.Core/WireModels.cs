@@ -6,9 +6,9 @@ namespace AgentPager.Core;
 public enum AgentSource { CodexDesktop, CodexCLI, ClaudeCode, OpenCode, Antigravity }
 public enum AgentLifecycle { Offline, Idle, Starting, Running, WaitingApproval, WaitingAnswer, Succeeded, Interrupted }
 public enum AgentActivity { Thinking, Reading, Searching, Editing, Executing, Testing, Browsing, Delegating }
-public enum TaskCapability { Approve, Deny, Answer, Interrupt, Retry }
+public enum TaskCapability { Approve, Deny, Answer, Interrupt, Retry, Prompt }
 public enum PendingRequestKind { Approval, Question }
-public enum ControlAction { Approve, Deny, Answer, Interrupt, Retry, Mute, MarkRead, Pin }
+public enum ControlAction { Approve, Deny, Answer, Interrupt, Retry, Mute, MarkRead, Pin, Prompt }
 public enum ControlResult { Accepted, Rejected, Stale, Unsupported }
 
 public sealed record TokenUsage(

@@ -42,6 +42,9 @@ public sealed class BridgeRuntime : IAsyncDisposable
     private readonly Channel<BridgeEvent> _events = Channel.CreateUnbounded<BridgeEvent>(
         new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
     private readonly TaskSnapshotPersistence _persistence = new();
+    private readonly PromptQueuePersistence _queuePersistence = new();
+    private readonly PromptQueuePersistence _agyQueuePersistence =
+        new(Path.Combine(AgentPagerPaths.DataRoot, "agy-queued-prompts.json"));
     private readonly CodexSessionTitleReader _titleReader = new();
     private readonly CodexRolloutObserver _rollout = new();
     private readonly CodexUsageLoader _usageLoader = new();
@@ -81,7 +84,12 @@ public sealed class BridgeRuntime : IAsyncDisposable
         _commandCodeUsageLoader.Log = _log.Write;
         _pairingSecret = new PairingSecretStore().LoadOrCreate();
         _catalog = new(_persistence.Load());
+        // 桥端排队文本是纯内存，重启会丢——随任务一起持久化，这里恢复
+        // （超 TTL 的在导入时直接丢弃；徽章由 Maintain 的自愈补回）。
+        ClaudePromptDispatcher.ImportQueues(_queuePersistence.Load(), _log.Write);
+        AgyCliDispatcher.ImportQueues(_agyQueuePersistence.Load(), _log.Write);
         _catalog.ApplyTitles(_titleReader.Load());
+        _catalog.HasOpenCodeControl = () => _hookServer?.HasOpenCodeControlClients == true;
         State = CreateState();
     }
 
@@ -315,7 +323,7 @@ public sealed class BridgeRuntime : IAsyncDisposable
                         changed = true;
                         break;
                     case MaintenanceEvent:
-                        changed = _catalog.Maintain();
+                        changed = _catalog.Maintain(log: _log.Write);
                         changed = _catalog.ApplyTitles(_titleReader.Load()) || changed;
                         // 挂起超时（三家统一）：等手机答复超过 HoldLimit 就把这次询问**交回终端** ——
                         // 撤卡 + 释放挂住的连接 + 回 running。用户可能在终端上作答 ✓，判死/判离线
@@ -351,6 +359,16 @@ public sealed class BridgeRuntime : IAsyncDisposable
             _hookServer.HasPending(hook.SessionID) &&
             !_catalog.HasPendingRequest(hook.SessionID))
             _hookServer.Cancel(hook.SessionID);
+
+        if (hook.HookEventName == "Stop")
+        {
+            _ = Task.Run(async () =>
+            {
+                // 等待 Claude Code 彻底结束当前回合、释放 turn 并回到提示符等待状态
+                await Task.Delay(300);
+                ClaudePromptDispatcher.TryDrainQueued(hook.SessionID, _log.Write);
+            });
+        }
         return changed;
     }
 
@@ -506,6 +524,18 @@ public sealed class BridgeRuntime : IAsyncDisposable
         catch (IOException error)
         {
             _lastError = $"保存任务状态失败：{error.Message}";
+            _log.Write("ERROR", _lastError);
+        }
+        try { _queuePersistence.Save(ClaudePromptDispatcher.ExportQueues()); }
+        catch (IOException error)
+        {
+            _lastError = $"保存排队状态失败：{error.Message}";
+            _log.Write("ERROR", _lastError);
+        }
+        try { _agyQueuePersistence.Save(AgyCliDispatcher.ExportQueues()); }
+        catch (IOException error)
+        {
+            _lastError = $"保存 agy 排队状态失败：{error.Message}";
             _log.Write("ERROR", _lastError);
         }
         PublishState();

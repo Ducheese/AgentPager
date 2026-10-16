@@ -1,4 +1,4 @@
-// AgentPager agy 钩子脚本单测（脚本 v3：**只对 ask_question 挂起**，其余一律立刻放行）
+// AgentPager agy 钩子脚本单测（脚本 v4：提问挂起不变；Stop 问桥要排队，有货原样打印、无货/超时打 {}）
 // 运行：node windows/tests/agy-hook.test.mjs
 // 做法：读仓库里的脚本源码、把端口补丁到测试端口、写入临时文件后 spawn，
 // 用本地 TCP 假桥驱动它的四种收场路径并断言 stdout。
@@ -114,11 +114,33 @@ const close = (server) => new Promise((resolve) => server.close(resolve))
   await close(server)
 }
 
-// ⑤ 非 PreToolUse：契约是空对象
+// ⑤ Stop：桥不回话 → 4 秒自收打 {}（不卡 agy）；信封带 pullPrompt 版本门
 {
-  const { server } = await startBridge(() => {})
+  const { server, frames } = await startBridge(() => {})
+  const started = Date.now()
   const result = await runHook("Stop", { conversationId: "agy_test" })
-  check(result.out === "{}", `agy hook: non-PreToolUse event answers {} (got '${result.out}')`)
+  const elapsed = Date.now() - started
+  check(result.out === "{}", `agy hook: silent bridge on Stop falls back to {} (got '${result.out}')`)
+  check(elapsed < 8000, `agy hook: Stop does not hang agy (took ${elapsed}ms)`)
+  check(frames.length === 1 && frames[0].payload.pullPrompt === true,
+    "agy hook: Stop frame carries the pull version gate")
+  await close(server)
+}
+
+// ⑥ Stop pull：桥回 block+reason → 原样打印（agy 当新一轮续跑）
+{
+  const handover = JSON.stringify({ decision: "block", reason: "顺手看看日志" })
+  const { server } = await startBridge((_envelope, socket) => { socket.write(handover + "\n") })
+  const result = await runHook("Stop", { conversationId: "agy_test" })
+  check(result.out === handover, `agy hook: Stop handover is printed verbatim (got '${result.out}')`)
+  await close(server)
+}
+
+// ⑦ Stop pull：桥回空行（无排队）→ {}
+{
+  const { server } = await startBridge((_envelope, socket) => { socket.write("\n") })
+  const result = await runHook("Stop", { conversationId: "agy_test" })
+  check(result.out === "{}", `agy hook: empty Stop reply falls back to {} (got '${result.out}')`)
   await close(server)
 }
 

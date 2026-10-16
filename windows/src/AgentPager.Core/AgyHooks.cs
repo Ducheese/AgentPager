@@ -21,7 +21,8 @@ public sealed record AgyHookPayload(
     [property: JsonPropertyName("modelName")] string? ModelName = null,
     [property: JsonPropertyName("toolCall")] AgyToolCall? ToolCall = null,
     [property: JsonPropertyName("terminationReason")] string? TerminationReason = null,
-    [property: JsonPropertyName("error")] string? Error = null)
+    [property: JsonPropertyName("error")] string? Error = null,
+    [property: JsonPropertyName("pullPrompt")] bool? PullPrompt = null)
 {
     [JsonIgnore]
     public string EffectiveEvent => Event ?? HookEventName ?? "Unknown";
@@ -463,8 +464,7 @@ public static class AgyEventReducer
         // 运行期间（PostInvocation/PreToolUse/PostToolUse）绝对不得以旧正文覆盖工具执行步骤
         if (!task.IsTerminal && hook.EffectiveEvent == "Stop" && latestResponse is not null)
         {
-            if (task.Activity is null or AgentActivity.Thinking &&
-                task.Lifecycle is not (AgentLifecycle.WaitingApproval or AgentLifecycle.WaitingAnswer))
+            if (task.Lifecycle is not (AgentLifecycle.WaitingApproval or AgentLifecycle.WaitingAnswer))
             {
                 task = WithStep(task, latestResponse);
             }
@@ -642,6 +642,12 @@ public static class AgyEventReducer
                     };
                 }
 
+                // 成功 Stop：排队徽章**保留当且仅当桥端还有没交接的条目**（pull 模型）。
+                // 跟进回合的 PreInvocation 靠 wasQueued 保计时（startsNewRound 的 !wasQueued 守卫）
+                // 和转录本复写守卫（`!task.PromptQueued` 才覆写 UserPrompt）：这里提前清掉，
+                // 跟进回合会把排队文本误判成真新回合（计时重置 + 第二行被旧提示词顶掉）。
+                // 无排队时照旧清零（与旧行为一致）。
+                var keepQueued = task.PromptQueued && AgyCliDispatcher.HasQueued(sessionID);
                 return task with
                 {
                     Lifecycle = task.Lifecycle == AgentLifecycle.Interrupted ? AgentLifecycle.Interrupted : AgentLifecycle.Succeeded,
@@ -650,7 +656,7 @@ public static class AgyEventReducer
                     CompletedAt = now,
                     IsUnread = true,
                     Capabilities = [],
-                    PromptQueued = false,
+                    PromptQueued = keepQueued,
                 };
             }
 
@@ -912,6 +918,21 @@ public static class AgyHookOutput
         };
         return Encoding.UTF8.GetBytes(JsonSerializer.Serialize(payload) + "\n");
     }
+
+    /// <summary>
+    /// Stop-pull 交接：把排队文本装进 block+reason（探针实证：agy 以 SYSTEM_MESSAGE
+    /// 在同一进程内续跑，后续 turn 可见；连续 block 10 次后 agy 自己收场，无限连锁兜底）。
+    /// 文本原样装入（不加前缀）：手机上发的就是 prompt，终端看到的也该是同一句话。
+    /// </summary>
+    public static byte[] PullPrompt(string prompt)
+    {
+        var payload = new
+        {
+            decision = "block",
+            reason = prompt,
+        };
+        return Encoding.UTF8.GetBytes(JsonSerializer.Serialize(payload) + "\n");
+    }
 }
 
 public enum AntigravityPluginStatus { NotInstalled, Installed, Outdated }
@@ -1067,7 +1088,9 @@ public sealed class AgyHookConfiguration(string? configDirectory = null)
                     {
                         ["type"] = "command",
                         ["command"] = $"{hookCommand} Stop",
-                        ["timeout"] = 5,
+                        // v4 起 Stop 要问桥拿排队（pull，本地回环毫秒级）：30 秒是给高负载的余量，
+                        // 脚本自己 4 秒自收，平时不占用这个上限。
+                        ["timeout"] = 30,
                     }
                 },
             };

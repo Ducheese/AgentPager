@@ -89,6 +89,9 @@ public static class ClaudeTranscriptReader
         // 本回合"最新一步"已经定过没有（倒序扫到的第一条主会话 assistant 行即是）。
         var sawLatestStep = false;
         var queueSettled = false;
+        // 队列操作的"欠账"：倒序扫到 dequeue / remove 就 +1，后面的 enqueue 先还账
+        // （说明这条有过配对取走）。详见 queue-operation 分支的说明。
+        var queueOwed = 0;
         // 正文只在"当前回合"内找：倒序扫到真实用户输入即封口，绝不跨回合捡上一轮的正文。
         var replySettled = false;
 
@@ -113,13 +116,42 @@ public static class ClaudeTranscriptReader
                         customTitle ??= Text(root, "customTitle");
                         break;
                     case "queue-operation":
-                        // 系统注入项（<task-notification> 一类）不参与判定，跳过继续往前找；
-                        // 第一条"非系统"队列操作说了算（见 ReadQueueOperation 的说明）。
-                        if (!queueSettled && Text(root, "content") is { } queuedContent &&
-                            !queuedContent.TrimStart().StartsWith('<'))
+                        // 队列状态必须按操作序列**成对抵消**来判，不能只看"最后一条带内容的操作"：
+                        // dequeue / remove 行**没有 content 字段**，旧模型会跳过它们、继续倒扫到
+                        // 更老的 enqueue，把"已排空"读成"仍在排队"——实测踩过（管道注入的消息
+                        // 跑完后，第二行被排队文本永久冒充，见 ClaudeEventReducer.ApplyTranscript
+                        // 的还原分支）。倒序扫描（dequeue 取队首，与更早的 enqueue 两两配对）：
+                        //   · dequeue / remove → 欠账 +1；
+                        //   · popAll → 整队清空，直接定案"没有排队"；
+                        //   · enqueue → 尚有欠账先抵账（这条被配对取走过）；还不上账、且
+                        //     content 是有效用户文本（系统注入 <task-notification> 与本地
+                        //     斜杠命令 /context 等排除）的，才是"当前还在队里"的那条。
+                        // 局限：同队多条交错时，报道的文本/时间戳可能配错一条（徽章开关不受影响）。
+                        if (!queueSettled && Text(root, "operation") is { Length: > 0 } queueOp)
                         {
-                            queueSettled = true;
-                            ReadQueueOperation(root, out queuedPrompt, out queuedAt);
+                            if (queueOp is "dequeue" or "remove")
+                            {
+                                queueOwed++;
+                            }
+                            else if (queueOp == "popAll")
+                            {
+                                queueSettled = true;
+                            }
+                            else if (queueOp == "enqueue")
+                            {
+                                if (queueOwed > 0)
+                                {
+                                    queueOwed--;
+                                }
+                                else if (Text(root, "content") is { } queuedContent &&
+                                         !queuedContent.TrimStart().StartsWith('<') &&
+                                         !queuedContent.TrimStart().StartsWith('/'))
+                                {
+                                    queueSettled = true;
+                                    queuedPrompt = queuedContent;
+                                    queuedAt = Timestamp(root);
+                                }
+                            }
                         }
                         break;
                     case "assistant":
@@ -211,32 +243,6 @@ public static class ClaudeTranscriptReader
         DateTimeOffset.TryParse(stamp, null, System.Globalization.DateTimeStyles.AdjustToUniversal, out var parsed)
             ? parsed
             : null;
-
-    /// <summary>
-    /// 倒序遇到的第一条 queue-operation：enqueue 表示"还有一条在队里"，
-    /// remove 表示"队里最后一条已被取走"（此时明确置空）。
-    ///
-    /// 两类内容必须排除，否则会被误当成"用户在排队提交提示词"（**实测踩过**）：
-    ///   ① 系统注入：Claude 把后台任务完成通知也塞进同一队列（content 以 &lt;task-notification&gt; 开头）；
-    ///   ② **本地斜杠命令**（`/context`、`/status`…）：它们是本地动作，且 Claude 只写 enqueue
-    ///      而**不写配对的 remove**——按"最后一条操作说了算"的模型会永远停在"排队中"，
-    ///      并把 `/context` 当成用户的提示词顶到第二行。
-    /// </summary>
-    private static void ReadQueueOperation(JsonElement root, out string? prompt, out DateTimeOffset? queuedAt)
-    {
-        prompt = null;
-        queuedAt = null;
-        var content = Text(root, "content");
-        if (string.IsNullOrWhiteSpace(content)) return;
-        var trimmed = content.TrimStart();
-        if (trimmed.StartsWith('<') || trimmed.StartsWith('/')) return;
-        if (Text(root, "operation") != "enqueue") return;
-        prompt = content;
-        if (Text(root, "timestamp") is { Length: > 0 } stamp &&
-            DateTimeOffset.TryParse(stamp, null, System.Globalization.DateTimeStyles.AdjustToUniversal,
-                out var parsed))
-            queuedAt = parsed;
-    }
 
     /// <summary>正文预览上限与 agy/opencode 一致：120 字单行。</summary>
     private static string? Truncate(string? value, int limit) =>

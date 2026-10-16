@@ -328,6 +328,8 @@ public sealed class ClaudeHookConfiguration(string? claudeConfigDir = null)
                 var registered = Events.All(spec =>
                     hooks[spec.Name] is JsonArray groups && groups.Any(node => IsManaged(node as JsonObject)));
                 if (!registered) return ClaudeHookStatus.NotInstalled;
+                if (!string.Equals(root?["crossSessionInbound"]?.ToString(), "accept", StringComparison.Ordinal))
+                    return ClaudeHookStatus.Outdated;
                 return ScriptIsCurrent() ? ClaudeHookStatus.Installed : ClaudeHookStatus.Outdated;
             }
             catch { return ClaudeHookStatus.NotInstalled; }
@@ -362,6 +364,7 @@ public sealed class ClaudeHookConfiguration(string? claudeConfigDir = null)
                 retained.Add(group);
                 hooks[spec.Name] = retained;
             }
+            root["crossSessionInbound"] = "accept";
             return root;
         });
         return new(changed || result.Changed, result.BackupPath);
@@ -371,6 +374,9 @@ public sealed class ClaudeHookConfiguration(string? claudeConfigDir = null)
     {
         var result = Mutate(root =>
         {
+            if (string.Equals(root["crossSessionInbound"]?.ToString(), "accept", StringComparison.Ordinal))
+                root.Remove("crossSessionInbound");
+
             if (root["hooks"] is not JsonObject hooks) return root;
             foreach (var spec in Events)
             {
@@ -524,7 +530,67 @@ public static class ClaudeSessionRegistry
     public static string Directory =>
         Path.Combine(ClaudeConfigDirectory.Home, "sessions");
 
-    public sealed record Entry(string SessionID, string? Name, string? NameSource, string? Status, long? StartedAt);
+    public sealed record Entry(
+        string SessionID,
+        string? Name,
+        string? NameSource,
+        string? Status,
+        long? StartedAt,
+        string? MessagingSocketPath = null,
+        int? Pid = null,
+        string? Cwd = null,
+        string? Kind = null,
+        string? Entrypoint = null);
+
+    public static Func<int, bool> ProcessAliveChecker { get; set; } = DefaultProcessAliveChecker;
+
+    // 会话 → 宿主进程 PID（kind=="interactive" && entrypoint=="cli" 的注册条目，见 Observe）。
+    // 被 /resume 切走（parked）的会话会从注册表里消失，但宿主进程往往还活着——这张表回答
+    // "这个会话还能不能被唤醒"（远程注入靠 `claude --resume` 回退子进程续接）。
+    // 边界（接受）：桥重启后此表为空，重启前就已切走的会话退化成"10 分钟兜底判离线"。
+    private static readonly Dictionary<string, int> HostPids = new(StringComparer.Ordinal);
+
+    /// <summary>该会话最近一次的宿主进程 PID；没记录过返回 null（不确定，不代表死）。</summary>
+    public static int? HostPidOf(string sessionID) =>
+        HostPids.TryGetValue(sessionID, out var pid) ? pid : null;
+
+    /// <summary>丢掉一个会话的宿主记录（判离线时调用：防 PID 复用把死宿主"复活"成 parked）。</summary>
+    public static void Forget(string sessionID) => HostPids.Remove(sessionID);
+
+    /// <summary>
+    /// 从注册表扫描结果里记"谁是宿主"。只认 kind=="interactive" && entrypoint=="cli"：
+    /// `-p` 回退子进程同样注册 kind=interactive，但 entrypoint="sdk-cli"（探针实测），
+    /// 不滤掉的话子进程会在会话切走前顶掉宿主 PID，子进程一退就误判宿主已死。
+    /// 已记录且原宿主仍存活时**不改写**（prefer-alive-incumbent）：同一会话可能被多个进程
+    /// 先后 resume，两个都活着时取先者最对症（子进程是短命替身，宿主是真身）。
+    /// </summary>
+    public static void Observe(IEnumerable<Entry> entries)
+    {
+        foreach (var entry in entries)
+        {
+            if (!string.Equals(entry.Kind, "interactive", StringComparison.Ordinal)) continue;
+            if (!string.Equals(entry.Entrypoint, "cli", StringComparison.Ordinal)) continue;
+            if (entry.Pid is not { } pid) continue;
+            if (HostPids.TryGetValue(entry.SessionID, out var incumbent) &&
+                incumbent != pid &&
+                ProcessAliveChecker(incumbent))
+                continue;
+            HostPids[entry.SessionID] = pid;
+        }
+    }
+
+    private static bool DefaultProcessAliveChecker(int pid)
+    {
+        try
+        {
+            using var proc = System.Diagnostics.Process.GetProcessById(pid);
+            return !proc.HasExited;
+        }
+        catch
+        {
+            return false;
+        }
+    }
 
     /// <summary>扫描注册表，返回 session_id → 条目（文件数通常个位数，无需缓存）。</summary>
     public static Dictionary<string, Entry> Scan(string? directory = null)
@@ -538,6 +604,8 @@ public static class ClaudeSessionRegistry
             {
                 try
                 {
+                    var fileName = Path.GetFileNameWithoutExtension(file);
+                    var pid = int.TryParse(fileName, out var parsedPid) ? parsedPid : (int?)null;
                     using var document = JsonDocument.Parse(File.ReadAllText(file));
                     var root = document.RootElement;
                     if (root.ValueKind != JsonValueKind.Object) continue;
@@ -549,7 +617,12 @@ public static class ClaudeSessionRegistry
                         Text(root, "name"),
                         Text(root, "nameSource"),
                         Text(root, "status"),
-                        root.TryGetProperty("startedAt", out var started) && started.TryGetInt64(out var value) ? value : null);
+                        root.TryGetProperty("startedAt", out var started) && started.TryGetInt64(out var value) ? value : null,
+                        Text(root, "messagingSocketPath"),
+                        pid,
+                        Text(root, "cwd"),
+                        Text(root, "kind"),
+                        Text(root, "entrypoint"));
                 }
                 catch
                 {
