@@ -8,7 +8,7 @@ public enum AgentLifecycle { Offline, Idle, Starting, Running, WaitingApproval, 
 public enum AgentActivity { Thinking, Reading, Searching, Editing, Executing, Testing, Browsing, Delegating }
 public enum TaskCapability { Approve, Deny, Answer, Interrupt, Retry, Prompt }
 public enum PendingRequestKind { Approval, Question }
-public enum ControlAction { Approve, Deny, Answer, Interrupt, Retry, Mute, MarkRead, Pin, Prompt }
+public enum ControlAction { Approve, Deny, Answer, Interrupt, Retry, Mute, MarkRead, Pin, Prompt, Shutdown }
 public enum ControlResult { Accepted, Rejected, Stale, Unsupported }
 
 public sealed record TokenUsage(

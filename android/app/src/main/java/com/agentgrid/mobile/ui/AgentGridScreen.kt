@@ -1,5 +1,6 @@
 package com.agentgrid.mobile.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.SizeTransform
@@ -71,6 +72,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.zIndex
@@ -352,6 +354,13 @@ private fun TaskTerminal(
         soundTracker.nextCue(tasks, soundEnabled)?.let(sound::play)
     }
 
+    // 层级返回：设置小窗 → 先关小窗；额度面板 → 回任务面板；都没开才交给系统（退桌面）。
+    // 和点右上角图标是同一动作（onToggleDashboard / 关小窗），返回键只是另一只手。
+    BackHandler(enabled = settingsVisible || showDashboard) {
+        if (settingsVisible) settingsVisible = false
+        else if (showDashboard) onToggleDashboard()
+    }
+
     BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
@@ -504,6 +513,9 @@ private fun TaskTerminal(
                 },
                 onUnpair = onUnpair,
                 onExitTerminal = onExitTerminal,
+                onControl = onControl,
+                // 矮窗口（横屏/悬浮窗）下 6 行会顶出可视区：面板限高 + 内部滚动，键才点得到。
+                panelMaxHeight = maxHeight - 60.dp,
             )
         }
 
@@ -1189,11 +1201,14 @@ private fun ResponseSection(markdown: String) {
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(10.dp),
     ) {
+        // 不加粗（2026-10-16）：REPLY 原来带 FontWeight.Bold，而 PixelFontFamily 把同一个 ttf
+        // 同时注册成 Normal/Medium/Bold —— 没有独立粗体字面，系统就做**伪粗体**，描边向外双向扩，
+        // 左边缘跟着多出一点，三个标签里就它看着偏左。去掉后与 MODEL/TOKEN 同字面、同原点，
+        // 标签列严格对齐。
         Text(
             "REPLY",
             color = AgentGridColors.Green,
             fontSize = 9.sp,
-            fontWeight = FontWeight.Bold,
             modifier = Modifier.width(58.dp),
         )
         Box(
@@ -1230,11 +1245,15 @@ private fun SettingsPanel(
     onSoundEnabledChange: (Boolean) -> Unit,
     onUnpair: () -> Unit,
     onExitTerminal: () -> Unit,
+    onControl: (String, ControlAction, String?, List<String>?) -> Unit,
+    panelMaxHeight: Dp,
 ) {
     Column(
         modifier = Modifier
             .width(206.dp)
             .background(AgentGridColors.Surface)
+            .heightIn(max = panelMaxHeight)
+            .verticalScroll(rememberScrollState())
             .padding(14.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
@@ -1253,6 +1272,26 @@ private fun SettingsPanel(
         }
         PixelButton("解除配对", AgentGridColors.Red, onUnpair)
         PixelButton("退出专用模式", AgentGridColors.Muted, onExitTerminal)
+        // 关机：点两次才发（第一次布防，8 秒内没点第二次自动撤防），误触保护。
+        // 发出去电脑 60 秒后关机（桥侧 shutdown /t 60），留反悔窗口，可在电脑上 shutdown /a 取消。
+        var shutdownArmed by remember { mutableStateOf(false) }
+        if (shutdownArmed) {
+            LaunchedEffect(Unit) {
+                delay(8000)
+                shutdownArmed = false
+            }
+        }
+        PixelButton(
+            if (shutdownArmed) "确认关机？" else "关闭计算机",
+            AgentGridColors.Red,
+        ) {
+            if (shutdownArmed) {
+                shutdownArmed = false
+                onControl("", ControlAction.SHUTDOWN, null, null)
+            } else {
+                shutdownArmed = true
+            }
+        }
     }
 }
 

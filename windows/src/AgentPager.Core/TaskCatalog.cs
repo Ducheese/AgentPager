@@ -1192,6 +1192,27 @@ public sealed class TaskCatalog
         return false;
     }
 
+    /// <summary>
+    /// agy 会话库的"变了吗"水位线。
+    ///
+    /// **必须把 -wal 一起看**（2026-10-16 修）：这个库跑在 WAL 模式，写入全部落在
+    /// <c>conversation_summaries.db-wal</c> 上，**主库文件的 mtime 只在 checkpoint 时才动** ——
+    /// agy 一直开着库，checkpoint 很少发生，实测主库 mtime 停在 02:34、WAL 已经到 03:16。
+    /// 只看主库的话门控永不失效：缓存永不过期、<see cref="CheckAgyTitles"/> 永不重跑，
+    /// 于是**模型后来才生成的标题永远进不来**，面板一直显示项目名兜底。
+    /// </summary>
+    private static DateTime AgyDbWatermark(string dbPath)
+    {
+        var stamp = File.GetLastWriteTimeUtc(dbPath);
+        var writeAheadLog = dbPath + "-wal";
+        if (File.Exists(writeAheadLog))
+        {
+            var walStamp = File.GetLastWriteTimeUtc(writeAheadLog);
+            if (walStamp > stamp) stamp = walStamp;
+        }
+        return stamp;
+    }
+
     private bool MaintainAgyDatabase(DateTimeOffset now)
     {
         if (!_tasks.Any(task => task.Source == AgentSource.Antigravity))
@@ -1203,7 +1224,7 @@ public sealed class TaskCatalog
             var changed = false;
             if (File.Exists(dbPath))
             {
-                var lastWrite = File.GetLastWriteTimeUtc(dbPath);
+                var lastWrite = AgyDbWatermark(dbPath);
                 if (_lastAgyDbModified is null || lastWrite > _lastAgyDbModified.Value)
                 {
                     _lastAgyDbModified = lastWrite;
@@ -1337,7 +1358,9 @@ public sealed class TaskCatalog
     {
         var dbPath = AgyConversationDatabase.DefaultDbPath;
         if (!File.Exists(dbPath)) return null;
-        var lastWrite = File.GetLastWriteTimeUtc(dbPath);
+        // 同样要看 -wal：写入落在 WAL 上时主库 mtime 不动，只盯主库会让这份缓存**永不过期**
+        // （见 AgyDbWatermark 的说明）。
+        var lastWrite = AgyDbWatermark(dbPath);
         if (_agyAcceptDbMtime != lastWrite)
         {
             _agyAcceptDbMtime = lastWrite;

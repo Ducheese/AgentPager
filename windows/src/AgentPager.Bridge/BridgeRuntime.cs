@@ -432,6 +432,17 @@ public sealed class BridgeRuntime : IAsyncDisposable
         return _catalog.Accept(hook);
     }
 
+    /// <summary>
+    /// 手机端"关闭计算机"：与任务无关的全局动作，不进 TaskCatalog（没有 taskID 可查）。
+    /// 配对签名已经验过——能点审批的人才能点它。60 秒延迟是唯一的反悔窗口。
+    /// </summary>
+    private ControlAckPayload ShutdownComputer(Guid requestID)
+    {
+        return SystemPower.Shutdown(SystemPower.ShutdownDelaySeconds, _log.Write)
+            ? new(requestID, ControlResult.Accepted, null)
+            : new(requestID, ControlResult.Rejected, "关机指令启动失败");
+    }
+
     private async Task<bool> HandleControl(string text)
     {
         SignedControlEnvelope? request;
@@ -442,8 +453,10 @@ public sealed class BridgeRuntime : IAsyncDisposable
         try
         {
             _replayGuard.Validate(request, _pairingSecret);
-            acknowledgment = _catalog.Perform(request.MessageId, request.Payload,
-                _hookServer ?? throw new InvalidOperationException("Hook 通道尚未就绪"));
+            acknowledgment = request.Payload.Action == ControlAction.Shutdown
+                ? ShutdownComputer(request.MessageId)
+                : _catalog.Perform(request.MessageId, request.Payload,
+                    _hookServer ?? throw new InvalidOperationException("Hook 通道尚未就绪"));
         }
         catch (ProtocolException error)
         {

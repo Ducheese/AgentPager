@@ -313,6 +313,9 @@ enum class ControlAction {
 
     @SerialName("prompt")
     PROMPT,
+
+    @SerialName("shutdown")
+    SHUTDOWN,
 }
 
 @Serializable

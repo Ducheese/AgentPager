@@ -2319,6 +2319,75 @@ finally
     try { File.Delete(agyDb); } catch { /* 同上 */ }
 }
 
+// ---- 1b：agy 库跑 WAL 时，标题门控必须把 -wal 一起看（2026-10-16 用户实测报出）----
+// 坑：库是 WAL 模式，写入落在 conversation_summaries.db-wal 上，**主库文件的 mtime 只在 checkpoint
+// 时才动**（agy 一直开着库，checkpoint 很少发生）。原来两处门控 —— MaintainAgyDatabase 与
+// LookupAgyConversation —— 都只看主库 mtime，于是水位线永不前进：缓存永不过期、CheckAgyTitles
+// 永不重跑，**模型后来才生成的标题永远进不来**，面板一直显示项目名兜底。
+// 实测现场：主库 mtime 停在 02:34，-wal 已经到 03:16，而 DB 里 title 早已有值。
+var agyWalBrain = Path.Combine(Path.GetTempPath(), "ap-agy-wal-brain-" + Guid.NewGuid().ToString("N"));
+var agyWalDb = Path.Combine(Path.GetTempPath(), "ap-agy-wal-db-" + Guid.NewGuid().ToString("N") + ".db");
+var previousWalBrainRoot = AgyTranscriptReader.BrainRoot;
+var previousWalDbOverride = AgyConversationDatabase.DatabasePathOverride;
+AgyTranscriptReader.BrainRoot = agyWalBrain;
+AgyConversationDatabase.DatabasePathOverride = agyWalDb;
+try
+{
+    // **连接全程不关**：一关 SQLite 就 checkpoint 并把 -wal 收掉，主库 mtime 跟着变，测试就白做了。
+    using var walConnection = new Microsoft.Data.Sqlite.SqliteConnection($"Data Source={agyWalDb}");
+    walConnection.Open();
+    void WalExec(string sql)
+    {
+        using var sqliteCommand = walConnection.CreateCommand();
+        sqliteCommand.CommandText = sql;
+        sqliteCommand.ExecuteNonQuery();
+    }
+    WalExec("PRAGMA journal_mode=WAL");
+    WalExec("CREATE TABLE conversation_summaries (conversation_id TEXT, title TEXT, " +
+        "parent_conversation_id TEXT, agent_name TEXT, status TEXT, nesting_depth INTEGER)");
+    WalExec("INSERT INTO conversation_summaries VALUES ('wal_agy', '', '', '', 'CASCADE_RUN_STATUS_IDLE', 0)");
+
+    // 两个目录：A 走"周期刷新"（Maintain），B 走"事件读取缓存"（Accept）—— 两处门控各测一条。
+    var walCatalogA = new TaskCatalog();
+    var walCatalogB = new TaskCatalog();
+    var walT0 = DateTimeOffset.UtcNow;
+    walCatalogA.Accept(A("PreInvocation", new { conversationId = "wal_agy", workspacePaths = new[] { @"C:\test" } }), walT0);
+    walCatalogB.Accept(A("PreInvocation", new { conversationId = "wal_agy", workspacePaths = new[] { @"C:\test" } }), walT0);
+    Check(walCatalogA.Projection().Tasks.First(t => t.Id == "wal_agy").Title == "test",
+        $"agy wal: DB has no title yet -> project name fallback (got '{walCatalogA.Projection().Tasks.First(t => t.Id == "wal_agy").Title}')");
+
+    // 建立水位线：此刻两边都已经看过一遍库（标题还是空的）。
+    walCatalogA.Maintain(walT0.AddSeconds(5));
+    walCatalogB.Maintain(walT0.AddSeconds(5));
+
+    var dbStampBefore = File.GetLastWriteTimeUtc(agyWalDb);
+    WalExec("UPDATE conversation_summaries SET title='模型生成的标题' WHERE conversation_id='wal_agy'");
+    var dbStampAfter = File.GetLastWriteTimeUtc(agyWalDb);
+
+    // 自校验：这一步必须**真的没碰主库**，否则这个测试就没在测那个坑。
+    Check(dbStampBefore == dbStampAfter,
+        $"agy wal: the UPDATE really left the main db file untouched (trap precondition; {dbStampBefore:O} -> {dbStampAfter:O})");
+    Check(File.Exists(agyWalDb + "-wal"), "agy wal: writes landed in the -wal file (journal really is WAL)");
+
+    // ① 周期刷新这条路：门控认 -wal 才会重跑 CheckAgyTitles
+    walCatalogA.Maintain(walT0.AddSeconds(10));
+    Check(walCatalogA.Projection().Tasks.First(t => t.Id == "wal_agy").Title == "test · 模型生成的标题",
+        $"agy wal: model-generated title lands on the Maintain path (got '{walCatalogA.Projection().Tasks.First(t => t.Id == "wal_agy").Title}')");
+
+    // ② 事件读取这条路：门控认 -wal 才会清掉那份永不过期的缓存
+    walCatalogB.Accept(A("PreInvocation", new { conversationId = "wal_agy", workspacePaths = new[] { @"C:\test" } }), walT0.AddSeconds(11));
+    Check(walCatalogB.Projection().Tasks.First(t => t.Id == "wal_agy").Title == "test · 模型生成的标题",
+        $"agy wal: model-generated title lands on the Accept path too (got '{walCatalogB.Projection().Tasks.First(t => t.Id == "wal_agy").Title}')");
+}
+finally
+{
+    AgyTranscriptReader.BrainRoot = previousWalBrainRoot;
+    AgyConversationDatabase.DatabasePathOverride = previousWalDbOverride;
+    try { Directory.Delete(agyWalBrain, true); } catch { /* 清理失败不影响断言 */ }
+    foreach (var leftover in new[] { agyWalDb, agyWalDb + "-wal", agyWalDb + "-shm" })
+        try { File.Delete(leftover); } catch { /* 同上 */ }
+}
+
 // ===================== 28. 工具路径缩写（三家共用：工作区相对 / 家目录 ~/ / 其它全路径）=====================
 var previousHomeRoot = PathDisplay.HomeRootOverride;
 PathDisplay.HomeRootOverride = @"C:\Users\tester";
@@ -3300,6 +3369,26 @@ var failAck = opencodeCatalog.Perform(Guid.NewGuid(), new ControlPayload("oc-1",
 Check(failAck.Result == ControlResult.Rejected, "prompt: delivery failure returns Rejected");
 
 Console.WriteLine();
+// 关机：只验参数形状与失败路径（桩掉 Starter，绝不真关机）。
+var prevPowerStarter = SystemPower.Starter;
+try
+{
+    System.Diagnostics.ProcessStartInfo? powerStartInfo = null;
+    SystemPower.Starter = psi => { powerStartInfo = psi; return null; };
+    Check(SystemPower.Shutdown(60), "shutdown: dispatch started");
+    Check(powerStartInfo is not null &&
+          powerStartInfo.FileName == "shutdown" &&
+          powerStartInfo.ArgumentList.Contains("/s") &&
+          powerStartInfo.ArgumentList.Contains("60"),
+        "shutdown: shutdown /s /t 60 with delay");
+    SystemPower.Starter = _ => throw new InvalidOperationException("no shutdown privilege");
+    Check(!SystemPower.Shutdown(60), "shutdown: starter failure returns false instead of throwing");
+}
+finally
+{
+    SystemPower.Starter = prevPowerStarter;
+}
+
 Console.WriteLine(failures.Count == 0 ? "ALL CHECKS PASSED" : $"FAILURES: {string.Join(", ", failures)}");
 return failures.Count == 0 ? 0 : 1;
 
