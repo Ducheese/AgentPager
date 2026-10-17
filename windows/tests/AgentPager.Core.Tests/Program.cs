@@ -393,21 +393,21 @@ Check(!json.Contains("\"OpenCode\""), "wire has no PascalCase enum leakage");
 var temp = Path.Combine(Path.GetTempPath(), "ap-verify-plugins-" + Guid.NewGuid().ToString("N"));
 var installer = new OpenCodePluginConfiguration(temp);
 Check(installer.Status == OpenCodePluginStatus.NotInstalled, "status: 未安装");
-Check(OpenCodePluginConfiguration.EmbeddedVersion == 21, $"embedded plugin version = 21 (got {OpenCodePluginConfiguration.EmbeddedVersion})");
+Check(OpenCodePluginConfiguration.EmbeddedVersion == 22, $"embedded plugin version = 22 (got {OpenCodePluginConfiguration.EmbeddedVersion})");
 var first = installer.Install();
 Check(first.Changed && File.Exists(Path.Combine(temp, "plugins", "agentpager-opencode.js")), "install writes plugin");
 Check(installer.Status == OpenCodePluginStatus.Installed && installer.IsInstalled(), "status: 已写入（与内置一致）");
-Check(installer.InstalledVersion == 21, "installed version = 21");
+Check(installer.InstalledVersion == 22, "installed version = 22");
 var second = installer.Install();
 Check(!second.Changed, "reinstall is idempotent");
 var pluginPath = Path.Combine(temp, "plugins", "agentpager-opencode.js");
 var content = File.ReadAllText(pluginPath);
 Check(content.Contains("Managed by AgentPager (OpenCode)"), "managed marker present");
-Check(content.Contains("agentpager-opencode v21"), "version header present");
+Check(content.Contains("agentpager-opencode v22"), "version header present");
 Check(content.Contains("hook_source: \"opencode\"") && content.Contains("49361"), "plugin content sane");
 File.WriteAllText(pluginPath, content.Replace("const MAX_TEXT = 1000", "const MAX_TEXT = 500"));
 Check(installer.Status == OpenCodePluginStatus.Outdated, "status: 待更新（内容与内置不一致）");
-Check(installer.InstalledVersion == 21, "outdated file still reports v21");
+Check(installer.InstalledVersion == 22, "outdated file still reports v22");
 var repair = installer.Install();
 Check(repair.Changed && installer.Status == OpenCodePluginStatus.Installed, "repair restores 已写入");
 var uninstalled = installer.Uninstall();
@@ -1838,8 +1838,8 @@ Check(termFinished.Lifecycle == AgentLifecycle.Succeeded && termFinished.Complet
     "terminal keep: task succeeded with completedAt");
 termCatalog.Accept(C("SessionEnd", new { session_id = "term_keep" }), termT0.AddSeconds(10));
 var termAfterEnd = termCatalog.Projection().Tasks.First(x => x.Id == "term_keep");
-Check(termAfterEnd.Lifecycle == AgentLifecycle.Succeeded && termAfterEnd.CompletedAt == termT0.AddSeconds(5),
-    "terminal keep: sessionEnd preserves succeeded state and completedAt");
+Check(termAfterEnd.Lifecycle == AgentLifecycle.Offline && termAfterEnd.CompletedAt == termT0.AddSeconds(5),
+    "terminal keep: sessionEnd transitions to offline while preserving completedAt");
 
 // 2) 离线超时清理：30 分钟后被 Normalize 移除
 termCatalog.Maintain(termT0.AddMinutes(36));
@@ -2567,6 +2567,27 @@ var ocReplyTask = ocReplyCatalog.Projection().Tasks.First(t => t.Id == "ses_repl
 Check(ocReplyTask.LatestStep == "# 标题 | A | B |", "opencode reply: LatestStep gets preview");
 Check(ocReplyTask.ResponseBody == markdownWithTables, "opencode reply: ResponseBody gets full multiline markdown");
 
+// 工具活动期间的 reply：第三行保护工具步不被冲掉，但 ResponseBody 必须收录完整正文（防丢字）
+ocReplyCatalog.Accept(H("message.part.updated", new {
+    sessionID = "ses_reply_test",
+    part = new {
+        id = "prt_tool_reply_test",
+        callID = "call_reply_test",
+        type = "tool",
+        tool = "bash",
+        state = new { status = "running", input = new { command = "npm test" } }
+    }
+}), ocReplyT0.AddSeconds(3));
+var ocToolTask = ocReplyCatalog.Projection().Tasks.First(t => t.Id == "ses_reply_test");
+Check(ocToolTask.LatestStep?.StartsWith("Bash") == true, "opencode reply tool guard: tool step is displayed");
+
+const string midTurnFullText = "这是正文写完之后随工具带过来的权威全文，绝不能被丢弃";
+ocReplyCatalog.Accept(H("reply", new { sessionID = "ses_reply_test", text = "这是正文写完...", fullText = midTurnFullText }), ocReplyT0.AddSeconds(4));
+var ocMidTurnTask = ocReplyCatalog.Projection().Tasks.First(t => t.Id == "ses_reply_test");
+Check(ocMidTurnTask.LatestStep?.StartsWith("Bash") == true, "opencode reply tool guard: tool step is NOT overwritten by reply");
+Check(ocMidTurnTask.ResponseBody == midTurnFullText, "opencode reply tool guard: ResponseBody captures fullText even while tool is running");
+
+
 
 // AgyUsageLoader: 解析真实的 agy /usage JSON 输出
 const string sampleAgyQuotaJson = """
@@ -2921,7 +2942,8 @@ Check(purgeAck.Result == ControlResult.Accepted, "claude queue: prompt queued be
 ClaudePromptDispatcher.QueueOrExecute("claude-qp", "没等到的那条", null, isRunning: true);
 Check(ClaudePromptDispatcher.HasQueued("claude-qp"), "claude queue: bridge holds the text before purge");
 purgeCatalog.Accept(C("Stop", new { session_id = "claude-qp" }), purgeT0.AddSeconds(2));
-purgeCatalog.Maintain(purgeT0.AddMinutes(33));
+purgeCatalog.Accept(C("SessionEnd", new { session_id = "claude-qp" }), purgeT0.AddSeconds(3));
+purgeCatalog.Maintain(purgeT0.AddMinutes(34));
 Check(!purgeCatalog.Projection().Tasks.Any(t => t.Id == "claude-qp"), "claude queue: terminal task purged after 30 minutes");
 Check(!ClaudePromptDispatcher.HasQueued("claude-qp"), "claude queue: purge drops the bridge queue");
 
@@ -3041,7 +3063,12 @@ agyPurgeCatalog.Accept(A("PreInvocation", new { conversationId = "agy-qp" }), ag
 agyPurgeCatalog.Perform(Guid.NewGuid(), new ControlPayload("agy-qp", ControlAction.Prompt, "没等到的那条"), new RecordingResolver());
 AgyCliDispatcher.QueueOrExecute("agy-qp", "没等到的那条", null, isRunning: true);
 agyPurgeCatalog.Accept(A("Stop", new { conversationId = "agy-qp" }), agyPurgeT0.AddSeconds(2));
-agyPurgeCatalog.Maintain(agyPurgeT0.AddMinutes(33));
+// 模拟 11 分钟无活动转离线（静默上限 10 分钟）
+agyPurgeCatalog.Maintain(agyPurgeT0.AddMinutes(11));
+Check(agyPurgeCatalog.Projection().Tasks.First(t => t.Id == "agy-qp").Lifecycle == AgentLifecycle.Offline,
+    "agy queue: silent task enters offline");
+// 离线满 30 分钟后（第 42 分钟）被 Normalize 回收并清队列
+agyPurgeCatalog.Maintain(agyPurgeT0.AddMinutes(42));
 Check(!agyPurgeCatalog.Projection().Tasks.Any(t => t.Id == "agy-qp"), "agy queue: terminal task purged after 30 minutes");
 Check(!AgyCliDispatcher.HasQueued("agy-qp"), "agy queue: purge drops the bridge queue");
 
@@ -3387,6 +3414,172 @@ try
 finally
 {
     SystemPower.Starter = prevPowerStarter;
+}
+
+// ===================== 29. 宿主存活离线判定、防翻生与 Prompt 能力规范 =====================
+Console.WriteLine();
+Console.WriteLine("--- 宿主存活离线判定与生命周期规范 ---");
+
+// 1. 防翻生：处于 Offline 的任务，迟到的 session.idle / Stop / reply 绝不得翻生回 Succeeded/Running
+var resurrectCatalog = new TaskCatalog();
+var resT0 = DateTimeOffset.UtcNow;
+// a) OpenCode: dispose 判离线后收到迟到的 session.idle 与 reply
+resurrectCatalog.Accept(H("chat.message", new { sessionID = "oc_res", text = "开工" }), resT0);
+resurrectCatalog.Accept(H("plugin.dispose", new { sessionID = "oc_res" }), resT0.AddSeconds(1));
+Check(resurrectCatalog.Projection().Tasks.First(t => t.Id == "oc_res").Lifecycle == AgentLifecycle.Offline,
+    "resurrect guard: opencode task is offline after dispose");
+resurrectCatalog.Accept(H("session.idle", new { sessionID = "oc_res" }), resT0.AddSeconds(2));
+Check(resurrectCatalog.Projection().Tasks.First(t => t.Id == "oc_res").Lifecycle == AgentLifecycle.Offline,
+    "resurrect guard: late session.idle does NOT resurrect offline task to succeeded");
+resurrectCatalog.Accept(H("reply", new { sessionID = "oc_res", text = "迟到的正文" }), resT0.AddSeconds(3));
+Check(resurrectCatalog.Projection().Tasks.First(t => t.Id == "oc_res").Lifecycle == AgentLifecycle.Offline,
+    "resurrect guard: late reply does NOT touch offline task");
+
+// b) Claude: SessionEnd 判离线后收到迟到的 Stop
+resurrectCatalog.Accept(C("UserPromptSubmit", new { session_id = "cl_res", prompt = "开工" }), resT0);
+resurrectCatalog.Accept(C("SessionEnd", new { session_id = "cl_res" }), resT0.AddSeconds(1));
+Check(resurrectCatalog.Projection().Tasks.First(t => t.Id == "cl_res").Lifecycle == AgentLifecycle.Offline,
+    "resurrect guard: claude task is offline after SessionEnd");
+resurrectCatalog.Accept(C("Stop", new { session_id = "cl_res" }), resT0.AddSeconds(2));
+Check(resurrectCatalog.Projection().Tasks.First(t => t.Id == "cl_res").Lifecycle == AgentLifecycle.Offline,
+    "resurrect guard: late Stop does NOT resurrect offline claude task");
+
+// c) Agy: 离线后收到迟到的 Stop
+resurrectCatalog.Accept(A("PreInvocation", new { conversationId = "agy_res" }), resT0);
+// 模拟 11 分钟无活动被静默判离线
+resurrectCatalog.Maintain(resT0.AddMinutes(11));
+Check(resurrectCatalog.Projection().Tasks.First(t => t.Id == "agy_res").Lifecycle == AgentLifecycle.Offline,
+    "resurrect guard: agy task goes offline after silent timeout");
+resurrectCatalog.Accept(A("Stop", new { conversationId = "agy_res" }), resT0.AddMinutes(12));
+Check(resurrectCatalog.Projection().Tasks.First(t => t.Id == "agy_res").Lifecycle == AgentLifecycle.Offline,
+    "resurrect guard: late Stop does NOT resurrect offline agy task");
+
+// 2. 宿主存活状态下，Succeeded 任务保持在线，永不因 30 分钟无动态被移出面板
+var aliveKeepCatalog = new TaskCatalog();
+var aliveT0 = DateTimeOffset.UtcNow;
+var fakePid = 999988;
+var isHostAlive = true;
+var alivePrevChecker = ClaudeSessionRegistry.ProcessAliveChecker;
+try
+{
+    ClaudeSessionRegistry.ProcessAliveChecker = pid => pid == fakePid ? isHostAlive : alivePrevChecker(pid);
+
+    // a) Claude: 回合跑完进入 Succeeded，宿主活着时，35 分钟后依然在面板且能输入 Prompt
+    aliveKeepCatalog.Accept(C("UserPromptSubmit", new { session_id = "cl_alive", prompt = "算个数" }), aliveT0);
+    aliveKeepCatalog.Accept(C("Stop", new { session_id = "cl_alive" }), aliveT0.AddSeconds(5));
+    Check(aliveKeepCatalog.Projection().Tasks.First(t => t.Id == "cl_alive").Lifecycle == AgentLifecycle.Succeeded,
+        "alive host: claude task is succeeded after turn");
+
+    // 登记宿主 PID
+    ClaudeSessionRegistry.Observe([new ClaudeSessionRegistry.Entry("cl_alive", "test", "derived", "idle", 0, null, fakePid, @"C:\test", "interactive", "cli")]);
+    Check(ClaudeSessionRegistry.HostPidOf("cl_alive") == fakePid, "alive host: host PID recorded");
+
+    // 宿主活着时，35 分钟过去：任务依然在面板（不被 purge），依然是 Succeeded，依然有 Prompt 能力
+    aliveKeepCatalog.Maintain(aliveT0.AddMinutes(35));
+    var clAliveTask = aliveKeepCatalog.Projection().Tasks.FirstOrDefault(t => t.Id == "cl_alive");
+    Check(clAliveTask is not null, "alive host: claude task is NOT purged after 35 minutes while host alive");
+    Check(clAliveTask!.Lifecycle == AgentLifecycle.Succeeded, "alive host: task remains in Succeeded state");
+    Check(clAliveTask.Capabilities.Contains(TaskCapability.Prompt), "alive host: Succeeded task CAN receive prompt while host alive");
+
+    // 宿主前台终端关闭（PID 死亡）
+    isHostAlive = false;
+    aliveKeepCatalog.Maintain(aliveT0.AddMinutes(36));
+    var clDeadTask = aliveKeepCatalog.Projection().Tasks.FirstOrDefault(t => t.Id == "cl_alive");
+    Check(clDeadTask is not null && clDeadTask.Lifecycle == AgentLifecycle.Offline,
+        "alive host: claude task immediately goes Offline when host process dies");
+    Check(!clDeadTask!.Capabilities.Contains(TaskCapability.Prompt),
+        "alive host: Offline task CANNOT receive prompt");
+
+    // 离线满 30 分钟后，才被 Normalize 移出面板
+    aliveKeepCatalog.Maintain(aliveT0.AddMinutes(36).AddMinutes(31));
+    Check(aliveKeepCatalog.Projection().Tasks.All(t => t.Id != "cl_alive"),
+        "alive host: task purged after 30 minutes in Offline state");
+}
+finally
+{
+    ClaudeSessionRegistry.ProcessAliveChecker = alivePrevChecker;
+    ClaudeSessionRegistry.Forget("cl_alive");
+}
+
+// b) OpenCode: 控制通道在线时保持 Succeeded 与 Prompt 能力，通道断开立即转 Offline
+var ocAliveCatalog = new TaskCatalog();
+var ocControlUp = true;
+ocAliveCatalog.HasOpenCodeControl = () => ocControlUp;
+var ocLiveT0 = DateTimeOffset.UtcNow;
+ocAliveCatalog.Accept(H("chat.message", new { sessionID = "oc_live", text = "做个功能" }), ocLiveT0);
+ocAliveCatalog.Accept(H("session.idle", new { sessionID = "oc_live" }), ocLiveT0.AddSeconds(5));
+Check(ocAliveCatalog.Projection().Tasks.First(t => t.Id == "oc_live").Lifecycle == AgentLifecycle.Succeeded,
+    "opencode control: task is succeeded");
+// 控制通道在位，35 分钟过去：不被删除，依然有 Prompt 能力
+ocAliveCatalog.Maintain(ocLiveT0.AddMinutes(35));
+var ocLiveTask = ocAliveCatalog.Projection().Tasks.FirstOrDefault(t => t.Id == "oc_live");
+Check(ocLiveTask is not null && ocLiveTask.Lifecycle == AgentLifecycle.Succeeded,
+    "opencode control: task NOT purged after 35 minutes while control channel up");
+Check(ocLiveTask!.Capabilities.Contains(TaskCapability.Prompt),
+    "opencode control: Succeeded task CAN receive prompt while control up");
+
+// 控制通道断开（前台终端关闭）
+ocControlUp = false;
+ocAliveCatalog.Maintain(ocLiveT0.AddMinutes(36));
+var ocDeadTask = ocAliveCatalog.Projection().Tasks.FirstOrDefault(t => t.Id == "oc_live");
+Check(ocDeadTask is not null && ocDeadTask.Lifecycle == AgentLifecycle.Offline,
+    "opencode control: task immediately goes Offline when control channel disconnects");
+Check(!ocDeadTask!.Capabilities.Contains(TaskCapability.Prompt),
+    "opencode control: Offline task CANNOT receive prompt");
+
+// c) Antigravity: 宿主 PID 在线时保持 Succeeded，35 分钟不被误判离线；宿主 PID 死亡立即转 Offline
+var agyAliveCatalog = new TaskCatalog();
+var agyLiveT0 = DateTimeOffset.UtcNow;
+var agyFakePid = 999977;
+var isAgyHostAlive = true;
+var agyPrevChecker = ClaudeSessionRegistry.ProcessAliveChecker;
+try
+{
+    ClaudeSessionRegistry.ProcessAliveChecker = pid => pid == agyFakePid ? isAgyHostAlive : agyPrevChecker(pid);
+
+    agyAliveCatalog.Accept(new AgyHookPayload(
+        Event: "PreInvocation",
+        ConversationId: "agy_live",
+        HostPid: agyFakePid
+    ), agyLiveT0);
+    var agyRunningTask = agyAliveCatalog.Projection().Tasks.First(t => t.Id == "agy_live");
+    Check(agyRunningTask.Lifecycle == AgentLifecycle.Running, "agy host: task is running");
+    Check(agyRunningTask.Capabilities.Contains(TaskCapability.Prompt), "agy host: running task CAN receive prompt while host alive");
+
+    agyAliveCatalog.Accept(new AgyHookPayload(
+        Event: "Stop",
+        ConversationId: "agy_live",
+        HostPid: agyFakePid
+    ), agyLiveT0.AddSeconds(5));
+    Check(agyAliveCatalog.Projection().Tasks.First(t => t.Id == "agy_live").Lifecycle == AgentLifecycle.Succeeded,
+        "agy host: task is succeeded after turn");
+
+    // 宿主活着时，35 分钟过去：任务依然在面板（不被超时误判离线，不被 purge），依然是 Succeeded；
+    // 按 Stop-pull 模型，完成态收回输入框（无 turn 可 pull，不给假入口）
+    agyAliveCatalog.Maintain(agyLiveT0.AddMinutes(35));
+    var agyLiveTask = agyAliveCatalog.Projection().Tasks.FirstOrDefault(t => t.Id == "agy_live");
+    Check(agyLiveTask is not null && agyLiveTask.Lifecycle == AgentLifecycle.Succeeded,
+        "agy host: task NOT purged after 35 minutes while host PID is alive");
+    Check(!agyLiveTask!.Capabilities.Contains(TaskCapability.Prompt),
+        "agy host: Succeeded task does NOT have prompt capability (pull only while running)");
+
+    // 宿主前台终端关闭（PID 死亡）
+    isAgyHostAlive = false;
+    agyAliveCatalog.Maintain(agyLiveT0.AddMinutes(36));
+    var agyDeadTask = agyAliveCatalog.Projection().Tasks.FirstOrDefault(t => t.Id == "agy_live");
+    Check(agyDeadTask is not null && agyDeadTask.Lifecycle == AgentLifecycle.Offline,
+        "agy host: task immediately goes Offline when host PID dies");
+    Check(!agyDeadTask!.Capabilities.Contains(TaskCapability.Prompt),
+        "agy host: Offline task CANNOT receive prompt");
+
+    // 离线满 30 分钟后，才被 Normalize 移出面板
+    agyAliveCatalog.Maintain(agyLiveT0.AddMinutes(36).AddMinutes(31));
+    Check(agyAliveCatalog.Projection().Tasks.All(t => t.Id != "agy_live"),
+        "agy host: task purged after 30 minutes in Offline state");
+}
+finally
+{
+    ClaudeSessionRegistry.ProcessAliveChecker = agyPrevChecker;
 }
 
 Console.WriteLine(failures.Count == 0 ? "ALL CHECKS PASSED" : $"FAILURES: {string.Join(", ", failures)}");

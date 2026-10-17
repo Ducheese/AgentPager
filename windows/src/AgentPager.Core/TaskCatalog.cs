@@ -109,6 +109,9 @@ public sealed class TaskCatalog
     private readonly Dictionary<string, QuestionProgress> _questionProgress = new(StringComparer.Ordinal);
     // Antigravity：会话 → 工作区目录（hook.WorkspacePaths[0]）。
     private readonly Dictionary<string, string> _agyWorkspaces = new(StringComparer.Ordinal);
+    // Antigravity：宿主进程 PID（hook.HostPid）与曾见过的会话集合（用于根据宿主存活判定在线与立即离线）。
+    private readonly Dictionary<string, int> _agyHostPids = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _agyHostSeen = new(StringComparer.Ordinal);
 
     /// <summary>逐题推进状态：当前第几题 + 已收集的答案（按题序）。</summary>
     private sealed record QuestionProgress(int Index, List<QuestionAnswer> Answers);
@@ -137,6 +140,8 @@ public sealed class TaskCatalog
     private readonly Dictionary<string, DateTimeOffset> _waitingSince = new(StringComparer.Ordinal);
     private readonly int _capacity;
     private ulong _revision;
+
+    private readonly HashSet<string> _openCodeControlSeen = new(StringComparer.Ordinal);
 
     public Func<bool>? HasOpenCodeControl { get; set; }
     public Func<Dictionary<string, ClaudeSessionRegistry.Entry>>? ClaudeRegistryScanner { get; set; }
@@ -181,7 +186,7 @@ public sealed class TaskCatalog
     {
         if (_requests.ContainsKey(task.Id)) return false;
         if (task.Lifecycle is AgentLifecycle.WaitingApproval or AgentLifecycle.WaitingAnswer) return false;
-        if (task.Lifecycle is AgentLifecycle.Offline or AgentLifecycle.Interrupted) return false;
+        if (task.Lifecycle == AgentLifecycle.Offline) return false;
 
         switch (task.Source)
         {
@@ -199,7 +204,12 @@ public sealed class TaskCatalog
                        ClaudeSessionRegistry.ProcessAliveChecker(hostPid);
 
             case AgentSource.Antigravity:
-                return task.Lifecycle == AgentLifecycle.Running;
+                // agy 采用 Stop-pull 模型在同进程内无缝续跑：仅运行中（非完成态）开放追加排队；
+                // 完成态下终端已停在提示符，无 turn 可 pull，不给假入口。
+                if (task.Lifecycle != AgentLifecycle.Running) return false;
+                if (_agyHostPids.TryGetValue(task.Id, out var agyHostPid))
+                    return ClaudeSessionRegistry.ProcessAliveChecker(agyHostPid);
+                return true;
 
             default:
                 return false;
@@ -711,11 +721,7 @@ public sealed class TaskCatalog
         var now = receivedAt ?? DateTimeOffset.UtcNow;
         var sessionID = OpenCodeEventReducer.SessionID(hook);
         if (sessionID is null) return false;
-        // 乱序残帧守卫：工具 part 处于 pending/running 期间，reply 一律丢弃。
-        // 状态判定不依赖 activity，覆盖 todowrite 类 thinking 工具；不做时间窗，
-        // 避免“工具结束后 1 秒内的合法短终稿被吞”（乱序残帧源头拦截由插件 v8 结束帧守卫负责）。
-        if (hook.Event == "reply" && _openCodeToolActive.Contains(sessionID))
-            return false;
+        // 维护工具活动状态（pending/running 时记入集合，否则移除）
         if (hook.Event == "message.part.updated" && OpenCodeEventReducer.ToolPartStatus(hook.Properties) is { } partStatus)
         {
             if (partStatus is "pending" or "running") _openCodeToolActive.Add(sessionID);
@@ -739,7 +745,8 @@ public sealed class TaskCatalog
         //     行改由 chat.message 建，那时提示词、标题都已在手。
         if (existing is null && hook.Event is "plugin.dispose" or "session.deleted" or "subagent" or "session.created") return false;
 
-        Upsert(OpenCodeEventReducer.Reduce(hook, existing, now, _openCodeDirectories.GetValueOrDefault(sessionID)));
+        var isToolActive = _openCodeToolActive.Contains(sessionID);
+        Upsert(OpenCodeEventReducer.Reduce(hook, existing, now, _openCodeDirectories.GetValueOrDefault(sessionID), isToolActive));
         switch (hook.Event)
         {
             case "permission.asked":
@@ -808,6 +815,17 @@ public sealed class TaskCatalog
 
         if (hook.WorkspacePaths is { Length: > 0 } paths && !string.IsNullOrWhiteSpace(paths[0]))
             _agyWorkspaces[sessionID] = paths[0];
+
+        if (hook.HostPid is { } rawPid && rawPid > 0)
+        {
+            var hostPid = AgyProcessResolver.ResolveHostPid(rawPid);
+            if (!_agyHostPids.TryGetValue(sessionID, out var incumbent) ||
+                incumbent == hostPid ||
+                !ClaudeSessionRegistry.ProcessAliveChecker(incumbent))
+            {
+                _agyHostPids[sessionID] = hostPid;
+            }
+        }
 
         // 1. 查询会话元数据（SQLite，mtime 门控缓存，A2）：会话真实标题与父会话 ID
         var dbInfo = LookupAgyConversation(sessionID);
@@ -1466,7 +1484,8 @@ public sealed class TaskCatalog
 
         foreach (var task in claude)
         {
-            if (task.IsTerminal || task.Lifecycle == AgentLifecycle.Offline) continue;
+            if (task.Lifecycle == AgentLifecycle.Offline) continue;
+            if (task.Subagents.Any(child => !child.IsTerminal)) continue;   // 还在等子代理的父任务不算死（与 OpenCode 对齐）
 
             if (registry.ContainsKey(task.Id))
             {
@@ -1483,6 +1502,7 @@ public sealed class TaskCatalog
             else if (_claudeRegistrySeen.Contains(task.Id) ||
                      now - task.UpdatedAt > TimeSpan.FromMinutes(10))
             {
+                _claudeRegistrySeen.Remove(task.Id);
                 // 会话没了，挂起卡也随之失效：不清的话手机会永久留一张点不动的卡
                 // （权限挂起中被杀 = 死会话带死卡）。
                 DropClaudeRequest(task.Id);
@@ -1663,17 +1683,38 @@ public sealed class TaskCatalog
         {
             var task = _tasks[i];
             if (task.Source is not (AgentSource.Antigravity or AgentSource.OpenCode)) continue;
-            if (task.IsTerminal || task.Lifecycle == AgentLifecycle.Offline) continue;
+            if (task.Lifecycle == AgentLifecycle.Offline) continue;
             if (task.Subagents.Any(child => !child.IsTerminal)) continue;   // 还在等子代理的父任务不算死
 
-            // 静默判据分两档：空闲态 10 分钟；**工具运行中**给到 30 分钟。
-            // 后者是给长命令留的余地（opencode 那条"跑着工具不算静默"的断言就是为长构建立的），
-            // 但**必须有上限**——死在工具中途的会话活动位永远停在 executing，
-            // 无上限就被永久豁免（实测三行僵尸挂了一个多小时）。
-            var silentLimit = task.Activity is null or AgentActivity.Thinking
-                ? TimeSpan.FromMinutes(10)
-                : TimeSpan.FromMinutes(30);
-            if (now - task.UpdatedAt <= silentLimit) continue;
+            if (task.Source == AgentSource.OpenCode)
+            {
+                if (HasOpenCodeControl?.Invoke() == true)
+                {
+                    _openCodeControlSeen.Add(task.Id);
+                    continue;
+                }
+                var silentLimit = task.Activity is null or AgentActivity.Thinking
+                    ? TimeSpan.FromMinutes(10)
+                    : TimeSpan.FromMinutes(30);
+                if (!_openCodeControlSeen.Contains(task.Id) && now - task.UpdatedAt <= silentLimit)
+                    continue;
+                _openCodeControlSeen.Remove(task.Id);
+            }
+            else
+            {
+                if (_agyHostPids.TryGetValue(task.Id, out var agyPid) && ClaudeSessionRegistry.ProcessAliveChecker(agyPid))
+                {
+                    _agyHostSeen.Add(task.Id);
+                    continue;
+                }
+                var silentLimit = task.Activity is null or AgentActivity.Thinking
+                    ? TimeSpan.FromMinutes(10)
+                    : TimeSpan.FromMinutes(30);
+                if (!_agyHostSeen.Contains(task.Id) && now - task.UpdatedAt <= silentLimit)
+                    continue;
+                _agyHostSeen.Remove(task.Id);
+                _agyHostPids.Remove(task.Id);
+            }
 
             // 判死的会话不该再留着可点的卡片（提问/审批都撤掉），否则手机会一直摆着一张点不动的卡。
             _requests.Remove(task.Id);
@@ -2134,7 +2175,7 @@ public sealed class TaskCatalog
         bool IsPurged(TaskSnapshot task) =>
             task.Id.StartsWith("agentgrid-", StringComparison.Ordinal) && now - task.UpdatedAt >= TimeSpan.FromMinutes(1) ||
             task.Lifecycle == AgentLifecycle.Offline && task.UserPrompt is null && task.Subagents.Count == 0 && now - task.UpdatedAt >= TimeSpan.FromMinutes(1) ||
-            task.IsTerminal && now - (task.CompletedAt ?? task.UpdatedAt) > TimeSpan.FromMinutes(30);
+            task.Lifecycle == AgentLifecycle.Offline && now - task.UpdatedAt > TimeSpan.FromMinutes(30);
         // 任务回收时连桥端队列一起清（claude 同款；排队文本只活在 dispatcher 内存里，
         // 任务没了就不可能再被 pull，不清会留下僵尸条目）。
         foreach (var victim in _tasks.Where(task => task.Source is AgentSource.ClaudeCode or AgentSource.Antigravity && IsPurged(task)).ToList())
@@ -2193,6 +2234,8 @@ public sealed class TaskCatalog
         // 以及**被裁任务的挂起卡仍留在 _requests 里**（projection 会把它当幽灵卡片发出去）。
         var live = _tasks.Select(task => task.Id).ToHashSet(StringComparer.Ordinal);
         _claudeRegistrySeen.RemoveWhere(id => !live.Contains(id));
+        _agyHostSeen.RemoveWhere(id => !live.Contains(id));
+        PruneSessionMap(_agyHostPids, live);
         PruneSessionMap(_openCodeDirectories, live);
         PruneSessionMap(_claudeQueuedText, live);
         PruneSessionMap(_claudeTranscripts, live);
@@ -2669,8 +2712,9 @@ public static class ClaudeEventReducer
             case "SessionEnd":
                 return task with
                 {
-                    Lifecycle = task.IsTerminal ? task.Lifecycle : AgentLifecycle.Offline,
+                    Lifecycle = AgentLifecycle.Offline,
                     Activity = null,
+                    UpdatedAt = now,
                     CompletedAt = task.IsTerminal ? task.CompletedAt : (task.CompletedAt ?? now),
                     // 进程退出后不会再有子代理事件，未终态的残留行级联扫为 interrupted。
                     Subagents = SubagentSweep.Finalize(task.Subagents),
@@ -2706,6 +2750,7 @@ public static class ClaudeEventReducer
     private static TaskSnapshot Stop(
         TaskSnapshot task, ClaudeHookPayload hook, ClaudeTranscriptSnapshot? transcript, DateTimeOffset now)
     {
+        if (task.Lifecycle == AgentLifecycle.Offline) return task;
         var interrupted = task.Lifecycle == AgentLifecycle.Interrupted;
         // 转录本那条要过"属于本轮"的闸；过不了就退回 payload 自带的终稿（它一定是本轮的）。
         // **别改成"宽松口径"**：Stop 存在"终稿还没落盘"的竞态，宽松口径会一路往回捞到**更早**的一段
@@ -3113,7 +3158,7 @@ public static class OpenCodeEventReducer
         return state is { } current ? Text(current, "status") : null;
     }
 
-    public static TaskSnapshot Reduce(OpenCodeHookPayload hook, TaskSnapshot? existing, DateTimeOffset now, string? workspaceRoot = null)
+    public static TaskSnapshot Reduce(OpenCodeHookPayload hook, TaskSnapshot? existing, DateTimeOffset now, string? workspaceRoot = null, bool isToolActive = false)
     {
         var sessionID = SessionID(hook) ?? existing?.Id ?? "opencode";
         // 行现在由 chat.message 建（session.created 不再建行），而 chat.message 不带目录 ——
@@ -3143,8 +3188,9 @@ public static class OpenCodeEventReducer
             case "session.deleted":
                 return task with
                 {
-                    Lifecycle = task.IsTerminal ? task.Lifecycle : AgentLifecycle.Offline,
+                    Lifecycle = AgentLifecycle.Offline,
                     Activity = null,
+                    UpdatedAt = now,
                     CompletedAt = task.IsTerminal ? task.CompletedAt : (task.CompletedAt ?? now),
                     // 退出/删除时未终态的子代理不会再有子会话事件（随进程一起消失），
                     // 级联扫为 interrupted，防永久 Running 行残留并落盘（O3）。
@@ -3174,18 +3220,23 @@ public static class OpenCodeEventReducer
             case "message.part.updated":
                 return PartUpdated(task, hook.Properties, workspaceRoot);
             case "reply":
-                // 正文预览（插件从 assistant text part 节流转发）：只更新第三行，不动生命周期；
-                // 等待用户输入期间忽略（迟到正文不盖掉问题/批准卡片的标题）。
-                if (task.Lifecycle is AgentLifecycle.WaitingApproval or AgentLifecycle.WaitingAnswer) return task;
-                // 工具活动期间忽略：正文结束帧可能晚于工具 part 约 200ms（实测乱序），
-                // 不拦会把刚写入的命令/工具步骤盖回上一段正文。
-                if (task.Activity is not null and not AgentActivity.Thinking) return task;
-                var preview = Text(hook.Properties, "text");
+                // 正文预览（插件从 assistant text part 节流转发）：只更新正文与第三行，不动生命周期；
+                // 等待用户输入期间与离线期间忽略（迟到正文不盖掉问题/批准卡片的标题，也不复活离线行）。
+                if (task.Lifecycle is AgentLifecycle.WaitingApproval or AgentLifecycle.WaitingAnswer or AgentLifecycle.Offline) return task;
+
+                // 1. 权威全文入库：无论工具是否活动，ResponseBody 必须收录完整正文，绝不丢字
                 var fullText = RawText(hook.Properties, "fullText") ?? RawText(hook.Properties, "text");
                 if (fullText is not null)
                 {
                     task = task with { ResponseBody = fullText.Trim() };
                 }
+
+                // 2. 第三行步骤保护：当工具正在活动（isToolActive 或 Activity 非 Thinking）时，
+                // 必须保护当前正在执行的工具步骤（如 Bash npm test、Edit app.js），绝不能被迟到的正文预览覆盖
+                if (isToolActive || (task.Activity is not null and not AgentActivity.Thinking))
+                    return task;
+
+                var preview = Text(hook.Properties, "text");
                 return preview is not null ? WithStep(task, Clamp(preview, 220)) : task;
             case "permission.asked":
                 return task with
@@ -3227,8 +3278,9 @@ public static class OpenCodeEventReducer
             case "plugin.dispose":
                 return task with
                 {
-                    Lifecycle = task.IsTerminal ? task.Lifecycle : AgentLifecycle.Offline,
+                    Lifecycle = AgentLifecycle.Offline,
                     Activity = null,
+                    UpdatedAt = now,
                     CompletedAt = task.IsTerminal ? task.CompletedAt : (task.CompletedAt ?? now),
                     Subagents = SubagentSweep.Finalize(task.Subagents),
                     Capabilities = [],
@@ -3337,7 +3389,7 @@ public static class OpenCodeEventReducer
 
     private static TaskSnapshot Idle(TaskSnapshot task, DateTimeOffset now)
     {
-        if (task.Lifecycle == AgentLifecycle.Interrupted) return task;
+        if (task.Lifecycle is AgentLifecycle.Interrupted or AgentLifecycle.Offline) return task;
         return task with
         {
             Lifecycle = AgentLifecycle.Succeeded,
@@ -3350,6 +3402,7 @@ public static class OpenCodeEventReducer
 
     private static TaskSnapshot Failed(TaskSnapshot task, string? step, DateTimeOffset now)
     {
+        if (task.Lifecycle == AgentLifecycle.Offline) return task;
         var next = task with
         {
             Lifecycle = AgentLifecycle.Interrupted,

@@ -159,6 +159,22 @@ await flush()
 const finalReply = events("reply").at(-1)
 check(finalReply?.payload?.properties?.fullText === streamFull, "throttled tail emitted via final updated frame (v19 fix)")
 
+// 4b. Trailing Edge 定时器（v22）：若流式在节流窗口内突然停顿（无结束帧），300ms 后自动补发
+await emit("message.part.updated", { part: { id: "prt_trailing_test", sessionID: "ses_t", messageID: "msg_1", type: "text", text: "" } })
+await emit("message.part.delta", { sessionID: "ses_t", messageID: "msg_1", partID: "prt_trailing_test", field: "text", delta: "开头字" })
+await flush()
+const countAfterFirst = events("reply").length
+// 立即送入第二块（冷却期内）
+await emit("message.part.delta", { sessionID: "ses_t", messageID: "msg_1", partID: "prt_trailing_test", field: "text", delta: ">>> 停顿尾巴" })
+await flush()
+// 此时未到 300ms 且无结束帧，未立即发出
+check(events("reply").length === countAfterFirst, "trailing chunk throttled immediately")
+// 等待 350ms，定时器自动 Flush
+await new Promise(r => setTimeout(r, 350))
+await flush()
+const trailingReply = events("reply").at(-1)
+check(trailingReply?.payload?.properties?.fullText === "开头字>>> 停顿尾巴", "trailing edge timer flushed accumulated text after 300ms (v22 fix)")
+
 // 5. 子会话被删除必须先补终态（v9）：旧实现只删映射不发信号，桥上那条子代理行会永远 running
 await emit("session.created", { info: { id: "ses_child", parentID: "ses_t", title: "explore (@explore subagent)" } })
 await flush()

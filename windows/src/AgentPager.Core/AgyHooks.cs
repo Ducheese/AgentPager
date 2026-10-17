@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -22,7 +23,8 @@ public sealed record AgyHookPayload(
     [property: JsonPropertyName("toolCall")] AgyToolCall? ToolCall = null,
     [property: JsonPropertyName("terminationReason")] string? TerminationReason = null,
     [property: JsonPropertyName("error")] string? Error = null,
-    [property: JsonPropertyName("pullPrompt")] bool? PullPrompt = null)
+    [property: JsonPropertyName("pullPrompt")] bool? PullPrompt = null,
+    [property: JsonPropertyName("hostPid")] int? HostPid = null)
 {
     [JsonIgnore]
     public string EffectiveEvent => Event ?? HookEventName ?? "Unknown";
@@ -647,6 +649,7 @@ public static class AgyEventReducer
                 // 和转录本复写守卫（`!task.PromptQueued` 才覆写 UserPrompt）：这里提前清掉，
                 // 跟进回合会把排队文本误判成真新回合（计时重置 + 第二行被旧提示词顶掉）。
                 // 无排队时照旧清零（与旧行为一致）。
+                if (task.Lifecycle == AgentLifecycle.Offline) return task;
                 var keepQueued = task.PromptQueued && AgyCliDispatcher.HasQueued(sessionID);
                 return task with
                 {
@@ -1175,3 +1178,80 @@ public sealed class AgyHookConfiguration(string? configDirectory = null)
 
     private static string? Normalize(string? value) => value?.Replace("\r\n", "\n").Trim();
 }
+
+public static class AgyProcessResolver
+{
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
+    private struct PROCESSENTRY32
+    {
+        public uint dwSize;
+        public uint cntUsage;
+        public uint th32ProcessID;
+        public IntPtr th32DefaultHeapID;
+        public uint th32ModuleID;
+        public uint cntThreads;
+        public uint th32ParentProcessID;
+        public int pcPriClassBase;
+        public uint dwFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string szExeFile;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+    private static extern IntPtr CreateToolhelp32Snapshot(uint dwFlags, uint th32ProcessID);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+    private static extern bool Process32First(IntPtr hSnapshot, ref PROCESSENTRY32 lppe);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+    private static extern bool Process32Next(IntPtr hSnapshot, ref PROCESSENTRY32 lppe);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr hObject);
+
+    private const uint TH32CS_SNAPPROCESS = 0x00000002;
+
+    public static int ResolveHostPid(int startPid)
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return startPid;
+        try
+        {
+            var snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (snapshot == IntPtr.Zero || snapshot == new IntPtr(-1)) return startPid;
+
+            var parentMap = new Dictionary<uint, (uint ParentId, string Name)>();
+            try
+            {
+                var entry = new PROCESSENTRY32 { dwSize = (uint)Marshal.SizeOf<PROCESSENTRY32>() };
+                if (Process32First(snapshot, ref entry))
+                {
+                    do
+                    {
+                        parentMap[entry.th32ProcessID] = (entry.th32ParentProcessID, entry.szExeFile);
+                    }
+                    while (Process32Next(snapshot, ref entry));
+                }
+            }
+            finally
+            {
+                CloseHandle(snapshot);
+            }
+
+            var curr = (uint)startPid;
+            for (var depth = 0; depth < 5; depth++)
+            {
+                if (!parentMap.TryGetValue(curr, out var info)) break;
+                if (info.Name.StartsWith("agy", StringComparison.OrdinalIgnoreCase))
+                    return (int)curr;
+                curr = info.ParentId;
+            }
+
+            return startPid;
+        }
+        catch
+        {
+            return startPid;
+        }
+    }
+}
+
