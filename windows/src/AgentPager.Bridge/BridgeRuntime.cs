@@ -19,7 +19,10 @@ public sealed record BridgeViewState(
     List<NetworkAddressOption> Networks,
     int TaskCount,
     string AgyHookText = "未安装",
-    AntigravityPluginStatus AgyHookState = AntigravityPluginStatus.NotInstalled);
+    AntigravityPluginStatus AgyHookState = AntigravityPluginStatus.NotInstalled,
+    string TunnelStatusText = "未启动",
+    NgrokTunnelStatus TunnelStatus = NgrokTunnelStatus.Stopped,
+    string? ActiveTunnelHost = null);
 
 public sealed class BridgeRuntime : IAsyncDisposable
 {
@@ -57,6 +60,8 @@ public sealed class BridgeRuntime : IAsyncDisposable
     private readonly ReplayGuard _replayGuard = new();
     private readonly byte[] _pairingSecret;
     private readonly TaskCatalog _catalog;
+    private readonly NgrokTunnelService _ngrokService;
+    private string _tunnelStatusText = "未启动";
     private HookTcpServer? _hookServer;
     private LanBridgeServer? _lanServer;
     private CancellationTokenSource? _linkedCancellation;
@@ -84,6 +89,18 @@ public sealed class BridgeRuntime : IAsyncDisposable
         _commandCodeUsageLoader.Log = _log.Write;
         _pairingSecret = new PairingSecretStore().LoadOrCreate();
         _catalog = new(_persistence.Load());
+        _ngrokService = new(
+            _log,
+            host =>
+            {
+                _log.Write("INFO", $"已获取 ngrok 公网域名：{host}");
+                PublishState();
+            },
+            (status, msg) =>
+            {
+                _tunnelStatusText = msg ?? status.ToString();
+                PublishState();
+            });
         // 桥端排队文本是纯内存，重启会丢——随任务一起持久化，这里恢复
         // （超 TTL 的在导入时直接丢弃；徽章由 Maintain 的自愈补回）。
         ClaudePromptDispatcher.ImportQueues(_queuePersistence.Load(), _log.Write);
@@ -112,11 +129,16 @@ public sealed class BridgeRuntime : IAsyncDisposable
             _hookServer.Start();
             _lanServer = new(
                 PairingText,
+                Authorize,
                 SnapshotText,
                 text => _events.Writer.WriteAsync(new ControlEvent(text), token).AsTask(),
                 count => _events.Writer.TryWrite(new PhoneCountEvent(count)),
                 _log);
             await _lanServer.StartAsync(token);
+            if (Settings.EnableNgrokTunnel)
+            {
+                _ = _ngrokService.StartAsync();
+            }
             _serviceStatus = "局域网服务运行中";
             _log.Write("INFO", "Bridge 服务已启动。");
         }
@@ -276,6 +298,39 @@ public sealed class BridgeRuntime : IAsyncDisposable
         Settings.Save();
         PublishState();
     }
+
+    /// <summary>
+    /// 配对外网隧道域名。手机连不上局域网地址时会改走 wss://这个域名/agentgrid。
+    /// </summary>
+    public void SetTunnelHost(string? host)
+    {
+        // 存原样（只 trim），清洗留到生成配对文本时做。边打字边洗会把用户正在输的
+        // "https://x" 中途截成 "https"，回写进输入框看着就像自己把字吃了。
+        var value = host?.Trim();
+        if (string.IsNullOrEmpty(value)) value = null;
+        if (Settings.TunnelHost == value) return;
+        Settings.TunnelHost = value;
+        Settings.SaveQuietly();
+        PublishState();
+    }
+
+    /// <summary>
+    /// 启停内置 ngrok 隧道托管。
+    /// </summary>
+    public void SetEnableNgrokTunnel(bool enabled)
+    {
+        if (Settings.EnableNgrokTunnel == enabled) return;
+        Settings.EnableNgrokTunnel = enabled;
+        Settings.Save();
+        if (enabled) _ = _ngrokService.StartAsync();
+        else _ = _ngrokService.StopAsync();
+        PublishState();
+    }
+
+    /// <summary>
+    /// WebSocket 握手鉴权。走隧道时端口挂在公网上，没这道门谁拿到域名都能连上收走全部快照。
+    /// </summary>
+    private bool Authorize(string? provided) => PairingSecret.Matches(_pairingSecret, provided);
 
     public void RefreshNetworks()
     {
@@ -555,13 +610,21 @@ public sealed class BridgeRuntime : IAsyncDisposable
         if (_lanServer is not null) _ = _lanServer.BroadcastAsync(SnapshotText());
     }
 
+    private string? EffectiveTunnelHost()
+    {
+        if (Settings.EnableNgrokTunnel && !string.IsNullOrEmpty(_ngrokService.ActiveHost))
+            return _ngrokService.ActiveHost;
+        return Settings.TunnelHost;
+    }
+
     private string PairingText() =>
         JsonSerializer.Serialize(new PairingPayload(
             1,
             $"agentgrid-{Environment.MachineName}",
             _selectedAddress,
             49362,
-            Convert.ToBase64String(_pairingSecret)), WireJson.Options);
+            Convert.ToBase64String(_pairingSecret),
+            PairingPayload.NormalizeTunnelHost(EffectiveTunnelHost())), WireJson.Options);
 
     private string SnapshotText()
     {
@@ -626,7 +689,10 @@ public sealed class BridgeRuntime : IAsyncDisposable
             _networks,
             _catalog.Projection().Tasks.Count,
             agyText,
-            agyStatus);
+            agyStatus,
+            _tunnelStatusText,
+            _ngrokService.Status,
+            _ngrokService.ActiveHost);
     }
 
     private void PublishState()
@@ -642,6 +708,7 @@ public sealed class BridgeRuntime : IAsyncDisposable
         if (_usageTask is not null) try { await _usageTask; } catch (OperationCanceledException) { }
         if (_hookServer is not null) await _hookServer.DisposeAsync();
         if (_lanServer is not null) await _lanServer.DisposeAsync();
+        await _ngrokService.DisposeAsync();
         _events.Writer.TryComplete();
         if (_eventTask is not null) try { await _eventTask; } catch (OperationCanceledException) { }
         _linkedCancellation?.Dispose();

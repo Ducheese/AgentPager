@@ -111,6 +111,10 @@ internal interface PhoneCredentialStore {
 internal data class PhoneEndpoint(
     val host: String,
     val port: Int,
+    /** 走 wss 而不是 ws —— 隧道那头是 443/TLS。 */
+    val secure: Boolean = false,
+    /** 握手要带的配对密钥（桥用 X-AgentGrid-Secret 校验），局域网也带。 */
+    val secret: String? = null,
 )
 
 internal sealed interface TransportEvent {
@@ -155,6 +159,9 @@ internal class DefaultPhoneSession(
     private var stopped = false
     private var retryCount = 0
     private var reconnectJob: Job? = null
+    /** 候选地址：局域网在前、隧道在后。连不上就轮换到下一个（见 disconnectAndRetryLocked）。 */
+    private var endpoints: List<PhoneEndpoint> = emptyList()
+    private var endpointIndex = 0
     private var lastSnapshotSentAt = Long.MIN_VALUE
     private var lastSnapshotMessageID: String? = null
     private val timeoutJobs = mutableMapOf<String, Job>()
@@ -217,6 +224,9 @@ internal class DefaultPhoneSession(
             transport.disconnect()
             pairing = decoded
             retryCount = 0
+            // 重新配对等于重新开始：候选从头走（能扫到码就说明人在局域网里）
+            endpoints = emptyList()
+            endpointIndex = 0
             mutableState.value = PhoneSessionState(
                 pairing = decoded.summary,
                 link = LinkState.CONNECTING,
@@ -329,8 +339,14 @@ internal class DefaultPhoneSession(
                 }
 
                 is TransportEvent.TextReceived -> acceptMessageLocked(event.text)
-                is TransportEvent.Closed -> disconnectAndRetryLocked()
-                is TransportEvent.Failed -> disconnectAndRetryLocked()
+                // 断连说明这个地址本来是通的，保持不动；只有连不上（初始握手阶段）才换候选。
+                is TransportEvent.Closed -> disconnectAndRetryLocked(advanceEndpoint = false)
+                is TransportEvent.Failed -> {
+                    // 若断开前已经是 CONNECTED 状态，说明当前端点本是可达的，移动网络抖动/切基站/丢包重连不应轮换端点；
+                    // 仅当从未连上（初次握手阶段失败）时才轮换下一个候选端点。
+                    val wasConnected = mutableState.value.link == LinkState.CONNECTED
+                    disconnectAndRetryLocked(advanceEndpoint = !wasConnected)
+                }
             }
         }
     }
@@ -398,16 +414,48 @@ internal class DefaultPhoneSession(
     }
 
     private fun connectLocked(value: PairingPayload) {
+        val candidates = endpointsFor(value)
+        // 配对没变时保留轮换位置（重连要接着上次的候选走，不能每次都退回局域网）。
+        if (endpoints != candidates) {
+            endpoints = candidates
+            endpointIndex = 0
+        }
         mutableState.value = mutableState.value.copy(link = LinkState.CONNECTING)
-        transport.connect(PhoneEndpoint(value.host, value.port))
+        transport.connect(endpoints[endpointIndex])
     }
 
-    private fun disconnectAndRetryLocked() {
+    /**
+     * 候选地址：局域网优先，配了隧道域名就再挂一个 wss://域名:443。
+     * 在家连局域网、出门自动落到隧道，不需要人手动切。
+     */
+    private fun endpointsFor(value: PairingPayload): List<PhoneEndpoint> {
+        val local = PhoneEndpoint(value.host, value.port, secret = value.secret)
+        val tunnel = tunnelHostOf(value)
+            ?.let { PhoneEndpoint(it, 443, secure = true, secret = value.secret) }
+        return if (tunnel == null) listOf(local) else listOf(local, tunnel)
+    }
+
+    /**
+     * 桥那边已经洗过一遍了，但配对文本可能是手改过的，这里再洗一次：
+     * 粘整段 https://xxx.ngrok-free.dev/ 进来是常态，不洗会拼出废 URL。
+     */
+    private fun tunnelHostOf(value: PairingPayload): String? {
+        val raw = value.tunnelHost?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        val host = raw.substringAfter("://").substringBefore('/').substringBefore(':').trim()
+        return host.takeIf { it.isNotEmpty() }
+    }
+
+    private fun disconnectAndRetryLocked(advanceEndpoint: Boolean) {
         mutableState.value = mutableState.value.copy(
             link = LinkState.DISCONNECTED,
             problem = PhoneSessionProblem.TransportFailure,
         )
         if (stopped || pairing == null || reconnectJob?.isActive == true) return
+        // 连不上就换下一个候选：局域网不通试隧道，隧道不通再试回局域网。
+        // 只在"根本没连上"时换 —— 断连（连上过又掉）保持原地址，否则在家待着也会漂到隧道去。
+        if (advanceEndpoint && endpoints.size > 1) {
+            endpointIndex = (endpointIndex + 1) % endpoints.size
+        }
         val exponent = minOf(retryCount++, 5)
         val waitMillis = minOf(30_000L, 1_000L shl exponent)
         reconnectJob = scope.launch {

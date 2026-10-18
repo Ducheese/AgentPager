@@ -1,3 +1,5 @@
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -132,7 +134,31 @@ public sealed record PairingPayload(
     string ServiceID,
     string Host,
     ushort Port,
-    string Secret);
+    string Secret,
+    /// <summary>
+    /// 外网隧道域名（ngrok 之类），手机在局域网地址连不上时改用它走 wss。
+    /// 只填域名，不带协议、不带端口 —— 隧道一律按 443/wss。留空即不启用外网。
+    /// </summary>
+    string? TunnelHost = null)
+{
+    /// <summary>
+    /// 隧道域名清洗：整段粘 https://xxx.ngrok-free.dev/ 进来是常态，统一洗成裸域名，
+    /// 免得手机那边拼出 wss://https://... 这种废 URL。空白或洗不出东西返回 null。
+    /// </summary>
+    public static string? NormalizeTunnelHost(string? host)
+    {
+        var value = host?.Trim();
+        if (string.IsNullOrEmpty(value)) return null;
+        var scheme = value.IndexOf("://", StringComparison.Ordinal);
+        if (scheme >= 0) value = value[(scheme + 3)..];
+        var slash = value.IndexOf('/');
+        if (slash >= 0) value = value[..slash];
+        var colon = value.IndexOf(':');
+        if (colon >= 0) value = value[..colon];
+        value = value.Trim();
+        return value.Length == 0 ? null : value;
+    }
+}
 
 public sealed record ControlPayload(
     string TaskID,
@@ -166,6 +192,23 @@ public sealed record MessageEnvelope<T>(
 {
     public static MessageEnvelope<T> Create(string type, T payload) =>
         new(1, Guid.NewGuid(), type, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), payload);
+}
+
+/// <summary>
+/// 配对密钥的比对规则。桥在 WebSocket 握手上验它，手机把配对文本里的 Base64 串原样带过来。
+/// </summary>
+public static class PairingSecret
+{
+    /// <summary>
+    /// 定长比对，避免用比较耗时反推密钥。长度不同直接判否（FixedTimeEquals 不会抛）。
+    /// </summary>
+    public static bool Matches(byte[] secret, string? provided)
+    {
+        if (string.IsNullOrEmpty(provided)) return false;
+        return CryptographicOperations.FixedTimeEquals(
+            Encoding.UTF8.GetBytes(provided),
+            Encoding.UTF8.GetBytes(Convert.ToBase64String(secret)));
+    }
 }
 
 public static class WireJson

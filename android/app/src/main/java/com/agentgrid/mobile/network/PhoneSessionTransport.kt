@@ -15,18 +15,36 @@ internal class OkHttpPhoneSessionTransport : PhoneSessionTransport {
     private val httpClient = OkHttpClient.Builder()
         .pingInterval(20, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
+        // 连不上局域网时要尽快失败，好切到隧道；默认 10 秒太久，出门在外每次重连都白等。
+        .connectTimeout(5, TimeUnit.SECONDS)
         .build()
 
+    @Volatile
     private var socket: WebSocket? = null
+    @Volatile
     private var generation = 0L
+
+    private companion object {
+        /** 与桥的 LanBridgeServer.SecretHeader 对齐，改一处必须改两处。 */
+        const val SECRET_HEADER = "X-AgentGrid-Secret"
+        /** 彻底绕过 ngrok 免费域名的浏览器拦截提示页面。 */
+        const val NGROK_SKIP_WARNING_HEADER = "ngrok-skip-browser-warning"
+    }
 
     override fun connect(endpoint: PhoneEndpoint) {
         generation += 1
         val currentGeneration = generation
         socket?.cancel()
         val request = runCatching {
+            val scheme = if (endpoint.secure) "wss" else "ws"
+            val defaultPort = if (endpoint.secure) 443 else 80
+            val authority =
+                if (endpoint.port == defaultPort) endpoint.host else "${endpoint.host}:${endpoint.port}"
             Request.Builder()
-                .url("ws://${endpoint.host}:${endpoint.port}/agentgrid")
+                .url("$scheme://$authority/agentgrid")
+                // 桥的握手要验这个头，走隧道时它就是唯一的门（同网段也一样带，逻辑只有一条）。
+                .apply { endpoint.secret?.let { header(SECRET_HEADER, it) } }
+                .header(NGROK_SKIP_WARNING_HEADER, "1")
                 .build()
         }.getOrElse {
             mutableEvents.tryEmit(TransportEvent.Failed(it.message))

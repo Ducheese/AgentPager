@@ -12,11 +12,35 @@ public partial class MainWindow : Window
 {
     private readonly BridgeRuntime _runtime;
     private bool _refreshing;
+    private static readonly System.Windows.Media.Brush TunnelBrushRunning = CreateFrozenBrush(0x38, 0xBD, 0xF8);
+    private static readonly System.Windows.Media.Brush TunnelBrushStarting = CreateFrozenBrush(0xFD, 0xBA, 0x4A);
+    private static readonly System.Windows.Media.Brush TunnelBrushDefault = CreateFrozenBrush(0x7F, 0x8A, 0x9A);
+
+    private static System.Windows.Media.Brush CreateFrozenBrush(byte r, byte g, byte b)
+    {
+        var brush = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(r, g, b));
+        brush.Freeze();
+        return brush;
+    }
+
+    /// <summary>
+    /// 隧道域名的延迟落盘。挂 LostFocus 靠不住 —— 实测用户输完没点开别处、桥就被
+    /// 换了进程，那次输入直接丢掉。改成打字停下就存，键盘焦点去哪都不影响。
+    /// </summary>
+    private readonly System.Windows.Threading.DispatcherTimer _tunnelCommitTimer = new()
+    {
+        Interval = TimeSpan.FromMilliseconds(600),
+    };
 
     public MainWindow(BridgeRuntime runtime)
     {
         _runtime = runtime;
         InitializeComponent();
+        _tunnelCommitTimer.Tick += (_, _) =>
+        {
+            _tunnelCommitTimer.Stop();
+            _runtime.SetTunnelHost(TunnelHostBox.Text);
+        };
         Refresh();
     }
 
@@ -56,11 +80,32 @@ public partial class MainWindow : Window
             _ => new SolidColorBrush(System.Windows.Media.Color.FromRgb(0x7F, 0x8A, 0x9A)),
         };
         LastHookText.Text = state.LastHookAt?.ToString("yyyy-MM-dd HH:mm:ss") ?? "尚未收到";
-        PairingTextBox.Text = state.PairingText;
-        PairingQrImage.Source = QrCode(state.PairingText);
+        if (PairingTextBox.Text != state.PairingText)
+        {
+            PairingTextBox.Text = state.PairingText;
+            PairingQrImage.Source = QrCode(state.PairingText);
+        }
         NetworkCombo.ItemsSource = state.Networks;
         NetworkCombo.SelectedValue = state.SelectedAddress;
         StartupCheckBox.IsChecked = _runtime.Settings.LaunchAtLogin;
+        EnableNgrokCheckBox.IsChecked = _runtime.Settings.EnableNgrokTunnel;
+        TunnelStatusText.Text = state.TunnelStatusText;
+        TunnelStatusText.Foreground = state.TunnelStatus switch
+        {
+            NgrokTunnelStatus.Running => TunnelBrushRunning,
+            NgrokTunnelStatus.Starting => TunnelBrushStarting,
+            NgrokTunnelStatus.Failed or NgrokTunnelStatus.NotFound => System.Windows.Media.Brushes.OrangeRed,
+            _ => TunnelBrushDefault,
+        };
+        if (!TunnelHostBox.IsKeyboardFocusWithin)
+        {
+            var hostText = _runtime.Settings.TunnelHost;
+            if (string.IsNullOrEmpty(hostText) && _runtime.Settings.EnableNgrokTunnel)
+            {
+                hostText = state.ActiveTunnelHost;
+            }
+            TunnelHostBox.Text = hostText ?? "";
+        }
         DiagnosticText.Text = state.LastError is null
             ? $"49361/49362 · {state.TaskCount} 个任务 · 数据目录 {AgentPagerPaths.DataRoot}"
             : state.LastError;
@@ -95,6 +140,35 @@ public partial class MainWindow : Window
     private void StartupCheckBox_Changed(object sender, RoutedEventArgs e)
     {
         if (!_refreshing) _runtime.SetLaunchAtLogin(StartupCheckBox.IsChecked == true);
+    }
+
+    private void EnableNgrokCheckBox_Changed(object sender, RoutedEventArgs e)
+    {
+        if (!_refreshing) _runtime.SetEnableNgrokTunnel(EnableNgrokCheckBox.IsChecked == true);
+    }
+
+    /// <summary>
+    /// 打字停顿 600ms 再提交。不能每次按键都提交：SetTunnelHost 会触发 PublishState →
+    /// Refresh，而 Refresh 每次都重画二维码，逐键提交会卡得打不动字。
+    /// </summary>
+    private void TunnelHostBox_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
+    {
+        if (_refreshing) return;
+        _tunnelCommitTimer.Stop();
+        _tunnelCommitTimer.Start();
+    }
+
+    private void TunnelHostBox_Changed(object sender, RoutedEventArgs e) => CommitTunnelHost();
+
+    private void TunnelHostBox_KeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+    {
+        if (e.Key == System.Windows.Input.Key.Enter) CommitTunnelHost();
+    }
+
+    private void CommitTunnelHost()
+    {
+        _tunnelCommitTimer.Stop();
+        if (!_refreshing) _runtime.SetTunnelHost(TunnelHostBox.Text);
     }
 
     private void CopyPairing_Click(object sender, RoutedEventArgs e)

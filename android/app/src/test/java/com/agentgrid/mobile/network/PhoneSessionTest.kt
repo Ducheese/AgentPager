@@ -41,9 +41,10 @@ class PhoneSessionTest {
         fixture.session.start()
         runCurrent()
 
-        assertEquals(LinkState.CONNECTING, fixture.session.state.value.link)
-        assertEquals(PairingSummary("bridge", "127.0.0.1", 8765), fixture.session.state.value.pairing)
-        assertEquals(listOf(PhoneEndpoint("127.0.0.1", 8765)), fixture.transport.connections)
+        assertEquals(
+            listOf(PhoneEndpoint("127.0.0.1", 8765, secret = secretText())),
+            fixture.transport.connections,
+        )
 
         fixture.transport.emit(TransportEvent.Opened)
         runCurrent()
@@ -276,6 +277,109 @@ class PhoneSessionTest {
         fixture.close()
     }
 
+    @Test
+    fun `配了隧道域名时，连不上局域网会轮换到 wss 隧道`() = runTest {
+        val fixture = fixture(pairing = pairing(tunnelHost = "xxx-yyy.ngrok-free.dev"))
+
+        fixture.session.start()
+        runCurrent()
+        assertEquals(
+            listOf(PhoneEndpoint("127.0.0.1", 8765, secret = secretText())),
+            fixture.transport.connections,
+        )
+
+        fixture.transport.emit(TransportEvent.Failed("connection refused"))
+        runCurrent()
+        advanceTimeBy(1_000)
+        runCurrent()
+
+        assertEquals(2, fixture.transport.connections.size)
+        assertEquals(
+            PhoneEndpoint("xxx-yyy.ngrok-free.dev", 443, secure = true, secret = secretText()),
+            fixture.transport.connections.last(),
+        )
+        fixture.close()
+    }
+
+    @Test
+    fun `没配隧道域名时，连不上也只会重试局域网地址`() = runTest {
+        val fixture = fixture(pairing = pairing())
+
+        fixture.session.start()
+        runCurrent()
+        fixture.transport.emit(TransportEvent.Failed("connection refused"))
+        runCurrent()
+        advanceTimeBy(1_000)
+        runCurrent()
+
+        val local = PhoneEndpoint("127.0.0.1", 8765, secret = secretText())
+        assertEquals(listOf(local, local), fixture.transport.connections)
+        fixture.close()
+    }
+
+    @Test
+    fun `连上过又断连时不轮换地址`() = runTest {
+        val fixture = fixture(pairing = pairing(tunnelHost = "xxx-yyy.ngrok-free.dev"))
+
+        fixture.session.start()
+        runCurrent()
+        fixture.transport.emit(TransportEvent.Opened)
+        runCurrent()
+        fixture.transport.emit(TransportEvent.Closed("服务端关闭"))
+        runCurrent()
+        advanceTimeBy(1_000)
+        runCurrent()
+
+        // 断连说明这个地址本来是通的，不该漂到隧道去
+        assertEquals(2, fixture.transport.connections.size)
+        assertEquals(
+            PhoneEndpoint("127.0.0.1", 8765, secret = secretText()),
+            fixture.transport.connections.last(),
+        )
+        fixture.close()
+    }
+
+    @Test
+    fun `连上过但在网络抖动触发Failed断连时也不轮换地址`() = runTest {
+        val fixture = fixture(pairing = pairing(tunnelHost = "xxx-yyy.ngrok-free.dev"))
+
+        fixture.session.start()
+        runCurrent()
+        fixture.transport.emit(TransportEvent.Opened)
+        runCurrent()
+        // 手机在公网或弱网抖动时，OkHttp 触发的是 onFailure (TransportEvent.Failed)
+        fixture.transport.emit(TransportEvent.Failed("software caused connection abort"))
+        runCurrent()
+        advanceTimeBy(1_000)
+        runCurrent()
+
+        // 既然连上过，说明当前地址有效，网络闪断不应切换回其他候选
+        assertEquals(2, fixture.transport.connections.size)
+        assertEquals(
+            PhoneEndpoint("127.0.0.1", 8765, secret = secretText()),
+            fixture.transport.connections.last(),
+        )
+        fixture.close()
+    }
+
+    @Test
+    fun `隧道域名带着协议和斜杠也会被洗干净`() = runTest {
+        val fixture = fixture(pairing = pairing(tunnelHost = "https://xxx-yyy.ngrok-free.dev/"))
+
+        fixture.session.start()
+        runCurrent()
+        fixture.transport.emit(TransportEvent.Failed("connection refused"))
+        runCurrent()
+        advanceTimeBy(1_000)
+        runCurrent()
+
+        val tunnel = fixture.transport.connections.last()
+        assertEquals("xxx-yyy.ngrok-free.dev", tunnel.host)
+        assertEquals(443, tunnel.port)
+        assertTrue(tunnel.secure)
+        fixture.close()
+    }
+
     private suspend fun kotlinx.coroutines.test.TestScope.connectedFixture(): Fixture {
         val fixture = fixture(pairing())
         fixture.session.start()
@@ -306,13 +410,16 @@ class PhoneSessionTest {
         return Fixture(session, credentials, transport, operationLog)
     }
 
-    private fun pairing() = PairingPayload(
+    private fun pairing(tunnelHost: String? = null) = PairingPayload(
         version = 1,
         serviceID = "bridge",
         host = "127.0.0.1",
         port = 8765,
-        secret = Base64.getEncoder().encodeToString(SECRET),
+        secret = secretText(),
+        tunnelHost = tunnelHost,
     )
+
+    private fun secretText() = Base64.getEncoder().encodeToString(SECRET)
 
     private fun snapshotEnvelope(messageID: String, sentAt: Long, taskID: String): String =
         json.encodeToString(

@@ -12,11 +12,17 @@ namespace AgentPager.Bridge;
 
 public sealed class LanBridgeServer(
     Func<string> pairingProvider,
+    Func<string?, bool> authorize,
     Func<string> snapshotProvider,
     Func<string, Task> messageHandler,
     Action<int> countChanged,
     DailyFileLog log) : IAsyncDisposable
 {
+    /// <summary>
+    /// 手机在 WebSocket 握手上带配对密钥的请求头。密钥就是配对文本里那个 Base64 串。
+    /// </summary>
+    public const string SecretHeader = "X-AgentGrid-Secret";
+
     private sealed class Client(WebSocket socket) : IAsyncDisposable
     {
         private readonly SemaphoreSlim _sendLock = new(1, 1);
@@ -60,8 +66,23 @@ public sealed class LanBridgeServer(
 
         app.MapGet("/pairing", async context =>
         {
-            if (context.Connection.RemoteIpAddress is null ||
-                !IPAddress.IsLoopback(context.Connection.RemoteIpAddress))
+            // 严防反向代理/公网隧道访问本地配对密钥接口：
+            // 1. Host 必须为 127.0.0.1 或 localhost 回环；
+            // 2. RemoteIpAddress 必须为 Loopback 本地回环；
+            // 3. 任何带有反向代理/公网穿透请求头的（X-Forwarded-*, Forwarded, X-Real-IP, ngrok-trace-id 等），直接拒绝。
+            // 避免 ngrok 或任何公网反代在本地端口转发时把配对文本（含 secret）裸露给公网。
+            var hostHeader = context.Request.Host.Host;
+            var isLoopbackHost = hostHeader.Equals("127.0.0.1", StringComparison.OrdinalIgnoreCase) ||
+                                 hostHeader.Equals("localhost", StringComparison.OrdinalIgnoreCase);
+            if (!isLoopbackHost ||
+                context.Connection.RemoteIpAddress is null ||
+                !IPAddress.IsLoopback(context.Connection.RemoteIpAddress) ||
+                context.Request.Headers.ContainsKey("X-Forwarded-For") ||
+                context.Request.Headers.ContainsKey("X-Forwarded-Proto") ||
+                context.Request.Headers.ContainsKey("X-Forwarded-Host") ||
+                context.Request.Headers.ContainsKey("Forwarded") ||
+                context.Request.Headers.ContainsKey("X-Real-IP") ||
+                context.Request.Headers.ContainsKey("ngrok-trace-id"))
             {
                 context.Response.StatusCode = StatusCodes.Status403Forbidden;
                 return;
@@ -92,6 +113,16 @@ public sealed class LanBridgeServer(
         if (!context.WebSockets.IsWebSocketRequest)
         {
             context.Response.StatusCode = StatusCodes.Status400BadRequest;
+            return;
+        }
+        // 握手必须验密钥。这个端口本来是局域网专用的，但一旦经隧道挂到公网（ngrok 之类），
+        // 不验就等于谁拿到域名谁就能连上收走全部快照（任务标题、正文、额度）。
+        // 控制消息本来就有 HMAC 签名挡着，敞开的只有"读" —— 而读恰恰是泄露面最大的那半边。
+        var provided = context.Request.Headers[SecretHeader].ToString();
+        if (!authorize(string.IsNullOrEmpty(provided) ? null : provided))
+        {
+            log.Write("WARN", $"WebSocket 握手上配对密钥无效，已拒绝：{context.Connection.RemoteIpAddress}");
+            context.Response.StatusCode = StatusCodes.Status401Unauthorized;
             return;
         }
         var socket = await context.WebSockets.AcceptWebSocketAsync();

@@ -215,6 +215,10 @@
 
         <TabControl Grid.Row="2" Background="{StaticResource Surface}" BorderBrush="{StaticResource Border}">
             <TabItem Header="连接">
+                <!-- 右列内容约 480px，Tab 内容区只有约 300px（560 窗高），隧道 UI 加进来后必然超高被裁。
+                     用 ScrollViewer 包住，小窗高时滚，大窗高时正常显示。 -->
+                <ScrollViewer VerticalScrollBarVisibility="Auto"
+                              HorizontalScrollBarVisibility="Disabled">
                 <Grid Margin="24">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="270"/>
@@ -235,6 +239,22 @@
                                       SelectedValuePath="Address" SelectionChanged="NetworkCombo_SelectionChanged"/>
                             <Button Content="刷新" Margin="8,0,0,0" Click="RefreshNetworks_Click"/>
                         </DockPanel>
+                        <TextBlock Text="外网隧道 (ngrok 穿透)" Margin="0,16,0,6"/>
+                        <DockPanel Margin="0,0,0,6">
+                            <CheckBox x:Name="EnableNgrokCheckBox" Content="启用 ngrok 自动穿透"
+                                      VerticalAlignment="Center"
+                                      Checked="EnableNgrokCheckBox_Changed"
+                                      Unchecked="EnableNgrokCheckBox_Changed"/>
+                            <TextBlock x:Name="TunnelStatusText" Margin="12,0,0,0"
+                                       Foreground="{StaticResource Cyan}" VerticalAlignment="Center"/>
+                        </DockPanel>
+                        <TextBox x:Name="TunnelHostBox" MinWidth="285" Padding="6,4"
+                                 Background="#090D12" Foreground="#C6D6E5"
+                                 BorderBrush="{StaticResource Border}"
+                                 TextChanged="TunnelHostBox_TextChanged"
+                                 LostFocus="TunnelHostBox_Changed" KeyDown="TunnelHostBox_KeyDown"/>
+                        <TextBlock Margin="0,6,0,0" Foreground="{StaticResource Muted}" TextWrapping="Wrap"
+                                   Text="启用 ngrok 时自动获取并填入域名；也可留空或手动填入其他隧道域名。手机在外网时会自动改用它。"/>
                         <TextBlock Text="配对文本" Margin="0,16,0,6"/>
                         <TextBox x:Name="PairingTextBox" Height="72" Padding="8"
                                  Background="#090D12" Foreground="#C6D6E5"
@@ -243,10 +263,11 @@
                         <Button Content="复制配对文本" HorizontalAlignment="Left" Margin="0,10,0,0"
                                 Click="CopyPairing_Click"/>
                         <CheckBox x:Name="StartupCheckBox" Content="登录 Windows 时启动"
-                                  Margin="0,18,0,0" Checked="StartupCheckBox_Changed"
-                                  Unchecked="StartupCheckBox_Changed"/>
+                                   Margin="0,18,0,8" Checked="StartupCheckBox_Changed"
+                                   Unchecked="StartupCheckBox_Changed"/>
                     </StackPanel>
                 </Grid>
+                </ScrollViewer>
             </TabItem>
 
             <TabItem Header="CODEX">

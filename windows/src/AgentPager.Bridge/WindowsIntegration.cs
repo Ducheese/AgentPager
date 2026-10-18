@@ -40,6 +40,17 @@ public static class NetworkAddresses
 public sealed class BridgeSettings
 {
     public string? SelectedNetworkAddress { get; set; }
+    /// <summary>
+    /// 外网隧道域名（ngrok 之类），只存域名本身。手机连不上局域网地址时改走
+    /// wss://这个域名/agentgrid —— 见 PairingPayload.TunnelHost。
+    /// </summary>
+    public string? TunnelHost { get; set; }
+
+    /// <summary>
+    /// 是否开启内置 ngrok 隧道守护。默认 true（开箱即用，随桥自动静默启动与回收）。
+    /// </summary>
+    public bool EnableNgrokTunnel { get; set; } = true;
+
     public bool LaunchAtLogin { get; set; } = true;
     public bool HasCompletedFirstRun { get; set; }
 
@@ -56,11 +67,23 @@ public sealed class BridgeSettings
 
     public void Save()
     {
-        Directory.CreateDirectory(AgentPagerPaths.DataRoot);
-        File.WriteAllText(AgentPagerPaths.SettingsFile,
-            JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
+        WriteFile();
         if (LaunchAtLogin) StartupRegistration.Enable();
         else StartupRegistration.Disable();
+    }
+
+    /// <summary>
+    /// 只落盘，不碰注册表。输入框边打字边存走这条 —— 每敲一个键都去写一遍 Run 键没有道理。
+    /// </summary>
+    public void SaveQuietly() => WriteFile();
+
+    private static readonly JsonSerializerOptions WriteOptions = new() { WriteIndented = true };
+
+    private void WriteFile()
+    {
+        Directory.CreateDirectory(AgentPagerPaths.DataRoot);
+        File.WriteAllText(AgentPagerPaths.SettingsFile,
+            JsonSerializer.Serialize(this, WriteOptions));
     }
 }
 

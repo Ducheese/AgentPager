@@ -3582,6 +3582,41 @@ finally
     ClaudeSessionRegistry.ProcessAliveChecker = agyPrevChecker;
 }
 
+// 外网隧道域名清洗。ngrok 域名靠手填或整段粘贴，脏格式必须在写入配对文本前就挡住——
+// 手机那边是照抄这个值拼 URL 的，漏一个 https:// 就会拼出 wss://https://... 的废地址。
+Check(PairingPayload.NormalizeTunnelHost(null) is null, "pairing: null tunnel host stays null");
+Check(PairingPayload.NormalizeTunnelHost("   ") is null, "pairing: blank tunnel host becomes null");
+Check(PairingPayload.NormalizeTunnelHost("https://") is null, "pairing: scheme-only input becomes null");
+Check(PairingPayload.NormalizeTunnelHost("xxx-yyy.ngrok-free.dev") == "xxx-yyy.ngrok-free.dev", "pairing: bare domain passes through");
+Check(PairingPayload.NormalizeTunnelHost("https://xxx-yyy.ngrok-free.dev") == "xxx-yyy.ngrok-free.dev", "pairing: scheme is stripped");
+Check(PairingPayload.NormalizeTunnelHost("https://xxx-yyy.ngrok-free.dev/") == "xxx-yyy.ngrok-free.dev", "pairing: trailing slash is stripped");
+Check(PairingPayload.NormalizeTunnelHost("xxx-yyy.ngrok-free.dev:8443") == "xxx-yyy.ngrok-free.dev", "pairing: port is stripped");
+Check(PairingPayload.NormalizeTunnelHost("  https://xxx-yyy.ngrok-free.dev/agentgrid  ") == "xxx-yyy.ngrok-free.dev", "pairing: path and padding are stripped");
+
+// 配对文本的线上契约：字段名是 tunnelHost（手机按这个名字读），
+// 没配隧道时整个字段不写出去 —— 旧版手机看到的就是原来那五个字段。
+static string PairingJson(string? tunnelHost) => JsonSerializer.Serialize(
+    new PairingPayload(1, "agentgrid-PC", "192.168.3.5", 49362, "c2VjcmV0", tunnelHost), WireJson.Options);
+Check(PairingJson(null).Contains("\"serviceID\""), "pairing: serviceID casing unchanged (phone contract)");
+Check(PairingJson("xxx-yyy.ngrok-free.dev").Contains("\"tunnelHost\""), "pairing: tunnel host is serialized as tunnelHost");
+Check(JsonSerializer.Deserialize<PairingPayload>(PairingJson("xxx-yyy.ngrok-free.dev"), WireJson.Options)?.TunnelHost == "xxx-yyy.ngrok-free.dev", "pairing: tunnel host round-trips");
+Check(!PairingJson(null).Contains("tunnelHost"), "pairing: absent tunnel host is omitted from the payload");
+Check(JsonSerializer.Deserialize<PairingPayload>(PairingJson(null), WireJson.Options)?.TunnelHost is null, "pairing: payload without tunnel host still parses");
+
+// 握手密钥比对。这是唯一挡在公网和全部快照之间的东西 —— 端口经隧道暴露后，
+// 任何拿到域名的人都能连上收走任务标题/正文/额度，所以比对规则必须有断言钉住。
+var pairingKey = new byte[] { 1, 2, 3, 4, 5, 6, 7, 8 };
+var pairingKeyText = Convert.ToBase64String(pairingKey);
+Check(PairingSecret.Matches(pairingKey, pairingKeyText), "auth: correct secret is accepted");
+Check(!PairingSecret.Matches(pairingKey, Convert.ToBase64String(new byte[] { 1, 2, 3, 4, 5, 6, 7, 9 })), "auth: wrong secret is rejected");
+Check(!PairingSecret.Matches(pairingKey, null), "auth: missing header is rejected");
+Check(!PairingSecret.Matches(pairingKey, ""), "auth: empty header is rejected");
+Check(!PairingSecret.Matches(pairingKey, "   "), "auth: whitespace header is rejected");
+Check(!PairingSecret.Matches(pairingKey, "not-base64-at-all"), "auth: garbage header is rejected");
+// 长度不同不能抛异常 —— 抛出去就是 500，而不是干净的 401
+Check(!PairingSecret.Matches(pairingKey, pairingKeyText + "AA"), "auth: longer secret is rejected without throwing");
+Check(!PairingSecret.Matches(pairingKey, pairingKeyText[..8]), "auth: truncated secret is rejected without throwing");
+
 Console.WriteLine(failures.Count == 0 ? "ALL CHECKS PASSED" : $"FAILURES: {string.Join(", ", failures)}");
 return failures.Count == 0 ? 0 : 1;
 

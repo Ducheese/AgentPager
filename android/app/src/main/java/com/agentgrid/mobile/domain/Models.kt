@@ -350,4 +350,6 @@ data class PairingPayload(
     val host: String,
     val port: Int,
     val secret: String,
+    /** 外网隧道域名（ngrok 之类），留空表示没配外网。只填域名，不带协议/端口 —— 一律按 443/wss。 */
+    val tunnelHost: String? = null,
 )

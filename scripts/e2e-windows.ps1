@@ -32,6 +32,9 @@ try {
 
     $pairing = Invoke-RestMethod $pairingUrl
     $socket = [Net.WebSockets.ClientWebSocket]::new()
+    if ($pairing.secret) {
+        $socket.Options.SetRequestHeader("X-AgentGrid-Secret", [string]$pairing.secret)
+    }
     [void]$socket.ConnectAsync(
         [Uri]"ws://127.0.0.1:$($pairing.port)/agentgrid",
         [Threading.CancellationToken]::None
