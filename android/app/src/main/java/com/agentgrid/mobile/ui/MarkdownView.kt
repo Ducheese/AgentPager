@@ -546,7 +546,13 @@ fun MarkdownView(
             when (block) {
                 is MarkdownBlock.Heading -> HeadingBlockView(block)
                 is MarkdownBlock.Paragraph -> ParagraphBlockView(block)
-                is MarkdownBlock.CodeBlock -> CodeBlockView(block)
+                is MarkdownBlock.CodeBlock -> {
+                    if (block.language.equals("mermaid", ignoreCase = true)) {
+                        MermaidBlockView(source = block.content)
+                    } else {
+                        CodeBlockView(block)
+                    }
+                }
                 is MarkdownBlock.Table -> TableBlockView(block)
                 is MarkdownBlock.BulletList -> BulletListView(block)
                 is MarkdownBlock.OrderedList -> OrderedListView(block)
@@ -585,7 +591,7 @@ private fun ParagraphBlockView(block: MarkdownBlock.Paragraph) {
 }
 
 @Composable
-private fun CodeBlockView(block: MarkdownBlock.CodeBlock) {
+internal fun CodeBlockView(block: MarkdownBlock.CodeBlock) {
     Column(
         modifier = Modifier
             .fillMaxWidth()

@@ -1,7 +1,9 @@
 package com.agentgrid.mobile
 
 import android.app.Application
-import android.provider.Settings
+import android.content.Intent
+import androidx.compose.runtime.mutableStateMapOf
+import androidx.core.content.ContextCompat
 import androidx.core.content.edit
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -17,6 +19,7 @@ import com.agentgrid.mobile.network.PairingOutcome
 import com.agentgrid.mobile.network.PairingSummary
 import com.agentgrid.mobile.network.PhoneSessionFactory
 import com.agentgrid.mobile.network.PhoneSessionProblem
+import com.agentgrid.mobile.service.LinkKeepAliveService
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -33,6 +36,7 @@ data class AgentGridUiState(
     val pendingRequests: List<PendingRequest> = emptyList(),
     val pairingError: String? = null,
     val terminalMode: Boolean = true,
+    val speakingTaskId: String? = null,
 ) {
     val focusedTask: TaskSnapshot?
         get() = taskProjection.focusedTask
@@ -48,13 +52,19 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
     )
     val state: StateFlow<AgentGridUiState> = mutableState.asStateFlow()
 
-    private val phoneSession = PhoneSessionFactory.create(
-        context = application,
-        deviceID = Settings.Secure.getString(
-            application.contentResolver,
-            Settings.Secure.ANDROID_ID,
-        ) ?: "agentgrid-android",
-    )
+    /**
+     * prompt 输入草稿：按 taskID 保存，切换 task/收纳面板都不丢，只有发送成功才清空。
+     * 放在 ViewModel（Activity 级）而不是 Composable 的 remember —— remember 的生命周期绑
+     * 收纳动画，收起再展开草稿就没了。
+     */
+    val promptDrafts = mutableStateMapOf<String, String>()
+
+    fun setPromptDraft(taskId: String, text: String) {
+        if (text.isEmpty()) promptDrafts.remove(taskId) else promptDrafts[taskId] = text
+    }
+
+    private val phoneSession = PhoneSessionFactory.shared(application)
+    private var keepAliveRequested = false
     private var latestSnapshot = StateSnapshotPayload(emptyList())
     private var dashboardTransitionJob: Job? = null
 
@@ -83,12 +93,35 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
                     usages = allUsages,
                     pendingRequests = session.snapshot.pendingRequests,
                 )
+                if (session.pairing != null) ensureKeepAliveService()
                 if (snapshotChanged) scheduleDashboardTransition(projection)
             }
         }
         viewModelScope.launch {
             phoneSession.start()
         }
+        viewModelScope.launch {
+            ReplySpeech.speakingTaskId.collect { speakingTaskId ->
+                mutableState.value = mutableState.value.copy(speakingTaskId = speakingTaskId)
+            }
+        }
+    }
+
+    /** 回前台时立刻把退避里的重连拎起来（配合保活服务，后台掉线只丢几秒）。 */
+    fun onForeground() {
+        phoneSession.nudge()
+        if (mutableState.value.pairing != null) ensureKeepAliveService()
+    }
+
+    private fun ensureKeepAliveService() {
+        if (keepAliveRequested) return
+        keepAliveRequested = true
+        runCatching {
+            ContextCompat.startForegroundService(
+                getApplication(),
+                Intent(getApplication(), LinkKeepAliveService::class.java),
+            )
+        }.onFailure { keepAliveRequested = false }
     }
 
     fun pair(text: String) {
@@ -107,9 +140,33 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
+    /**
+     * 点 REPLY 标签：朗读/停止。
+     * 仅完成态（SUCCEEDED / INTERRUPTED）允许开读；开读后即使任务又回到运行态，再点仍然能停。
+     */
+    fun toggleReplySpeech(taskId: String) {
+        if (ReplySpeech.speakingTaskId.value == taskId) {
+            ReplySpeech.stop()
+            return
+        }
+        val task = mutableState.value.taskProjection.orderedTasks
+            .firstOrNull { it.id == taskId }
+            ?: return
+        if (!task.isTerminal) return
+        val body = task.responseBody ?: return
+        ReplySpeech.speak(getApplication(), taskId, body)
+    }
+
     fun unpair() {
         viewModelScope.launch {
+            ReplySpeech.stop()
             phoneSession.unpair()
+            keepAliveRequested = false
+            runCatching {
+                getApplication<Application>().stopService(
+                    Intent(getApplication(), LinkKeepAliveService::class.java),
+                )
+            }
         }
     }
 
@@ -143,7 +200,8 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
 
     override fun onCleared() {
         dashboardTransitionJob?.cancel()
-        phoneSession.close()
+        // 会话是进程级单例：Activity/ViewModel 销毁不等于断开，保活服务还握着这条连接。
+        // 真正断开只有 unpair（或进程死亡）。
     }
 
     private fun scheduleDashboardTransition(projection: TaskDashboardProjection) {

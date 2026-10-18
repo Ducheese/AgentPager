@@ -96,6 +96,12 @@ interface PhoneSession : AutoCloseable {
     ): ControlSubmission
 
     suspend fun unpair()
+
+    /**
+     * 从后台冻结/断网恢复时的立即重连：取消退避等待、清零计数、马上再连当前候选。
+     * 已连接或没有配对时什么都不做（幂等，可在回前台/网络恢复/亮屏时随手调用）。
+     */
+    fun nudge()
 }
 
 internal interface PhoneCredentialStore {
@@ -313,6 +319,21 @@ internal class DefaultPhoneSession(
             lastSnapshotSentAt = Long.MIN_VALUE
             lastSnapshotMessageID = null
             mutableState.value = PhoneSessionState()
+        }
+    }
+
+    override fun nudge() {
+        scope.launch {
+            mutex.withLock {
+                if (stopped || pairing == null) return@withLock
+                // 健康连接不折腾；重连在飞（CONNECTING）或被冻结卡住时，断开重来一次最快。
+                if (mutableState.value.link == LinkState.CONNECTED) return@withLock
+                reconnectJob?.cancel()
+                reconnectJob = null
+                retryCount = 0
+                transport.disconnect()
+                pairing?.let(::connectLocked)
+            }
         }
     }
 

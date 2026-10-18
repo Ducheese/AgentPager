@@ -380,6 +380,50 @@ class PhoneSessionTest {
         fixture.close()
     }
 
+    @Test
+    fun `断线退避期间 nudge 会立刻重连`() = runTest {
+        val fixture = connectedFixture()
+        fixture.transport.emit(TransportEvent.Failed("冻结断网"))
+        runCurrent()
+        // 退避中：还没发起新连接
+        assertEquals(1, fixture.transport.connections.size)
+
+        fixture.session.nudge()
+        runCurrent()
+
+        // 不等 1 秒退避，nudge 直接重连
+        assertEquals(2, fixture.transport.connections.size)
+        // 被取消的退避任务不会迟到再补一条连接
+        advanceTimeBy(2_000)
+        runCurrent()
+        assertEquals(2, fixture.transport.connections.size)
+        fixture.close()
+    }
+
+    @Test
+    fun `连接健康时 nudge 不打扰`() = runTest {
+        val fixture = connectedFixture()
+
+        fixture.session.nudge()
+        runCurrent()
+
+        assertEquals(1, fixture.transport.connections.size)
+        fixture.close()
+    }
+
+    @Test
+    fun `未配对时 nudge 什么都不做`() = runTest {
+        val fixture = fixture()
+        fixture.session.start()
+        runCurrent()
+
+        fixture.session.nudge()
+        runCurrent()
+
+        assertTrue(fixture.transport.connections.isEmpty())
+        fixture.close()
+    }
+
     private suspend fun kotlinx.coroutines.test.TestScope.connectedFixture(): Fixture {
         val fixture = fixture(pairing())
         fixture.session.start()

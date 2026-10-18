@@ -20,7 +20,9 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -32,6 +34,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -41,6 +44,8 @@ import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
@@ -57,9 +62,11 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
@@ -70,6 +77,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.Dp
@@ -93,6 +101,7 @@ import com.agentgrid.mobile.network.LinkState
 import com.agentgrid.mobile.render.PixelCoreSurfaceView
 import com.agentgrid.mobile.render.PixelRenderState
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 private val EaseOutQuart = CubicBezierEasing(0.25f, 1f, 0.5f, 1f)
 private val TaskListAnchorHeight = 1.dp
@@ -136,6 +145,10 @@ fun AgentGridScreen(
     onFocus: (String) -> Unit,
     onToggleDashboard: () -> Unit,
     onExitTerminal: () -> Unit,
+    onToggleReplySpeech: (String) -> Unit,
+    inMultiWindow: Boolean,
+    promptDrafts: Map<String, String>,
+    onPromptDraftChange: (String, String) -> Unit,
 ) {
     AgentGridTheme {
         AnimatedContent(
@@ -160,7 +173,7 @@ fun AgentGridScreen(
             label = "配对与终端切换",
         ) { isPairing ->
             if (isPairing) {
-                PairingScreen(state, onPair)
+                PairingScreen(state, onPair, inMultiWindow)
             } else {
                 TaskTerminal(
                     state = state,
@@ -169,6 +182,9 @@ fun AgentGridScreen(
                     onFocus = onFocus,
                     onToggleDashboard = onToggleDashboard,
                     onExitTerminal = onExitTerminal,
+                    onToggleReplySpeech = onToggleReplySpeech,
+                    promptDrafts = promptDrafts,
+                    onPromptDraftChange = onPromptDraftChange,
                 )
             }
         }
@@ -179,6 +195,7 @@ fun AgentGridScreen(
 private fun PairingScreen(
     state: AgentGridUiState,
     onPair: (String) -> Unit,
+    inMultiWindow: Boolean,
 ) {
     var manualText by remember { mutableStateOf("") }
 
@@ -188,105 +205,56 @@ private fun PairingScreen(
             .background(AgentGridColors.Background),
     ) {
         val isCompact = maxWidth < 600.dp || maxHeight > maxWidth
+        // 嵌套 lambda 里没有 BoxWithConstraintsScope 的隐式接收者，先落成本地值
+        val availableWidth = maxWidth
+        val availableHeight = maxHeight
 
         if (isCompact) {
-            // 竖屏、分屏、悬浮小窗：单列垂直居中排布，带滚动防键盘遮挡
+            // 竖屏、分屏、悬浮小窗：单列排布。
+            // 外层滚动防键盘遮挡；内层给足最小高度让内容真的垂直居中（短居中、长可滚）。
             Column(
                 modifier = Modifier
                     .fillMaxSize()
                     .verticalScroll(rememberScrollState())
                     .padding(20.dp),
                 horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(14.dp),
             ) {
-                Text(
-                    "AGENTPAGER",
-                    color = AgentGridColors.Text,
-                    fontSize = 24.sp,
-                    fontWeight = FontWeight.Bold,
-                    letterSpacing = 2.sp,
-                )
-                Box(
-                    modifier = Modifier
-                        .size(190.dp)
-                        .background(AgentGridColors.Surface),
-                ) {
-                    QRCodeScanner(onResult = onPair, modifier = Modifier.fillMaxSize())
-                }
-                Text("扫描 Bridge 上的二维码", color = AgentGridColors.Cyan, fontSize = 14.sp)
-                Text(
-                    "在电脑上打开 AgentPager Bridge → 扫描二维码",
-                    color = AgentGridColors.Muted,
-                    fontSize = 11.sp,
-                )
-                OutlinedTextField(
-                    value = manualText,
-                    onValueChange = { manualText = it },
-                    label = { Text("无法扫码？粘贴配对文本") },
-                    minLines = 2,
-                    maxLines = 4,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                Button(
-                    onClick = { onPair(manualText) },
-                    enabled = manualText.isNotBlank(),
-                    shape = RectangleShape,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text("连接 Bridge")
-                }
-                AnimatedVisibility(visible = state.pairingError != null) {
-                    Text(
-                        state.pairingError.orEmpty(),
-                        color = AgentGridColors.Red,
-                        fontSize = 12.sp,
-                    )
-                }
-            }
-        } else {
-            // 宽屏横屏桌面态：左右并排
-            Row(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(28.dp),
-                horizontalArrangement = Arrangement.spacedBy(48.dp),
-            ) {
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxHeight()
-                        .background(AgentGridColors.Surface),
-                ) {
-                    QRCodeScanner(onResult = onPair, modifier = Modifier.fillMaxSize())
-                }
                 Column(
                     modifier = Modifier
-                        .weight(0.92f)
-                        .fillMaxHeight(),
+                        .fillMaxWidth()
+                        .heightIn(min = (availableHeight - 40.dp).coerceAtLeast(0.dp)),
+                    horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.Center,
                 ) {
                     Text(
                         "AGENTPAGER",
                         color = AgentGridColors.Text,
-                        fontSize = 30.sp,
+                        fontSize = 24.sp,
                         fontWeight = FontWeight.Bold,
                         letterSpacing = 2.sp,
                     )
-                    Spacer(Modifier.height(10.dp))
-                    Text("扫描 Bridge 上的二维码", color = AgentGridColors.Cyan, fontSize = 16.sp)
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        "在电脑上打开 AgentPager Bridge → 连接，\n扫描其中显示的二维码",
-                        color = AgentGridColors.Muted,
-                        fontSize = 12.sp,
-                        lineHeight = 18.sp,
+                    Spacer(Modifier.height(14.dp))
+                    ScannerArea(
+                        inMultiWindow = inMultiWindow,
+                        onResult = onPair,
+                        modifier = Modifier
+                            .size(minOf(availableWidth * 0.68f, 280.dp)),
                     )
-                    Spacer(Modifier.height(18.dp))
+                    Spacer(Modifier.height(14.dp))
+                    Text("扫描 Bridge 上的二维码", color = AgentGridColors.Cyan, fontSize = 14.sp)
+                    Text(
+                        "在电脑上打开 AgentPager Bridge → 扫描二维码",
+                        color = AgentGridColors.Muted,
+                        fontSize = 11.sp,
+                        textAlign = TextAlign.Center,
+                    )
+                    Spacer(Modifier.height(14.dp))
                     OutlinedTextField(
                         value = manualText,
                         onValueChange = { manualText = it },
                         label = { Text("无法扫码？粘贴配对文本") },
-                        minLines = 3,
+                        minLines = 2,
+                        maxLines = 4,
                         modifier = Modifier.fillMaxWidth(),
                     )
                     Spacer(Modifier.height(10.dp))
@@ -294,21 +262,134 @@ private fun PairingScreen(
                         onClick = { onPair(manualText) },
                         enabled = manualText.isNotBlank(),
                         shape = RectangleShape,
+                        modifier = Modifier.fillMaxWidth(),
                     ) {
                         Text("连接 Bridge")
                     }
                     AnimatedVisibility(visible = state.pairingError != null) {
-                        Column {
-                            Spacer(Modifier.height(10.dp))
-                            Text(
-                                state.pairingError.orEmpty(),
-                                color = AgentGridColors.Red,
-                                fontSize = 12.sp,
-                            )
+                        Text(
+                            state.pairingError.orEmpty(),
+                            color = AgentGridColors.Red,
+                            fontSize = 12.sp,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.padding(top = 10.dp),
+                        )
+                    }
+                }
+            }
+        } else {
+            // 宽屏横屏桌面态：左右并排。右侧表单列带滚动——矮窗/键盘顶起来时不再整列被裁掉。
+            Row(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(28.dp),
+                horizontalArrangement = Arrangement.spacedBy(48.dp),
+            ) {
+                ScannerArea(
+                    inMultiWindow = inMultiWindow,
+                    onResult = onPair,
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxHeight(),
+                )
+                Column(
+                    modifier = Modifier
+                        .weight(0.92f)
+                        .fillMaxHeight()
+                        .verticalScroll(rememberScrollState()),
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = (availableHeight - 56.dp).coerceAtLeast(0.dp)),
+                        verticalArrangement = Arrangement.Center,
+                    ) {
+                        Text(
+                            "AGENTPAGER",
+                            color = AgentGridColors.Text,
+                            fontSize = 30.sp,
+                            fontWeight = FontWeight.Bold,
+                            letterSpacing = 2.sp,
+                        )
+                        Spacer(Modifier.height(10.dp))
+                        Text("扫描 Bridge 上的二维码", color = AgentGridColors.Cyan, fontSize = 16.sp)
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "在电脑上打开 AgentPager Bridge → 连接，\n扫描其中显示的二维码",
+                            color = AgentGridColors.Muted,
+                            fontSize = 12.sp,
+                            lineHeight = 18.sp,
+                        )
+                        Spacer(Modifier.height(18.dp))
+                        OutlinedTextField(
+                            value = manualText,
+                            onValueChange = { manualText = it },
+                            label = { Text("无法扫码？粘贴配对文本") },
+                            minLines = 3,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Spacer(Modifier.height(10.dp))
+                        Button(
+                            onClick = { onPair(manualText) },
+                            enabled = manualText.isNotBlank(),
+                            shape = RectangleShape,
+                        ) {
+                            Text("连接 Bridge")
+                        }
+                        AnimatedVisibility(visible = state.pairingError != null) {
+                            Column {
+                                Spacer(Modifier.height(10.dp))
+                                Text(
+                                    state.pairingError.orEmpty(),
+                                    color = AgentGridColors.Red,
+                                    fontSize = 12.sp,
+                                )
+                            }
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+/**
+ * 扫码取景区。分屏/小窗模式下相机不可用（系统对非焦点多窗口封锁相机），
+ * 此时不渲染相机，原位给提示；手动粘贴配对文本始终可用。
+ */
+@Composable
+private fun ScannerArea(
+    inMultiWindow: Boolean,
+    onResult: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Box(
+        modifier = modifier
+            .border(1.dp, AgentGridColors.Divider)
+            .background(AgentGridColors.Surface),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (inMultiWindow) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(
+                    "分屏 / 小窗模式下无法使用相机扫码",
+                    color = AgentGridColors.Amber,
+                    fontSize = 12.sp,
+                    textAlign = TextAlign.Center,
+                )
+                Text(
+                    "请全屏后重试，或在下方粘贴配对文本",
+                    color = AgentGridColors.Muted,
+                    fontSize = 11.sp,
+                    textAlign = TextAlign.Center,
+                )
+            }
+        } else {
+            QRCodeScanner(onResult = onResult, modifier = Modifier.fillMaxSize())
         }
     }
 }
@@ -321,6 +402,9 @@ private fun TaskTerminal(
     onFocus: (String) -> Unit,
     onToggleDashboard: () -> Unit,
     onExitTerminal: () -> Unit,
+    onToggleReplySpeech: (String) -> Unit,
+    promptDrafts: Map<String, String>,
+    onPromptDraftChange: (String, String) -> Unit,
 ) {
     val projection = state.taskProjection
     val tasks = projection.orderedTasks
@@ -432,7 +516,9 @@ private fun TaskTerminal(
                         .then(
                             if (isCompact) Modifier.fillMaxHeight()
                             else Modifier.heightIn(max = 306.dp)
-                        ),
+                        )
+                        // 键盘弹起时列表底部让位（edge-to-edge 场景生效；adjustResize 时由窗口收缩兜底）
+                        .imePadding(),
                     verticalArrangement = Arrangement.spacedBy(0.dp),
                 ) {
                     item(key = TaskListAnchorKey) {
@@ -480,6 +566,10 @@ private fun TaskTerminal(
                                 projection.urgentTaskID != task.id,
                             showDivider = index < visibleTasks.lastIndex,
                             compact = isCompact,
+                            speakingTaskId = state.speakingTaskId,
+                            onToggleReplySpeech = onToggleReplySpeech,
+                            promptDraft = promptDrafts[task.id].orEmpty(),
+                            onPromptDraftChange = onPromptDraftChange,
                             onClick = {
                                 val willExpand = expandedTaskID != task.id
                                 expandedTaskID = if (willExpand) task.id else null
@@ -657,8 +747,12 @@ private fun TaskRow(
     dimmed: Boolean,
     showDivider: Boolean,
     compact: Boolean = false,
+    speakingTaskId: String?,
+    promptDraft: String,
     onClick: () -> Unit,
     onControl: (String, ControlAction, String?, List<String>?) -> Unit,
+    onToggleReplySpeech: (String) -> Unit,
+    onPromptDraftChange: (String, String) -> Unit,
 ) {
     val rowAlpha by animateFloatAsState(
         targetValue = if (dimmed) 0.34f else 1f,
@@ -759,7 +853,11 @@ private fun TaskRow(
                 pending = pending,
                 showToken = expanded,
                 compact = compact,
+                speaking = speakingTaskId == task.id,
+                promptDraft = promptDraft,
                 onControl = onControl,
+                onToggleReplySpeech = onToggleReplySpeech,
+                onPromptDraftChange = onPromptDraftChange,
             )
         }
 
@@ -916,7 +1014,11 @@ private fun TaskDetails(
     pending: PendingRequest?,
     showToken: Boolean,
     compact: Boolean = false,
+    speaking: Boolean = false,
+    promptDraft: String,
     onControl: (String, ControlAction, String?, List<String>?) -> Unit,
+    onToggleReplySpeech: (String) -> Unit,
+    onPromptDraftChange: (String, String) -> Unit,
 ) {
     var answer by remember(task.id, pending?.summary) { mutableStateOf("") }
     // 非完成态也显示：第三行会被后续工具步顶掉，展开后的 REPLY 面板是唯一能留住中途正文的地方。
@@ -951,7 +1053,12 @@ private fun TaskDetails(
                 )
             }
             if (showResponseBody) {
-                ResponseSection(markdown = task.responseBody!!)
+                ResponseSection(
+                    markdown = task.responseBody!!,
+                    speaking = speaking,
+                    canSpeak = task.isTerminal,
+                    onToggle = { onToggleReplySpeech(task.id) },
+                )
             }
         }
         AnimatedContent(
@@ -1070,17 +1177,29 @@ private fun TaskDetails(
                 }
             }
         }
-        if (pending == null && TaskCapability.PROMPT in task.capabilities) {
-            var promptText by remember(task.id) { mutableStateOf("") }
+        // 与 MODEL/TOKEN/REPLY 同一条可见性规则：收纳时一起收缩，
+        // 否则收起动画里只剩一个输入框裸着顶到 lastStep 下面（就是"区别对待"的来源）。
+        if (showToken && pending == null && TaskCapability.PROMPT in task.capabilities) {
+            val bringIntoViewRequester = remember { BringIntoViewRequester() }
+            val scope = rememberCoroutineScope()
             Row(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .bringIntoViewRequester(bringIntoViewRequester),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 OutlinedTextField(
-                    value = promptText,
-                    onValueChange = { promptText = it },
-                    modifier = Modifier.weight(1f),
+                    value = promptDraft,
+                    onValueChange = { onPromptDraftChange(task.id, it) },
+                    modifier = Modifier
+                        .weight(1f)
+                        .onFocusChanged { focusState ->
+                            // 键盘弹起后把输入框滚到可见区（嵌套滚动也会向上传递，列表跟着让位）
+                            if (focusState.isFocused) {
+                                scope.launch { bringIntoViewRequester.bringIntoView() }
+                            }
+                        },
                     placeholder = {
                         Text(
                             if (task.lifecycle == AgentLifecycle.RUNNING) "追加 Prompt (排队)..." else "输入 Prompt 发起任务...",
@@ -1094,9 +1213,10 @@ private fun TaskDetails(
                     if (task.lifecycle == AgentLifecycle.RUNNING) "排队" else "发送",
                     AgentGridColors.Cyan,
                 ) {
-                    if (promptText.isNotBlank()) {
-                        val toSend = promptText.trim()
-                        promptText = ""
+                    if (promptDraft.isNotBlank()) {
+                        val toSend = promptDraft.trim()
+                        // 只有发送成功才清空草稿；切换 task/收纳面板都不清
+                        onPromptDraftChange(task.id, "")
                         onControl(task.id, ControlAction.PROMPT, toSend, null)
                     }
                 }
@@ -1196,7 +1316,14 @@ private fun DetailLine(label: String, value: String, color: Color) {
 }
 
 @Composable
-private fun ResponseSection(markdown: String) {
+private fun ResponseSection(
+    markdown: String,
+    speaking: Boolean,
+    canSpeak: Boolean,
+    onToggle: () -> Unit,
+) {
+    // 完成态才给「开读」；已在朗读时永远可停（哪怕任务又变回运行态，不留下停不掉的死角）。
+    val clickable = speaking || canSpeak
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -1206,10 +1333,18 @@ private fun ResponseSection(markdown: String) {
         // 左边缘跟着多出一点，三个标签里就它看着偏左。去掉后与 MODEL/TOKEN 同字面、同原点，
         // 标签列严格对齐。
         Text(
-            "REPLY",
-            color = AgentGridColors.Green,
+            text = if (speaking) "STOP" else "REPLY",
+            color = if (speaking) AgentGridColors.Amber else AgentGridColors.Green,
             fontSize = 9.sp,
-            modifier = Modifier.width(58.dp),
+            modifier = Modifier
+                .width(58.dp)
+                .clickable(
+                    enabled = clickable,
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = onToggle,
+                )
+                .padding(vertical = 3.dp),
         )
         Box(
             modifier = Modifier
