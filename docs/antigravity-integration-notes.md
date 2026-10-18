@@ -181,7 +181,21 @@
 
 ---
 
-## 七、专题：远程 prompt 改 pull 模型（Stop 回包交接，2026-10-17 实证 → 落地）
+## 七、远程 prompt：现役「到达即按键注入」（2026-10-19 落地），附 pull 模型历史存档
+
+**现役形态**：桥端**不再排队**——手机发来的 Prompt 一到就**按键注入宿主终端**并回车（`AgyCliDispatcher.Dispatch` → `ConsoleKeystrokes`：`AttachConsole` + `CONIN$` + `WriteConsoleInputW`，与 `tool-dev/antigravity-discord-channel` 的 inject-worker 同款），运行中与完成态都走这一条腿。理由是**"这条算排队还是打断"由 agy 自己决定**（`/config` 的 `Queued Messages`：`Queue` 攒到回合末、`Send Immediately` 直接打断，另可 `alt+m` 反向发送）——桥替它排一遍只是多一层状态。opencode 那条腿同模式：桥只管把 Prompt 送进会话。
+
+- 撤除的：桥端队列（`PendingPrompts`/TTL sweep/`DrainOne`/`TryTakeQueued`/`Requeue`）、持久化（`agy-queued-prompts.json`）、徽章自愈的 `HasQueued` 兜底、Stop 回包交接（Stop 只照常收尾，桥回空包 → 插件打 `{}`）。`AgyHookOutput.PullPrompt` 已删；插件仍在 Stop 信封里带 `pullPrompt`，桥读了不用。
+- 能力位（`TaskCatalog.CanReceivePrompt`）：Antigravity 只认「**记录着活着的宿主终端 PID**，且该终端**最近一次**上报的会话是它（或其子代理）」。运行中与完成态都给入口；没有 PID，或该终端最近跑的是别的会话，就不给——免得点了发送只换来失败/串台。
+- 机制实证（2026-10-19 本机）：普通 conhost（`CREATE_NO_WINDOW`）与 Windows Terminal 的 **ConPTY**（父链 `python <- cmd <- WindowsTerminal`）都能把整行送达；真实注入 worker 对目标 5/5 稳定。注入方必须**自己没有控制台**，所以桥一律起自身 WinExe 子进程 `--console-inject <pid> <base64>` 执行。
+- 已撤的队列语义：跟进回合仍靠转录本检测保计时（`DetectQueuedPrompt` + `wasQueued`，没变）。
+- **寻址策略（2026-10-19 二次定案：最后观测）**：注入只能落到**进程**，所以按「该终端**最近一次**上报的会话」放行——终端换过会话（`/resume` 选择器、`@conversation:`、从 `Other` 导入）后，只有最近跑过的那个会话还能从手机发，被切走的那个拒发（避免按键落进当前显示的会话）。**父子会话算同一台终端**：子代理在跑时父会话的入口不消失（输入框仍归父会话）。子代理会话不建独立 task，不构成发错对象。
+  - 真机复刻过的场景（A/B 各一台终端、关掉 B 的终端、A 的终端 `/resume` 到 B 并跑一轮）：B 恢复入口 ✓、A 失去入口 ✓、**A 判离线**（同一个 pid 上除父子外的旧映射作废 → 它已不在任何终端里，下一次 Maintain 直接离线，不吃"hook 还没到"的十分钟宽限）✓；A 之后在同一台终端重跑会**重建映射、入口回来**（旧映射已清，不再被 incumbent 粘住）✓。单测见 `5.1d / 5.1e`。
+  - 残余：**裸切**（切过去还没跑任何一轮、没有 hook）不可见，仍可能误发；注入没有送达确认。
+  - 更早的一版（"pid 见过 ≥2 个会话就全部拒发"）在真机实测里把**该放行的**也拦了，已换成本条。
+- 未实测：真 agy 回合进行中注入时，agy 是入队还是打断（其 `Queued Messages` 决定）；以及真机端到端。
+
+**（以下为 2026-10-17 的 pull 模型记录，2026-10-19 已被上面的注入模型取代，相关落地代码已删，仅存档）**
 
 **为什么推翻 spawn 投递**：`agy --conversation -p` 起子进程有两处结构性毛病——输出直接丢弃（`CreateNoWindow`，终端看不见是必然的）+ 与 GUI 手里的会话抢 conversation（锁 contention 高度可疑）。用户拍板：走 hook 通道（作答同款思路），Stop 回包带排队。
 
@@ -198,8 +212,8 @@
 - 硬化（与 claude 同规格）：TTL 30 分钟（三层 sweep）+ 离线/回收清队列记 WARN + 重启持久化（`agy-queued-prompts.json` 独立文件）+ 徽章自愈 + 提供商铁律（pull 在同一进程续跑，天然满足；idle 腿仍是 CLI，见下）。
 - e2e 实证（scratch essay 长任务 + 文件播种 + 重启验证 import）：import→徽章自愈→Stop 交接（"剩余排队 0"）→跟进回合 `PULL-RECEIVED` 落盘→徽章清除，全链条通。
 
-**残余与待办**：
-- idle 投递仍是 CLI 子进程（没 turn 就没 hook 可挂，pull 无从谈起）：不继承原会话环境、硬编码 `--mode accept-edits`——提供商铁律在这里仍是缺口，待定。
-- 升级窗口：v3 脚本无 pull 标记，v85 桥给空回包（不丢件）；队里东西靠 TTL 兜底。生产切流 = 点"安装或修复"升 v4。
-- open cosmetic：重启恢复窗口内徽章自愈 15 秒打 5 次（疑 turn 收尾工具 hook 交错，正确性无影响，待查）。
-- drain-撞-resume 的 300ms 竞态在 pull 下不存在（无 spawn 时钟），已消除一类。
+**残余与待办（pull 时代，多数已随本节被取代）**：
+- idle 投递仍是 CLI 子进程…… → 已由注入腿取代（2026-10-19），本条作废。
+- 升级窗口：v3 脚本无 pull 标记，v85 桥给空回包（不丢件）；队里东西靠 TTL 兜底。生产切流 = 点"安装或修复"升 v4。→ 队列已撤，本条作废。
+- open cosmetic：重启恢复窗口内徽章自愈 15 秒打 5 次（疑 turn 收尾工具 hook 交错，正确性无影响，待查）。→ 自愈路径已删，本条作废。
+- drain-撞-resume 的 300ms 竞态在 pull 下不存在（无 spawn 时钟），已消除一类。→ 队列与 spawn 都没了，本条作废。

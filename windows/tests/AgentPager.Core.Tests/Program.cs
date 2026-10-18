@@ -2822,25 +2822,13 @@ Check(!ocDisconnectedCatalog.Projection().Tasks.First(t => t.Id == "oc-dead").Ca
 var ocDeadAck = ocDisconnectedCatalog.Perform(Guid.NewGuid(), new ControlPayload("oc-dead", ControlAction.Prompt, "通道断开不可发"), ocRec);
 Check(ocDeadAck.Result == ControlResult.Unsupported, "prompt: rejected when opencode channel broken");
 
-// 4. Antigravity Prompt 下发与工作区记录
+// 4. Antigravity Prompt 下发与工作区记录（回调链，注入腿在 5.1c / agy host 段单测）
 var remoteAgyCatalog = new TaskCatalog();
-remoteAgyCatalog.Accept(new AgyHookPayload("PreInvocation", ConversationId: "agy-1", WorkspacePaths: ["F:\\Git\\agy-proj"]));
+remoteAgyCatalog.Accept(new AgyHookPayload("PreInvocation", ConversationId: "agy-1", WorkspacePaths: ["F:\\Git\\agy-proj"], HostPid: Environment.ProcessId));
 var agyRec = new RecordingResolver();
 var agyAck = remoteAgyCatalog.Perform(Guid.NewGuid(), new ControlPayload("agy-1", ControlAction.Prompt, "重构一下模型层"), agyRec);
 Check(agyAck.Result == ControlResult.Accepted, "prompt: agy running prompt accepted");
 Check(agyRec.PromptSessionID == "agy-1" && agyRec.PromptWorkspace == "F:\\Git\\agy-proj" && agyRec.PromptIsRunning == true, "prompt: agy workspace passed to resolver");
-
-// 5. AgyCliDispatcher 队列测试（pull 模型：Stop 问桥要、给一条出一条；spawn drain 已删）
-{
-    AgyCliDispatcher.QueueOrExecute("agy-q1", "排队执行的指令", "F:\\Git\\proj", isRunning: true);
-    AgyCliDispatcher.QueueOrExecute("agy-q1", "排队第二条", "F:\\Git\\proj", isRunning: true);
-    Check(AgyCliDispatcher.HasQueued("agy-q1"), "agy dispatcher: prompt queued when running");
-    Check(AgyCliDispatcher.TryTakeQueued("agy-q1") == "排队执行的指令", "agy dispatcher: handover takes the head");
-    Check(AgyCliDispatcher.QueuedCount("agy-q1") == 1, "agy dispatcher: one left after handover");
-    Check(AgyCliDispatcher.TryTakeQueued("agy-q1") == "排队第二条", "agy dispatcher: FIFO order on handover");
-    Check(!AgyCliDispatcher.HasQueued("agy-q1"), "agy dispatcher: queue is empty after handover");
-    Check(AgyCliDispatcher.TryTakeQueued("agy-q1") is null, "agy dispatcher: empty handover takes nothing");
-}
 
 // 5.1 ClaudePromptDispatcher 队列测试
 var prevClaudeStarter = ClaudePeerClient.ProcessStarter;
@@ -3021,92 +3009,117 @@ finally
     try { File.Delete(qpPath); } catch { }
 }
 
-// 5.1c agy pull 模型（Stop 回包交接；spawn drain 已删）。
-// 回包形状：block + 原文 reason（探针实证：agy 以 SYSTEM_MESSAGE 同一进程续跑）。
+// 5.1c agy 到达即注入（2026-10-19 用户裁定：桥端队列撤除，排队/打断交 agy 的 Queued Messages）
 {
-    var pullBytes = AgyHookOutput.PullPrompt("顺手看看日志");
-    var pullDoc = JsonDocument.Parse(System.Text.Encoding.UTF8.GetString(pullBytes));
-    Check(pullDoc.RootElement.GetProperty("decision").GetString() == "block" &&
-          pullDoc.RootElement.GetProperty("reason").GetString() == "顺手看看日志",
-        "agy pull: handover reply is block + raw prompt");
+    var previousInjector = AgyCliDispatcher.Injector;
+    var previousHostPid = AgyCliDispatcher.HostPidProvider;
+    try
+    {
+        var injected = new List<(int Pid, string Text)>();
+        var livePid = Environment.ProcessId;
+        AgyCliDispatcher.HostPidProvider = _ => livePid;
+        AgyCliDispatcher.Injector = (int pid, string text, out string reason) =>
+        {
+            injected.Add((pid, text));
+            reason = "ok";
+            return true;
+        };
+
+        // 运行中到达 → 立刻注入（不等 Stop、不进任何队列）
+        Check(AgyCliDispatcher.Dispatch("agy-live", "回合中插话", null, isRunning: true), "agy inject: running prompt dispatched immediately");
+        // 完成态到达 → 同样立刻注入
+        Check(AgyCliDispatcher.Dispatch("agy-idle", "完成态再发", null, isRunning: false), "agy inject: completed prompt dispatched immediately");
+        Check(injected.Count == 2 && injected[0].Pid == livePid && injected[0].Text == "回合中插话" && injected[1].Text == "完成态再发",
+            "agy inject: both deliveries hit the host terminal with the raw text");
+
+        // 没有宿主 PID / 宿主已死 → 如实失败，不留任何状态
+        AgyCliDispatcher.HostPidProvider = _ => null;
+        Check(!AgyCliDispatcher.Dispatch("agy-nohost", "无处可注", null, isRunning: false), "agy inject: no host pid fails honestly");
+        AgyCliDispatcher.HostPidProvider = _ => 2147483632;
+        Check(!AgyCliDispatcher.Dispatch("agy-deadhost", "注不进去", null, isRunning: false), "agy inject: dead host terminal is refused");
+
+        // 注入器自己失败（AttachConsole 失败等）→ 原样上报
+        AgyCliDispatcher.HostPidProvider = _ => 4242;
+        AgyCliDispatcher.Injector = (int _, string _, out string reason) => { reason = "AttachConsole 失败"; return false; };
+        Check(!AgyCliDispatcher.Dispatch("agy-fail", "注不进去", null, isRunning: false), "agy inject: injector failure is reported");
+    }
+    finally
+    {
+        AgyCliDispatcher.Injector = previousInjector;
+        AgyCliDispatcher.HostPidProvider = previousHostPid;
+    }
 }
 
-// Stop 保徽章：有排队就留（跟进回合靠 wasQueued 保计时），无排队照旧清。
+// Stop 收尾：这一轮里用户自己提交过跟进（转录本检测）才保留排队徽章，其余清零。
 var agyStopCatalog = new TaskCatalog();
 var agyStopT0 = DateTimeOffset.UtcNow;
 agyStopCatalog.Accept(A("PreInvocation", new { conversationId = "agy-qs" }), agyStopT0);
-var agyStopAck = agyStopCatalog.Perform(Guid.NewGuid(), new ControlPayload("agy-qs", ControlAction.Prompt, "排队那条"), new RecordingResolver());
-Check(agyStopAck.Result == ControlResult.Accepted, "agy pull: prompt queued while running");
-AgyCliDispatcher.QueueOrExecute("agy-qs", "排队那条", null, isRunning: true);
 agyStopCatalog.Accept(A("Stop", new { conversationId = "agy-qs" }), agyStopT0.AddSeconds(2));
-var agyStopTask = agyStopCatalog.Projection().Tasks.First(t => t.Id == "agy-qs");
-Check(agyStopTask.PromptQueued, "agy pull: Stop keeps the badge while the queue is pending");
-Check(AgyCliDispatcher.HasQueued("agy-qs"), "agy pull: Stop does not consume (consumed at handover reply)");
-AgyCliDispatcher.ClearQueued("agy-qs");
+Check(!agyStopCatalog.Projection().Tasks.First(t => t.Id == "agy-qs").PromptQueued,
+    "agy stop: a plain turn ends without the queued badge");
 
-var agyStopEmptyCatalog = new TaskCatalog();
-agyStopEmptyCatalog.Accept(A("PreInvocation", new { conversationId = "agy-qe" }), agyStopT0);
-agyStopEmptyCatalog.Accept(A("Stop", new { conversationId = "agy-qe" }), agyStopT0.AddSeconds(2));
-Check(!agyStopEmptyCatalog.Projection().Tasks.First(t => t.Id == "agy-qe").PromptQueued,
-    "agy pull: Stop without queue clears the badge as before");
-
-// TTL：超期未被 pull 的就地丢弃。
-AgyCliDispatcher.QueueOrExecute("agy-qt", "过期的那条", null, isRunning: true);
-Check(AgyCliDispatcher.SweepExpired("agy-qt", AgyCliDispatcher.QueueEntryTtl, now: DateTimeOffset.UtcNow + TimeSpan.FromMinutes(31)) == 1,
-    "agy queue: expired entry swept");
-Check(!AgyCliDispatcher.HasQueued("agy-qt"), "agy queue: swept queue reads empty");
-
-// 任务回收清队列（与 claude 同款；排队文本只活内存，任务没了 pull 无从谈起）。
-var agyPurgeCatalog = new TaskCatalog();
-var agyPurgeT0 = DateTimeOffset.UtcNow;
-agyPurgeCatalog.Accept(A("PreInvocation", new { conversationId = "agy-qp" }), agyPurgeT0);
-agyPurgeCatalog.Perform(Guid.NewGuid(), new ControlPayload("agy-qp", ControlAction.Prompt, "没等到的那条"), new RecordingResolver());
-AgyCliDispatcher.QueueOrExecute("agy-qp", "没等到的那条", null, isRunning: true);
-agyPurgeCatalog.Accept(A("Stop", new { conversationId = "agy-qp" }), agyPurgeT0.AddSeconds(2));
-// 模拟 11 分钟无活动转离线（静默上限 10 分钟）
-agyPurgeCatalog.Maintain(agyPurgeT0.AddMinutes(11));
-Check(agyPurgeCatalog.Projection().Tasks.First(t => t.Id == "agy-qp").Lifecycle == AgentLifecycle.Offline,
-    "agy queue: silent task enters offline");
-// 离线满 30 分钟后（第 42 分钟）被 Normalize 回收并清队列
-agyPurgeCatalog.Maintain(agyPurgeT0.AddMinutes(42));
-Check(!agyPurgeCatalog.Projection().Tasks.Any(t => t.Id == "agy-qp"), "agy queue: terminal task purged after 30 minutes");
-Check(!AgyCliDispatcher.HasQueued("agy-qp"), "agy queue: purge drops the bridge queue");
-
-// 持久化 round-trip：顺序不变；导入即过期直接丢。
-AgyCliDispatcher.QueueOrExecute("agy-qx", "持久第一条", null, isRunning: true);
-AgyCliDispatcher.QueueOrExecute("agy-qx", "持久第二条", null, isRunning: true);
-var agyExported = AgyCliDispatcher.ExportQueues();
-Check(agyExported.TryGetValue("agy-qx", out var agyExpItems) && agyExpItems.Count == 2 &&
-      agyExpItems[0].Prompt == "持久第一条" && agyExpItems[1].Prompt == "持久第二条",
-    "agy queue: export keeps order");
-Check(AgyCliDispatcher.ClearQueued("agy-qx") == 2, "agy queue: cleared before import");
-Check(AgyCliDispatcher.ImportQueues(agyExported) == 2, "agy queue: import restores all");
-Check(AgyCliDispatcher.TryTakeQueued("agy-qx") == "持久第一条", "agy queue: FIFO order preserved across restart");
-Check(AgyCliDispatcher.ClearQueued("agy-qx") == 1, "agy queue: cleanup");
-var agyStale = new Dictionary<string, List<QueuedPromptRecord>>(StringComparer.Ordinal)
+// 5.1d 「最后观测」寻址：复刻真机场景（A/pidA、B/pidB 都完成 → 关掉 pidB → pidA 的终端 /resume 到 B 并跑一轮）
 {
-    ["agy-qy"] = new()
-    {
-        new("过期的那条", null, DateTimeOffset.UtcNow - TimeSpan.FromMinutes(31)),
-        new("新鲜的那条", null, DateTimeOffset.UtcNow),
-    },
-};
-Check(AgyCliDispatcher.ImportQueues(agyStale) == 1, "agy queue: import drops expired entries");
-Check(AgyCliDispatcher.PeekLastText("agy-qy") == "新鲜的那条", "agy queue: only the fresh entry survives import");
-Check(AgyCliDispatcher.ClearQueued("agy-qy") == 1, "agy queue: cleanup");
+    var switchCatalog = new TaskCatalog();
+    var switchT0 = DateTimeOffset.UtcNow;
+    var livePid = Environment.ProcessId;   // A 的终端（活着）
+    const int deadPid = 2147483632;        // B 的终端（已关闭）
+    switchCatalog.Accept(A("PreInvocation", new { conversationId = "agy-sw-a", hostPid = livePid }), switchT0);
+    switchCatalog.Accept(A("Stop", new { conversationId = "agy-sw-a", hostPid = livePid }), switchT0.AddSeconds(1));
+    switchCatalog.Accept(A("PreInvocation", new { conversationId = "agy-sw-b", hostPid = deadPid }), switchT0.AddSeconds(2));
+    switchCatalog.Accept(A("Stop", new { conversationId = "agy-sw-b", hostPid = deadPid }), switchT0.AddSeconds(3));
+    // 桥至少跑过一次 Maintain（生产里每 300ms 一次）：此时 A 的终端活着 → A 进 _agyHostSeen
+    switchCatalog.Maintain(switchT0.AddSeconds(1));
+    // pidB 的终端关闭；A 的终端 /resume 到 B 并跑了一轮（hook 从 pidA 上报 conversationId=B）
+    switchCatalog.Accept(A("PreInvocation", new { conversationId = "agy-sw-b", hostPid = livePid }), switchT0.AddSeconds(4));
 
-// 徽章自愈：重启后任务行是 hook 重建的（徽章没了），队列还在——Maintain 补回。
-var agyHealCatalog = new TaskCatalog();
-var agyHealT0 = DateTimeOffset.UtcNow;
-agyHealCatalog.Accept(A("PreInvocation", new { conversationId = "agy-qh" }), agyHealT0);
-AgyCliDispatcher.QueueOrExecute("agy-qh", "恢复的那条", null, isRunning: true);
-Check(!agyHealCatalog.Projection().Tasks.First(t => t.Id == "agy-qh").PromptQueued,
-    "agy queue: rebuilt task starts without the badge");
-agyHealCatalog.Maintain(agyHealT0.AddSeconds(5));
-var agyHealTask = agyHealCatalog.Projection().Tasks.First(t => t.Id == "agy-qh");
-Check(agyHealTask.PromptQueued && agyHealTask.UserPrompt == "恢复的那条",
-    $"agy queue: maintain heals the badge from the queue (queued={agyHealTask.PromptQueued} / '{agyHealTask.UserPrompt}')");
-Check(AgyCliDispatcher.ClearQueued("agy-qh") == 1, "agy queue: cleanup");
+    var switched = switchCatalog.Projection().Tasks.ToDictionary(task => task.Id);
+    Check(switched["agy-sw-b"].Capabilities.Contains(TaskCapability.Prompt),
+        "agy addressing: the conversation the terminal last ran keeps the prompt capability");
+    Check(!switched["agy-sw-a"].Capabilities.Contains(TaskCapability.Prompt),
+        "agy addressing: the conversation the terminal switched away from loses the prompt capability");
+    Check(switchCatalog.AgyHostPidServes("agy-sw-b") && !switchCatalog.AgyHostPidServes("agy-sw-a"),
+        "agy addressing: the gate follows the last observed conversation on that pid");
+    Check(switchCatalog.AgyHostPidOf("agy-sw-a") is null,
+        "agy addressing: the superseded conversation's pid mapping is dropped (C)");
+
+    // C 的连带：被切走的任务已不在任何终端 → 下一次 Maintain 直接判离线（不吃"hook 还没到"的十分钟宽限）
+    switchCatalog.Maintain(switchT0.AddSeconds(5));
+    var movedAway = switchCatalog.Projection().Tasks.First(task => task.Id == "agy-sw-a");
+    Check(movedAway.Lifecycle == AgentLifecycle.Offline,
+        "agy addressing: a task whose terminal moved on goes Offline instead of pretending to be watched");
+
+    // 反向恢复：A 在（同一台）终端里重新跑起来 → 映射重建、入口回来（旧映射已清，不会被 incumbent 粘住）
+    switchCatalog.Accept(A("PreInvocation", new { conversationId = "agy-sw-a", hostPid = livePid }), switchT0.AddSeconds(10));
+    var revived = switchCatalog.Projection().Tasks.First(task => task.Id == "agy-sw-a");
+    Check(revived.Lifecycle == AgentLifecycle.Running && revived.Capabilities.Contains(TaskCapability.Prompt),
+        "agy addressing: a conversation that moves back gets its prompt entry again");
+    Check(switchCatalog.AgyHostPidOf("agy-sw-b") is null,
+        "agy addressing: the other side's mapping is dropped symmetrically");
+}
+
+// 5.1e 父子共用一台终端：子代理在跑不该让父会话失去入口（输入框仍归父会话）
+{
+    var familyCatalog = new TaskCatalog();
+    var familyT0 = DateTimeOffset.UtcNow;
+    var livePid = Environment.ProcessId;
+    familyCatalog.Accept(A("PreInvocation", new { conversationId = "agy-par", hostPid = livePid }), familyT0);
+    familyCatalog.Accept(A("PreToolUse", new
+    {
+        conversationId = "agy-par",
+        hostPid = livePid,
+        toolCall = new { name = "invoke_subagent", args = new { Subagents = new[] { new { Role = "researcher", TypeName = "research", Prompt = "调查" } } } },
+    }), familyT0.AddSeconds(1));
+    familyCatalog.Accept(A("PreInvocation", new { conversationId = "agy-par-child", hostPid = livePid }), familyT0.AddSeconds(2));
+
+    var parent = familyCatalog.Projection().Tasks.First(task => task.Id == "agy-par");
+    Check(parent.Subagents.Any(child => child.Id == "agy-par-child"), "agy addressing: the child conversation attaches to the parent");
+    Check(parent.Capabilities.Contains(TaskCapability.Prompt),
+        "agy addressing: a running subagent does not take the parent's prompt entry away");
+    Check(familyCatalog.AgyHostPidServes("agy-par"), "agy addressing: the gate treats parent and child as one terminal");
+    Check(familyCatalog.AgyHostPidOf("agy-par") == livePid,
+        "agy addressing: the parent keeps its pid mapping while the child reports from the same terminal");
+}
 
 // ---------------------------------------------------------------------------
 // 5.2 远程注入第二条腿（2026-10-16 探针定案）：宿主台账 / parked 存活 / env 全量继承 / 送达确认
@@ -3555,13 +3568,36 @@ try
         "agy host: task is succeeded after turn");
 
     // 宿主活着时，35 分钟过去：任务依然在面板（不被超时误判离线，不被 purge），依然是 Succeeded；
-    // 按 Stop-pull 模型，完成态收回输入框（无 turn 可 pull，不给假入口）
+    // 统一控制台按键注入模型：完成态下依然具备 Prompt 能力，可原地按键唤醒
     agyAliveCatalog.Maintain(agyLiveT0.AddMinutes(35));
     var agyLiveTask = agyAliveCatalog.Projection().Tasks.FirstOrDefault(t => t.Id == "agy_live");
     Check(agyLiveTask is not null && agyLiveTask.Lifecycle == AgentLifecycle.Succeeded,
         "agy host: task NOT purged after 35 minutes while host PID is alive");
-    Check(!agyLiveTask!.Capabilities.Contains(TaskCapability.Prompt),
-        "agy host: Succeeded task does NOT have prompt capability (pull only while running)");
+    Check(agyLiveTask!.Capabilities.Contains(TaskCapability.Prompt),
+        "agy host: Succeeded task CAN receive prompt while host alive (console injection)");
+
+    // 控制台按键注入单测：完成态与运行中都**立刻**注入（桥端已无队列）
+    int lastInjectedPid = 0;
+    string? lastInjectedText = null;
+    AgyCliDispatcher.Injector = (int pid, string text, out string reason) =>
+    {
+        lastInjectedPid = pid;
+        lastInjectedText = text;
+        reason = "ok";
+        return true;
+    };
+    AgyCliDispatcher.HostPidProvider = agyAliveCatalog.AgyHostPidOf;
+
+    var agyIdleAck = agyAliveCatalog.Perform(Guid.NewGuid(), new ControlPayload("agy_live", ControlAction.Prompt, "完成态按键注入"), new AllowResolver());
+    Check(agyIdleAck.Result == ControlResult.Accepted, "agy console injection: completed prompt accepted by catalog");
+    var injectedDirectly = AgyCliDispatcher.Dispatch("agy_live", "完成态按键注入", null, isRunning: false);
+    Check(injectedDirectly && lastInjectedPid == agyFakePid && lastInjectedText == "完成态按键注入",
+        $"agy console injection: completed prompt injected via console keystrokes (pid={lastInjectedPid}, text={lastInjectedText})");
+
+    // 运行中到达也立刻注入（排队或打断由 agy 的 Queued Messages 决定，桥不等 Stop）
+    var injectedRunning = AgyCliDispatcher.Dispatch("agy_live", "回合中插话", null, isRunning: true);
+    Check(injectedRunning && lastInjectedPid == agyFakePid && lastInjectedText == "回合中插话",
+        "agy console injection: running prompt injected immediately (no bridge queue)");
 
     // 宿主前台终端关闭（PID 死亡）
     isAgyHostAlive = false;
@@ -3580,6 +3616,8 @@ try
 finally
 {
     ClaudeSessionRegistry.ProcessAliveChecker = agyPrevChecker;
+    AgyCliDispatcher.Injector = ConsoleKeystrokes.InjectViaWorker;
+    AgyCliDispatcher.HostPidProvider = _ => null;
 }
 
 // 外网隧道域名清洗。ngrok 域名靠手填或整段粘贴，脏格式必须在写入配对文本前就挡住——
@@ -3616,6 +3654,89 @@ Check(!PairingSecret.Matches(pairingKey, "not-base64-at-all"), "auth: garbage he
 // 长度不同不能抛异常 —— 抛出去就是 500，而不是干净的 401
 Check(!PairingSecret.Matches(pairingKey, pairingKeyText + "AA"), "auth: longer secret is rejected without throwing");
 Check(!PairingSecret.Matches(pairingKey, pairingKeyText[..8]), "auth: truncated secret is rejected without throwing");
+
+// ---------------------------------------------------------------------------
+// ngrok 孤儿治理（2026-10-19 实测：强杀桥留下孤儿 ngrok，占住免费版单会话名额，
+// 下一次启动的 ngrok 被云端拒绝——退出码 1）
+// ---------------------------------------------------------------------------
+static System.Diagnostics.Process SpawnVictim()
+{
+    var info = new System.Diagnostics.ProcessStartInfo
+    {
+        FileName = "cmd.exe",
+        Arguments = "/c ping -n 60 127.0.0.1 > nul",
+        UseShellExecute = false,
+        CreateNoWindow = true,
+    };
+    return System.Diagnostics.Process.Start(info)!;
+}
+
+// 1. Job Object：关掉 job（等价于宿主进程消失）时成员子进程必须跟着死
+{
+    using var job = ChildProcessJob.TryCreate();
+    Check(job is not null, "child job: job object created");
+    var victim = SpawnVictim();
+    try
+    {
+        Check(job is not null && job.TryAssign(victim), "child job: victim assigned to the job");
+        job?.Dispose();
+        Check(victim.WaitForExit(5000), "child job: closing the job takes the child with it");
+    }
+    finally
+    {
+        try { if (!victim.HasExited) victim.Kill(entireProcessTree: true); } catch { }
+        victim.Dispose();
+    }
+}
+
+// 2. 租约收尸：名字不符必须放过（PID 复用保险丝），名字符合才收
+{
+    var leaseFile = Path.Combine(Path.GetTempPath(), $"agentpager-lease-{Guid.NewGuid():N}.pid");
+    var victim = SpawnVictim();
+    try
+    {
+        ChildProcessLease.Remember(leaseFile, victim.Id);
+        Check(File.Exists(leaseFile), "child lease: pid is remembered on disk");
+        Check(!ChildProcessLease.ReapPrevious(leaseFile, "ngrok"), "child lease: a pid whose name does not match is left alone (pid reuse fuse)");
+        Check(!victim.WaitForExit(500), "child lease: the mismatched process is still alive");
+        Check(!File.Exists(leaseFile), "child lease: the stale pid file is consumed even when nothing is killed");
+
+        ChildProcessLease.Remember(leaseFile, victim.Id);
+        Check(ChildProcessLease.ReapPrevious(leaseFile, "cmd"), "child lease: a matching process name is reaped");
+        Check(victim.WaitForExit(5000), "child lease: the reaped process is gone");
+        Check(!File.Exists(leaseFile), "child lease: the pid file is deleted after reaping");
+
+        ChildProcessLease.Remember(leaseFile, 2147483632);
+        Check(!ChildProcessLease.ReapPrevious(leaseFile, "ngrok"), "child lease: a pid that no longer exists is a quiet no-op");
+    }
+    finally
+    {
+        try { if (!victim.HasExited) victim.Kill(entireProcessTree: true); } catch { }
+        victim.Dispose();
+        try { if (File.Exists(leaseFile)) File.Delete(leaseFile); } catch { }
+    }
+}
+
+// 控制台按键注入的线格式：字符必须是 **16 位 UTF-16** 落进记录。
+// 2026-10-19 真机 bug（另一会话发现、本机复现）：结构体少写 CharSet.Unicode → char 按 ANSI 封送，
+// ASCII 一字不差、中文/全角整条丢失。这里钉住字节层，不依赖真控制台。
+{
+    var encoded = ConsoleKeystrokes.EncodeKeyRecords("回A");
+    Check(encoded.Length == 6 * 20, $"console keystrokes: 3 chars + cr = 6 records x 20 bytes (got {encoded.Length})");
+    // '回' = U+56DE → UTF-16LE DE 56，落在第 0 条的 UnicodeChar（偏移 14）
+    Check(encoded[14] == 0xDE && encoded[15] == 0x56, "console keystrokes: CJK char lands as 16-bit utf-16 (回)");
+    // 'A' = U+0041 → 41 00（ASCII 也必须走同一个 16 位槽）
+    Check(encoded[40 + 14] == 0x41 && encoded[40 + 15] == 0x00, "console keystrokes: ascii uses the same 16-bit slot (A)");
+    Check(encoded[80 + 14] == 0x0D && encoded[80 + 15] == 0x00, "console keystrokes: trailing carriage return closes the line");
+
+    // 换行折成空格、尾附回车（TUI 按回车提交）："一\n二" → 一 空格 二 CR = 4 字符 = 8 条
+    var folded = ConsoleKeystrokes.EncodeKeyRecords("一\n二");
+    Check(folded.Length == 8 * 20, $"console keystrokes: newline folded to a space (got {folded.Length})");
+    Check(folded[14] == 0x00 && folded[15] == 0x4E, "console keystrokes: first char after fold is 一");
+    Check(folded[40 + 14] == 0x20 && folded[40 + 15] == 0x00, "console keystrokes: folded separator is a real space");
+    Check(folded[80 + 14] == 0x8C && folded[80 + 15] == 0x4E, "console keystrokes: third char after fold is 二");
+    Check(folded[120 + 14] == 0x0D, "console keystrokes: folded line still ends with cr");
+}
 
 Console.WriteLine(failures.Count == 0 ? "ALL CHECKS PASSED" : $"FAILURES: {string.Join(", ", failures)}");
 return failures.Count == 0 ? 0 : 1;

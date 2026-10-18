@@ -16,6 +16,8 @@ public static class Program
     [STAThread]
     public static int Main(string[] args)
     {
+        if (args.Contains(ConsoleKeystrokes.WorkerSwitch, StringComparer.OrdinalIgnoreCase))
+            return ConsoleKeystrokes.RunWorker(args);
         if (args.Contains("--hook", StringComparer.OrdinalIgnoreCase))
             return HookClient.RunAsync(args).GetAwaiter().GetResult();
         if (args.Contains("--uninstall-hook", StringComparer.OrdinalIgnoreCase))

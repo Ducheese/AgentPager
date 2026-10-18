@@ -23,6 +23,8 @@ public sealed record AgyHookPayload(
     [property: JsonPropertyName("toolCall")] AgyToolCall? ToolCall = null,
     [property: JsonPropertyName("terminationReason")] string? TerminationReason = null,
     [property: JsonPropertyName("error")] string? Error = null,
+    // 插件（v5 及更早）仍会在 Stop 信封里带 pullPrompt 标记；投递已改为「到达即按键注入」，
+    // 桥不再据此回交接文本，这个字段只作协议留痕，读了也不用。
     [property: JsonPropertyName("pullPrompt")] bool? PullPrompt = null,
     [property: JsonPropertyName("hostPid")] int? HostPid = null)
 {
@@ -644,13 +646,13 @@ public static class AgyEventReducer
                     };
                 }
 
-                // 成功 Stop：排队徽章**保留当且仅当桥端还有没交接的条目**（pull 模型）。
+                // 成功 Stop：排队徽章**保留当且仅当这一轮里用户自己提交过跟进**
+                // （桥端队列已撤，2026-10-19：投递改成到达即注入，排队与否由 agy 的 Queued Messages 决定）。
                 // 跟进回合的 PreInvocation 靠 wasQueued 保计时（startsNewRound 的 !wasQueued 守卫）
                 // 和转录本复写守卫（`!task.PromptQueued` 才覆写 UserPrompt）：这里提前清掉，
                 // 跟进回合会把排队文本误判成真新回合（计时重置 + 第二行被旧提示词顶掉）。
-                // 无排队时照旧清零（与旧行为一致）。
                 if (task.Lifecycle == AgentLifecycle.Offline) return task;
-                var keepQueued = task.PromptQueued && AgyCliDispatcher.HasQueued(sessionID);
+                var keepQueued = task.PromptQueued;
                 return task with
                 {
                     Lifecycle = task.Lifecycle == AgentLifecycle.Interrupted ? AgentLifecycle.Interrupted : AgentLifecycle.Succeeded,
@@ -918,21 +920,6 @@ public static class AgyHookOutput
         {
             decision = "deny",
             reason = body.ToString().TrimEnd('\n'),
-        };
-        return Encoding.UTF8.GetBytes(JsonSerializer.Serialize(payload) + "\n");
-    }
-
-    /// <summary>
-    /// Stop-pull 交接：把排队文本装进 block+reason（探针实证：agy 以 SYSTEM_MESSAGE
-    /// 在同一进程内续跑，后续 turn 可见；连续 block 10 次后 agy 自己收场，无限连锁兜底）。
-    /// 文本原样装入（不加前缀）：手机上发的就是 prompt，终端看到的也该是同一句话。
-    /// </summary>
-    public static byte[] PullPrompt(string prompt)
-    {
-        var payload = new
-        {
-            decision = "block",
-            reason = prompt,
         };
         return Encoding.UTF8.GetBytes(JsonSerializer.Serialize(payload) + "\n");
     }

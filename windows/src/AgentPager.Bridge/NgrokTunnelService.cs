@@ -25,6 +25,13 @@ public sealed class NgrokTunnelService : IAsyncDisposable
     private CancellationTokenSource? _cts;
     private string? _activeHost;
     private NgrokTunnelStatus _status = NgrokTunnelStatus.Stopped;
+    private ChildProcessJob? _job;
+
+    /// <summary>我们自己起的子进程名（收尸时的保险丝，见 <see cref="ChildProcessLease"/>）。</summary>
+    private const string ChildProcessName = "ngrok";
+
+    /// <summary>上一次起的 ngrok PID 落在这里：强杀桥会留孤儿，下次启动先按它收尸。</summary>
+    private static string ChildPidFilePath => Path.Combine(AgentPagerPaths.DataRoot, "ngrok.pid");
 
     public NgrokTunnelStatus Status => _status;
     public string? ActiveHost => _activeHost;
@@ -83,10 +90,14 @@ public sealed class NgrokTunnelService : IAsyncDisposable
 
         try
         {
+            // 上一次若被强杀（Task Manager / Stop-Process）会留下孤儿 ngrok：它还占着 ngrok 免费版
+            // 的单会话名额与保留域名，害我们这次起的 ngrok 被云端拒绝（退出码 1）。先收尸再启动。
+            ChildProcessLease.ReapPrevious(ChildPidFilePath, ChildProcessName, _log.Write);
+
             var psi = new ProcessStartInfo
             {
                 FileName = ngrokExe,
-                Arguments = "http 49362 --log stdout --log-format json",
+                Arguments = $"http {LanBridgeServer.PhonePort} --log stdout --log-format json",
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = false,
@@ -151,6 +162,12 @@ public sealed class NgrokTunnelService : IAsyncDisposable
             }
             _log.Write("INFO", $"已拉起 ngrok 隧道守护进程 PID={process.Id}，使用可执行文件：{ngrokExe}");
 
+            // 绑进 Job Object：本进程一死（含强杀）系统立刻带走它——孤儿从此不再产生。
+            _job?.Dispose();
+            _job = ChildProcessJob.TryCreate(_log.Write);
+            _job?.TryAssign(process, _log.Write);
+            ChildProcessLease.Remember(ChildPidFilePath, process.Id);
+
             _ = Task.Run(() => MonitorOutputAsync(process, token), token);
         }
         catch (Exception ex)
@@ -182,6 +199,7 @@ public sealed class NgrokTunnelService : IAsyncDisposable
                         try
                         {
                             using var doc = JsonDocument.Parse(line);
+                            if (!IsOwnTunnel(doc.RootElement)) continue;
                             if (doc.RootElement.TryGetProperty("url", out var urlProp))
                             {
                                 var rawUrl = urlProp.GetString();
@@ -217,10 +235,12 @@ public sealed class NgrokTunnelService : IAsyncDisposable
                 {
                     var json = await http.GetStringAsync("http://127.0.0.1:4040/api/tunnels", token);
                     using var doc = JsonDocument.Parse(json);
-                    if (doc.RootElement.TryGetProperty("tunnels", out var tunnels) && tunnels.GetArrayLength() > 0)
+                    if (doc.RootElement.TryGetProperty("tunnels", out var tunnels))
                     {
-                        var first = tunnels[0];
-                        if (first.TryGetProperty("public_url", out var pubUrl))
+                        // 4040 是 ngrok 的**全局** API：机器上还有别人的（或我们上一次留下的孤儿）
+                        // 隧道时，必须只认转发到我们自己端口的那一条。
+                        var first = tunnels.EnumerateArray().FirstOrDefault(IsOwnTunnel);
+                        if (first.ValueKind == JsonValueKind.Object && first.TryGetProperty("public_url", out var pubUrl))
                         {
                             var normalized = PairingPayload.NormalizeTunnelHost(pubUrl.GetString());
                             if (!string.IsNullOrEmpty(normalized))
@@ -239,6 +259,23 @@ public sealed class NgrokTunnelService : IAsyncDisposable
         {
             _log.Write("DEBUG", $"ngrok 4040 轮询异常：{ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// 这条隧道是不是我们自己的？ngrok 的 4040 API 是**全局**的：机器上还存在别人（或我们上一次
+    /// 留下的孤儿）的 ngrok 时，会把它的隧道当成我们的报上去——2026-10-19 实测就是这样报出
+    /// "子进程退出码 1"却又"已获取公网域名"的混合状态。判据是隧道配置里的转发目标必须是我们
+    /// 绑定的手机端口；拿不到 addr 就不挑剔（老版本 ngrok 不暴露）。
+    /// </summary>
+    private static bool IsOwnTunnel(JsonElement tunnel)
+    {
+        string? address = null;
+        if (tunnel.ValueKind == JsonValueKind.Object)
+        {
+            if (tunnel.TryGetProperty("addr", out var topLevel)) address = topLevel.GetString();
+            else if (tunnel.TryGetProperty("config", out var config) && config.TryGetProperty("addr", out var nested)) address = nested.GetString();
+        }
+        return string.IsNullOrEmpty(address) || address.Contains(LanBridgeServer.PhonePort.ToString(), StringComparison.Ordinal);
     }
 
     private void UpdateRunningHost(string host)
@@ -295,6 +332,11 @@ public sealed class NgrokTunnelService : IAsyncDisposable
                 _log.Write("WARN", $"终止 ngrok 进程异常：{ex.Message}");
             }
         }
+
+        // 正常收尾：job 关掉（成员子进程随之收尾）并销账，别让下次启动白杀一个已复用的 PID。
+        _job?.Dispose();
+        _job = null;
+        ChildProcessLease.Forget(ChildPidFilePath);
     }
 
     public async ValueTask DisposeAsync()

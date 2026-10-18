@@ -1,187 +1,77 @@
-using System.Collections.Concurrent;
-using System.Diagnostics;
-
 namespace AgentPager.Core;
 
+/// <summary>
+/// Antigravity 的远程 Prompt 投递：**到达即按键注入**宿主终端，桥端不再排队。
+///
+/// 为什么不排队（2026-10-19 用户裁定）：键盘输入就是用户输入，agy 的 TUI 自己就带排队/打断语义
+/// （`/config` 的 `Queued Messages`：`Queue` 攒到回合末、`Send Immediately` 直接打断，
+/// 另可 `alt+m` 反向发送）——"这条算排队还是打断"是 agy 自己的决定，桥替它排一遍只会多一层
+/// 状态（旧 Stop-pull 队列、TTL 清扫、徽章自愈、持久化都据此撤除）。opencode 那条腿也是同一模式：
+/// 桥只负责把 Prompt 送进会话，排不排由对方决定。
+///
+/// 机制与实证见 <see cref="ConsoleKeystrokes"/>：不新起进程、终端里打得出来、完成态也能开新一轮。
+/// 代价是**寻址只到进程**——按键落进那个终端**当前显示**的会话，终端换过会话
+/// （`/resume` 选择器、`@conversation:`、导入别会话）时就不再保证是目标任务。
+/// </summary>
 public static class AgyCliDispatcher
 {
+    public delegate bool ConsoleInjector(int pid, string text, out string reason);
+
+    /// <summary>控制台物理按键注入器（默认起自身短命子进程执行；单测替换成探针）。</summary>
+    public static ConsoleInjector Injector { get; set; } = ConsoleKeystrokes.InjectViaWorker;
+
+    /// <summary>会话 → 宿主 agy 终端 PID（注入目标）。生产环境挂 <c>TaskCatalog.AgyHostPidOf</c>。</summary>
+    public static Func<string, int?> HostPidProvider { get; set; } = _ => null;
+
     /// <summary>
-    /// 桥端待办队列：会话运行中到达的远程 prompt 在这里等 Stop hook 来 pull。
-    /// 投递腿是 Stop 回包（pull 模型，实证见 docs）：脚本问桥要、桥给一条就出队一条，
-    /// 同一进程内续跑——没有新进程、无锁、不烧第二次环境。条目带入队时间戳，
-    /// 超 <see cref="QueueEntryTtl"/> 未被 pull 就地丢弃并记日志。
+    /// 寻址闸门：该会话的宿主终端是否"正对着它"。生产环境挂 <c>TaskCatalog.AgyHostPidServes</c>——
+    /// 终端换过会话（`/resume` 等）后，那个 pid 最近上报的会话就不是本任务了，返回 false。
+    /// 默认放行（未接线的宿主保持旧行为）。
     /// </summary>
-    public static readonly TimeSpan QueueEntryTtl = TimeSpan.FromMinutes(30);
+    public static Func<string, bool> HostServesSession { get; set; } = _ => true;
 
-    private record struct QueuedPrompt(string Prompt, string? Cwd, DateTimeOffset EnqueuedAt);
-
-    private static readonly ConcurrentDictionary<string, ConcurrentQueue<QueuedPrompt>> PendingPrompts = new(StringComparer.Ordinal);
-
-    public static Func<ProcessStartInfo, Process?> ProcessStarter { get; set; } = Process.Start;
-
-    public static bool QueueOrExecute(
+    /// <summary>
+    /// 投递一条 Prompt：定位该会话的宿主终端，按键注入 + 回车，由 agy 自己决定
+    /// 「接着跑（Queue 模式）还是打断当前回合（Send Immediately 模式）」。
+    /// <paramref name="workspaceDir"/> 不参与投递（注入不换工作目录），保留该参数只为与
+    /// Claude / OpenCode 共用 <c>DispatchPrompt</c> 的签名。
+    /// </summary>
+    public static bool Dispatch(
         string sessionID,
         string prompt,
         string? workspaceDir,
         bool isRunning,
         Action<string, string>? log = null)
     {
-        if (isRunning)
+        var hostPid = HostPidProvider(sessionID);
+        if (hostPid is null || hostPid <= 0)
         {
-            var queue = PendingPrompts.GetOrAdd(sessionID, _ => new());
-            queue.Enqueue(new(prompt, workspaceDir, DateTimeOffset.UtcNow));
-            log?.Invoke("INFO", $"[Antigravity] 任务正在运行，Prompt 已加入桥端待办队列（会话 {sessionID}，排队数 {queue.Count}）");
-            return true;
-        }
-
-        return ExecuteAgy(sessionID, prompt, workspaceDir, log);
-    }
-
-    /// <summary>
-    /// Stop-pull 交接：取出队头（出队即消费）。调出方把文本装进 Stop 回包；
-    /// 回包写失败由调出方把条目重回队尾（见 HookTcpServer）。
-    /// </summary>
-    public static string? TryTakeQueued(string sessionID)
-    {
-        if (!PendingPrompts.TryGetValue(sessionID, out var queue)) return null;
-        return queue.TryDequeue(out var pending) ? pending.Prompt : null;
-    }
-
-    /// <summary>重回队尾：交接回包写失败时的兜底（localhost 上基本不可能，防丢失不断链）。</summary>
-    public static void Requeue(string sessionID, string prompt, string? workspaceDir = null)
-    {
-        var queue = PendingPrompts.GetOrAdd(sessionID, _ => new());
-        queue.Enqueue(new(prompt, workspaceDir, DateTimeOffset.UtcNow));
-    }
-
-    /// <summary>
-    /// 丢弃队头起连续过期的条目，返回丢弃数。now 可注入（单测）。
-    /// </summary>
-    public static int SweepExpired(
-        string sessionID,
-        TimeSpan maxAge,
-        Action<string, string>? log = null,
-        DateTimeOffset? now = null)
-    {
-        var current = now ?? DateTimeOffset.UtcNow;
-        if (!PendingPrompts.TryGetValue(sessionID, out var queue)) return 0;
-
-        var dropped = 0;
-        while (queue.TryPeek(out var head) && current - head.EnqueuedAt > maxAge)
-        {
-            queue.TryDequeue(out _);
-            dropped++;
-        }
-
-        if (dropped > 0)
-            log?.Invoke("WARN", $"[Antigravity] 桥端队列 {dropped} 条 Prompt 超 {maxAge.TotalMinutes:0} 分钟未被 pull，已丢弃（会话 {sessionID}）");
-        return dropped;
-    }
-
-    /// <summary>全会话 TTL 清扫（任务行已不在的僵尸条目也清），返回丢弃总数。</summary>
-    public static int SweepAllExpired(
-        TimeSpan maxAge,
-        Action<string, string>? log = null,
-        DateTimeOffset? now = null)
-    {
-        var total = 0;
-        foreach (var sessionID in PendingPrompts.Keys.ToList())
-            total += SweepExpired(sessionID, maxAge, log, now);
-        return total;
-    }
-
-    public static bool HasQueued(string sessionID) =>
-        PendingPrompts.TryGetValue(sessionID, out var queue) && !queue.IsEmpty;
-
-    public static int QueuedCount(string sessionID) =>
-        PendingPrompts.TryGetValue(sessionID, out var queue) ? queue.Count : 0;
-
-    /// <summary>队尾（最新一条）的文本；徽章自愈时与入队登记保持同一语义。</summary>
-    public static string? PeekLastText(string sessionID)
-    {
-        if (!PendingPrompts.TryGetValue(sessionID, out var queue)) return null;
-        var snapshot = queue.ToArray();
-        return snapshot.Length == 0 ? null : snapshot[^1].Prompt;
-    }
-
-    /// <summary>
-    /// 清空整个会话队列（离线/任务回收时调用，调用方把返回值记进日志），返回丢弃条数。
-    /// </summary>
-    public static int ClearQueued(string sessionID)
-    {
-        if (!PendingPrompts.TryRemove(sessionID, out var queue)) return 0;
-        return queue.Count;
-    }
-
-    /// <summary>持久化导出：会话 → 有序条目（队头在前）。空队列不导出。</summary>
-    public static Dictionary<string, List<QueuedPromptRecord>> ExportQueues()
-    {
-        var result = new Dictionary<string, List<QueuedPromptRecord>>(StringComparer.Ordinal);
-        foreach (var (sessionID, queue) in PendingPrompts)
-        {
-            var items = queue.Select(item => new QueuedPromptRecord(item.Prompt, item.Cwd, item.EnqueuedAt)).ToList();
-            if (items.Count > 0) result[sessionID] = items;
-        }
-        return result;
-    }
-
-    /// <summary>
-    /// 启动时恢复：逐条重新入队并立即按 TTL 过期一批。返回实际恢复条数。
-    /// 重复导入会追加——调用方只在启动时调一次。
-    /// </summary>
-    public static int ImportQueues(
-        Dictionary<string, List<QueuedPromptRecord>>? state,
-        Action<string, string>? log = null,
-        DateTimeOffset? now = null)
-    {
-        if (state is null) return 0;
-        var restored = 0;
-        foreach (var (sessionID, items) in state)
-        {
-            var queue = PendingPrompts.GetOrAdd(sessionID, _ => new());
-            foreach (var item in items)
-            {
-                if (string.IsNullOrEmpty(item.Prompt)) continue;
-                queue.Enqueue(new(item.Prompt, item.Cwd, item.EnqueuedAt));
-                restored++;
-            }
-            restored -= SweepExpired(sessionID, QueueEntryTtl, log, now);
-        }
-        if (restored > 0)
-            log?.Invoke("INFO", $"[Antigravity] 重启恢复桥端排队 {restored} 条（等 Stop pull）");
-        return restored;
-    }
-
-    private static bool ExecuteAgy(
-        string sessionID,
-        string prompt,
-        string? workspaceDir,
-        Action<string, string>? log = null)
-    {
-        try
-        {
-            var workDir = workspaceDir ?? Environment.CurrentDirectory;
-            var startInfo = new ProcessStartInfo
-            {
-                FileName = "agy.exe",
-                WorkingDirectory = workDir,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-            };
-            startInfo.ArgumentList.Add("--conversation");
-            startInfo.ArgumentList.Add(sessionID);
-            startInfo.ArgumentList.Add("-p");
-            startInfo.ArgumentList.Add(prompt);
-            startInfo.ArgumentList.Add("--mode");
-            startInfo.ArgumentList.Add("accept-edits");
-            ProcessStarter(startInfo);
-            log?.Invoke("INFO", $"[Antigravity] 已启动 agy 子进程执行新一轮 Prompt（会话 {sessionID}）");
-            return true;
-        }
-        catch (Exception error)
-        {
-            log?.Invoke("WARN", $"[Antigravity] 启动 agy 子进程失败（会话 {sessionID}）：{error.Message}");
+            log?.Invoke("WARN", $"[Antigravity] 找不到会话 {sessionID} 的宿主终端 PID（hook 未上报，或桥重启后还没收到该会话的事件），无法注入");
             return false;
         }
+
+        if (!ClaudeSessionRegistry.ProcessAliveChecker(hostPid.Value))
+        {
+            log?.Invoke("WARN", $"[Antigravity] 会话 {sessionID} 的宿主终端（PID {hostPid.Value}）已退出，注入取消");
+            return false;
+        }
+
+        // 寻址闸门：那个终端最近一次上报的会话不是本任务（换过会话），按键会落进当前显示的那个会话——
+        // 我们无法核实是哪一个（TUI 不显示会话标识），所以拒发而不是赌一把。
+        if (!HostServesSession(sessionID))
+        {
+            log?.Invoke("WARN", $"[Antigravity] 会话 {sessionID} 的宿主终端（PID {hostPid.Value}）最近跑的是别的会话（/resume 换过会话），拒绝注入以免打进别的会话");
+            return false;
+        }
+
+        if (!Injector(hostPid.Value, prompt, out var reason))
+        {
+            log?.Invoke("WARN", $"[Antigravity] 向宿主终端（PID {hostPid.Value}）注入 Prompt 失败（会话 {sessionID}）：{reason}");
+            return false;
+        }
+
+        var moment = isRunning ? "回合进行中，排队或打断由 agy 的 Queued Messages 决定" : "已完成，原地开新一轮";
+        log?.Invoke("INFO", $"[Antigravity] 已按键注入 Prompt（会话 {sessionID}，宿主终端 PID {hostPid.Value}，投递时{moment}）");
+        return true;
     }
 }

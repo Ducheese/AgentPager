@@ -122,7 +122,7 @@ public sealed class HookTcpServer(
                 return ClaudePromptDispatcher.QueueOrExecute(sessionID, prompt, workspaceDir, isRunning, log.Write);
 
             case AgentSource.Antigravity:
-                return AgyCliDispatcher.QueueOrExecute(sessionID, prompt, workspaceDir, isRunning, log.Write);
+                return AgyCliDispatcher.Dispatch(sessionID, prompt, workspaceDir, isRunning, log.Write);
 
             default:
                 log.Write("WARN", $"[Prompt] 不支持的 Agent 来源：{source}");
@@ -293,36 +293,10 @@ public sealed class HookTcpServer(
             }
 
             await hookHandler(envelope);
-            if (envelope is HookEnvelope.Antigravity agyStop &&
-                agyStop.Hook.EffectiveEvent == "Stop" &&
-                agyStop.Hook.PullPrompt == true)
-            {
-                // Stop-pull 交接（pull 模型）：脚本问桥要排队，有货给一条（同时出队，
-                // 发一条清一条，下个 Stop 再来拿也不会重发），无货给空行。
-                // v3 及更早脚本不带 pull 标记 → 走旧分支（空行），队里东西靠 TTL 兜底。
-                var taken = AgyCliDispatcher.TryTakeQueued(sessionID);
-                if (taken is { Length: > 0 } prompt)
-                {
-                    try
-                    {
-                        await stream.WriteAsync(AgyHookOutput.PullPrompt(prompt), cancellationToken);
-                        log.Write("INFO", $"[Antigravity] Stop 接单排队的 Prompt（会话 {sessionID}，剩余排队 {AgyCliDispatcher.QueuedCount(sessionID)}）");
-                    }
-                    catch (Exception error) when (error is IOException or OperationCanceledException)
-                    {
-                        AgyCliDispatcher.Requeue(sessionID, prompt);
-                        log.Write("WARN", $"[Antigravity] Stop 交接回包写失败，已重回队尾（会话 {sessionID}）：{error.Message}");
-                    }
-                }
-                else
-                {
-                    await stream.WriteAsync("\n"u8.ToArray(), cancellationToken);
-                }
-            }
-            else
-            {
-                await stream.WriteAsync("\n"u8.ToArray(), cancellationToken);
-            }
+            // Antigravity 的 Stop 不再做 pull 交接：投递已改成「到达即按键注入」
+            // （AgyCliDispatcher.Dispatch），Stop 只管照常收尾——空回包让插件打 {}，agy 正常结束回合。
+            // 排队/打断的语义由 agy 自己的 Queued Messages 决定，桥不再替它排队。
+            await stream.WriteAsync("\n"u8.ToArray(), cancellationToken);
             client.Dispose();
         }
         catch (Exception error) when (error is IOException or JsonException or OperationCanceledException)

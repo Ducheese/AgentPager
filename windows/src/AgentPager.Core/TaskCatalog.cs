@@ -112,6 +112,11 @@ public sealed class TaskCatalog
     // Antigravity：宿主进程 PID（hook.HostPid）与曾见过的会话集合（用于根据宿主存活判定在线与立即离线）。
     private readonly Dictionary<string, int> _agyHostPids = new(StringComparer.Ordinal);
     private readonly HashSet<string> _agyHostSeen = new(StringComparer.Ordinal);
+    // Antigravity：宿主终端 PID → 在该终端上**最近一次**上报的会话（"最后观测"寻址规则）。
+    // 注入的寻址键只有进程：终端换过会话（`/resume`、`@conversation:`、导入）后按键会落进"当前显示"的会话，
+    // 而 TUI 不显示会话标识、读屏核对不了——所以只放行"该终端最近跑过"的那个会话（父子会话算同一台终端，
+    // 子代理在跑时输入框仍归父会话）。裸切（切过去还没跑、没有 hook）看不见，是已知残余。
+    private readonly Dictionary<int, string> _agyPidLastConversation = new();
 
     /// <summary>逐题推进状态：当前第几题 + 已收集的答案（按题序）。</summary>
     private sealed record QuestionProgress(int Index, List<QuestionAnswer> Answers);
@@ -204,12 +209,13 @@ public sealed class TaskCatalog
                        ClaudeSessionRegistry.ProcessAliveChecker(hostPid);
 
             case AgentSource.Antigravity:
-                // agy 采用 Stop-pull 模型在同进程内无缝续跑：仅运行中（非完成态）开放追加排队；
-                // 完成态下终端已停在提示符，无 turn 可 pull，不给假入口。
-                if (task.Lifecycle != AgentLifecycle.Running) return false;
-                if (_agyHostPids.TryGetValue(task.Id, out var agyHostPid))
-                    return ClaudeSessionRegistry.ProcessAliveChecker(agyHostPid);
-                return true;
+                // agy 统一走控制台物理按键注入（AttachConsole + CONIN$ + WriteConsoleInputW，见 ConsoleKeystrokes）：
+                // 运行中与完成态都能收，只要**记录着活着的宿主终端 PID**。没有 PID 就没处注入
+                // （hook 未上报，或桥重启后还没收到该会话的事件）——此时不给入口，免得手机上点了发送只换来失败。
+                if (!_agyHostPids.TryGetValue(task.Id, out var agyHostPid)) return false;
+                if (!ClaudeSessionRegistry.ProcessAliveChecker(agyHostPid)) return false;
+                // 最后观测：只放行该终端**最近跑过**的会话（父子算同一台），切换过就拒发（见 AgyHostPidServes）。
+                return AgyHostPidServes(task.Id);
 
             default:
                 return false;
@@ -816,9 +822,13 @@ public sealed class TaskCatalog
         if (hook.WorkspacePaths is { Length: > 0 } paths && !string.IsNullOrWhiteSpace(paths[0]))
             _agyWorkspaces[sessionID] = paths[0];
 
+        int? observedHostPid = null;
         if (hook.HostPid is { } rawPid && rawPid > 0)
         {
             var hostPid = AgyProcessResolver.ResolveHostPid(rawPid);
+            observedHostPid = hostPid;
+            // 最后观测：这个终端最近一次跑的是哪个会话——注入寻址的唯一依据（见 AgyHostPidServes）。
+            _agyPidLastConversation[hostPid] = sessionID;
             if (!_agyHostPids.TryGetValue(sessionID, out var incumbent) ||
                 incumbent == hostPid ||
                 !ClaudeSessionRegistry.ProcessAliveChecker(incumbent))
@@ -833,6 +843,11 @@ public sealed class TaskCatalog
         // 2. 解析父会话（内存映射 / 先验派发窗口认领 / 转录本 sender 探测 / SQLite 四重保障）
         var parentSessionID = ResolveAgyParentSession(hook, now, out var resolvedRole);
         parentSessionID ??= !string.IsNullOrWhiteSpace(dbInfo?.ParentConversationId) ? dbInfo.ParentConversationId : null;
+
+        // 2.5 终端换过会话（C，2026-10-19）：同一个 pid 上除父子关系外的旧会话映射作废。
+        // 不清理的话，被切走的任务会一直挂着一个**不会再看它**的终端：既给出假入口，又永远不会判离线。
+        if (observedHostPid is { } currentHostPid)
+            DropSupersededHostPids(sessionID, currentHostPid);
 
         // 3. 如果是子代理会话，更新父任务的 Subagents 列表，绝不建立幽灵顶层任务
         if (parentSessionID is not null)
@@ -1395,31 +1410,14 @@ public sealed class TaskCatalog
 
     private bool CheckAgyQueuedPrompts(DateTimeOffset now, Action<string, string>? log = null)
     {
+        // 桥端队列已撤（2026-10-19：投递改成到达即注入，排队与否由 agy 的 Queued Messages 决定），
+        // 这里只剩**转录本**这一路：用户在本回合进行中亲手提交的跟进（history.jsonl 时间戳 > StartedAt）。
         var changed = false;
-        // 全局 TTL 清扫：任务行已不在的僵尸条目也清（与 claude 的 CheckClaudeQueueHealth 同构）。
-        AgyCliDispatcher.SweepAllExpired(AgyCliDispatcher.QueueEntryTtl, log, now);
         for (var i = 0; i < _tasks.Count; i++)
         {
             var task = _tasks[i];
             if (task.Source != AgentSource.Antigravity) continue;
-            if (AgyEventReducer.DetectQueuedPrompt(task.Id, task) is not { } queued)
-            {
-                // 徽章自愈：重启后任务行是 hook 重建的（徽章没了），队列还在（持久化恢复的）——
-                // 补回 PromptQueued=true + UserPrompt=最新排队（与入队登记同一语义），只补一次。
-                if (!task.IsTerminal && task.Lifecycle != AgentLifecycle.Offline &&
-                    !task.PromptQueued && AgyCliDispatcher.HasQueued(task.Id))
-                {
-                    _tasks[i] = task with
-                    {
-                        UserPrompt = AgyCliDispatcher.PeekLastText(task.Id) ?? task.UserPrompt,
-                        PromptQueued = true,
-                        UpdatedAt = now,
-                    };
-                    log?.Invoke("INFO", $"[Antigravity] 桥端队列非空，补回排队徽章（会话 {task.Id}）");
-                    changed = true;
-                }
-                continue;
-            }
+            if (AgyEventReducer.DetectQueuedPrompt(task.Id, task) is not { } queued) continue;
             if (!task.PromptQueued || task.UserPrompt != queued.Prompt)
             {
                 _tasks[i] = task with
@@ -1720,7 +1718,6 @@ public sealed class TaskCatalog
             _requests.Remove(task.Id);
             _questionItems.Remove(task.Id);
             _questionProgress.Remove(task.Id);
-            AgyCliDispatcher.ClearQueued(task.Id);
             ClaudePromptDispatcher.ClearQueued(task.Id);
 
             _tasks[i] = task with
@@ -1787,6 +1784,46 @@ public sealed class TaskCatalog
 
     /// <summary>该任务此刻是否还挂着待处理请求（权限/作答）。桥用它决定要不要释放挂住的 hook。</summary>
     public bool HasPendingRequest(string taskID) => _requests.ContainsKey(taskID);
+
+    /// <summary>获取 Antigravity 会话对应的宿主终端进程 PID（用于控制台按键注入）。</summary>
+    public int? AgyHostPidOf(string sessionID) =>
+        _agyHostPids.TryGetValue(sessionID, out var pid) ? pid : null;
+
+    /// <summary>
+    /// 同一台终端上报了新会话后，把这个 pid 上**其它会话**的映射清掉（父子保留：父子共用一台终端，
+    /// 子代理在跑时不能摘掉父的映射）。被清掉的任务已经不在任何终端里——随后由 <c>CheckSilentOffline</c>
+    /// 判离线（它已进过 `_agyHostSeen`，不再吃"hook 还没到"的十分钟宽限），不会一直假装"有终端在看"。
+    /// 反过来，如果它之后在**别的终端**里重新跑起来，新 hook 会重建映射（旧 pid 已清，不会再被 incumbent 粘住）
+    /// ——这也是"会话搬终端后能恢复入口"的关键。
+    /// </summary>
+    private void DropSupersededHostPids(string sessionID, int hostPid)
+    {
+        foreach (var (otherSessionID, otherHostPid) in _agyHostPids.ToList())
+        {
+            if (otherHostPid != hostPid || otherSessionID == sessionID) continue;
+            if (IsAgyRelative(sessionID, otherSessionID)) continue;
+            _agyHostPids.Remove(otherSessionID);
+        }
+    }
+
+    private bool IsAgyRelative(string first, string second) =>
+        (_agyChildToParent.TryGetValue(first, out var firstParent) && firstParent == second) ||
+        (_agyChildToParent.TryGetValue(second, out var secondParent) && secondParent == first);
+
+    /// <summary>
+    /// 该会话的宿主终端是否"正对着它"：要求那个终端**最近一次**上报的会话就是它本身，或它的子代理会话
+    /// （父子共用一台终端，子代理在跑时输入框仍归父会话）。终端换过会话（`/resume`、`@conversation:`、导入）
+    /// 后这里会拒发，避免按键落进当前显示的那个会话——TUI 不显示会话标识、读屏核对不了，
+    /// 这是能做的最强判断。**裸切**（切过去还没跑任何一轮、没有 hook）看不见，是已知残余。
+    /// </summary>
+    public bool AgyHostPidServes(string sessionID)
+    {
+        if (!_agyHostPids.TryGetValue(sessionID, out var pid)) return false;
+        if (!_agyPidLastConversation.TryGetValue(pid, out var last)) return false; // 没观测过就不敢发
+        if (string.Equals(last, sessionID, StringComparison.Ordinal)) return true;
+        var task = _tasks.FirstOrDefault(value => value.Id == sessionID);
+        return task is not null && task.Subagents.Any(subagent => string.Equals(subagent.Id, last, StringComparison.Ordinal));
+    }
 
     /// <summary>
     /// 挂起超时：等待人类答复（审批/提问）超过 <paramref name="limit"/> 的行**交回给代理**——
@@ -2176,15 +2213,13 @@ public sealed class TaskCatalog
             task.Id.StartsWith("agentgrid-", StringComparison.Ordinal) && now - task.UpdatedAt >= TimeSpan.FromMinutes(1) ||
             task.Lifecycle == AgentLifecycle.Offline && task.UserPrompt is null && task.Subagents.Count == 0 && now - task.UpdatedAt >= TimeSpan.FromMinutes(1) ||
             task.Lifecycle == AgentLifecycle.Offline && now - task.UpdatedAt > TimeSpan.FromMinutes(30);
-        // 任务回收时连桥端队列一起清（claude 同款；排队文本只活在 dispatcher 内存里，
-        // 任务没了就不可能再被 pull，不清会留下僵尸条目）。
-        foreach (var victim in _tasks.Where(task => task.Source is AgentSource.ClaudeCode or AgentSource.Antigravity && IsPurged(task)).ToList())
+        // 任务回收时连桥端队列一起清（排队文本只活在 dispatcher 内存里，任务没了就不可能再被投递，
+        // 不清会留下僵尸条目）。Antigravity 侧队列已撤（投递改成到达即注入），只剩 Claude 这一家。
+        foreach (var victim in _tasks.Where(task => task.Source == AgentSource.ClaudeCode && IsPurged(task)).ToList())
         {
-            var (dropped, label) = victim.Source == AgentSource.ClaudeCode
-                ? (ClaudePromptDispatcher.ClearQueued(victim.Id), "ClaudeCode")
-                : (AgyCliDispatcher.ClearQueued(victim.Id), "Antigravity");
+            var dropped = ClaudePromptDispatcher.ClearQueued(victim.Id);
             if (dropped > 0)
-                log?.Invoke("WARN", $"[{label}] 任务回收，桥端队列 {dropped} 条未投递 Prompt 已丢弃（会话 {victim.Id}）");
+                log?.Invoke("WARN", $"[ClaudeCode] 任务回收，桥端队列 {dropped} 条未投递 Prompt 已丢弃（会话 {victim.Id}）");
         }
         _tasks.RemoveAll(task => IsPurged(task));
         for (var index = 0; index < _tasks.Count; index++)
@@ -2236,6 +2271,9 @@ public sealed class TaskCatalog
         _claudeRegistrySeen.RemoveWhere(id => !live.Contains(id));
         _agyHostSeen.RemoveWhere(id => !live.Contains(id));
         PruneSessionMap(_agyHostPids, live);
+        // 最后观测台账按**终端存活**剪枝（会话没了不代表终端没了，反之亦然）
+        foreach (var deadPid in _agyPidLastConversation.Keys.Where(pid => !ClaudeSessionRegistry.ProcessAliveChecker(pid)).ToList())
+            _agyPidLastConversation.Remove(deadPid);
         PruneSessionMap(_openCodeDirectories, live);
         PruneSessionMap(_claudeQueuedText, live);
         PruneSessionMap(_claudeTranscripts, live);

@@ -46,8 +46,6 @@ public sealed class BridgeRuntime : IAsyncDisposable
         new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
     private readonly TaskSnapshotPersistence _persistence = new();
     private readonly PromptQueuePersistence _queuePersistence = new();
-    private readonly PromptQueuePersistence _agyQueuePersistence =
-        new(Path.Combine(AgentPagerPaths.DataRoot, "agy-queued-prompts.json"));
     private readonly CodexSessionTitleReader _titleReader = new();
     private readonly CodexRolloutObserver _rollout = new();
     private readonly CodexUsageLoader _usageLoader = new();
@@ -103,10 +101,12 @@ public sealed class BridgeRuntime : IAsyncDisposable
             });
         // 桥端排队文本是纯内存，重启会丢——随任务一起持久化，这里恢复
         // （超 TTL 的在导入时直接丢弃；徽章由 Maintain 的自愈补回）。
+        // Antigravity 无队列可恢复：投递已改成到达即注入（2026-10-19）。
         ClaudePromptDispatcher.ImportQueues(_queuePersistence.Load(), _log.Write);
-        AgyCliDispatcher.ImportQueues(_agyQueuePersistence.Load(), _log.Write);
         _catalog.ApplyTitles(_titleReader.Load());
         _catalog.HasOpenCodeControl = () => _hookServer?.HasOpenCodeControlClients == true;
+        AgyCliDispatcher.HostPidProvider = _catalog.AgyHostPidOf;
+        AgyCliDispatcher.HostServesSession = _catalog.AgyHostPidServes;
         State = CreateState();
     }
 
@@ -598,12 +598,6 @@ public sealed class BridgeRuntime : IAsyncDisposable
         catch (IOException error)
         {
             _lastError = $"保存排队状态失败：{error.Message}";
-            _log.Write("ERROR", _lastError);
-        }
-        try { _agyQueuePersistence.Save(AgyCliDispatcher.ExportQueues()); }
-        catch (IOException error)
-        {
-            _lastError = $"保存 agy 排队状态失败：{error.Message}";
             _log.Write("ERROR", _lastError);
         }
         PublishState();

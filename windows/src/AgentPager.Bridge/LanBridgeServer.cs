@@ -49,6 +49,9 @@ public sealed class LanBridgeServer(
         }
     }
 
+    /// <summary>手机侧（局域网/隧道）接入端口。ngrok 隧道也转发到这里，两处必须同源。</summary>
+    public const int PhonePort = 49362;
+
     private readonly ConcurrentDictionary<Guid, Client> _clients = [];
     private WebApplication? _application;
 
@@ -59,7 +62,7 @@ public sealed class LanBridgeServer(
         var options = new WebApplicationOptions { Args = [], ApplicationName = typeof(LanBridgeServer).Assembly.FullName };
         var builder = WebApplication.CreateSlimBuilder(options);
         builder.Logging.ClearProviders();
-        builder.WebHost.UseUrls("http://0.0.0.0:49362");
+        builder.WebHost.UseUrls($"http://0.0.0.0:{PhonePort}");
         builder.Services.AddRouting();
         var app = builder.Build();
         app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(20) });
