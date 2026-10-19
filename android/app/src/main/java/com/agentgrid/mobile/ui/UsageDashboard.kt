@@ -28,6 +28,7 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -67,9 +68,14 @@ internal fun UsageDashboard(
 ) {
     val availableUsages = remember(usage, usages) {
         val list = usages.ifEmpty { listOfNotNull(usage) }
-        list.distinctBy { it.planType ?: it.limitID }
+        list.distinctBy { providerKey(it) }
     }
-    var selectedProviderIndex by remember(availableUsages) { mutableStateOf(0) }
+    // 选择按提供商身份记住，而不是按列表实例：额度每 10 分钟刷新会重建 list，
+    // 旧写法 remember(availableUsages) 会把用户踢回第一个提供商。
+    var selectedProviderKey by remember { mutableStateOf<String?>(null) }
+    val selectedProviderIndex = availableUsages
+        .indexOfFirst { providerKey(it) == selectedProviderKey }
+        .takeIf { it >= 0 } ?: 0
     val activeUsage = availableUsages.getOrNull(selectedProviderIndex) ?: usage
     var selectedRange by remember { mutableStateOf(UsageRange.SEVEN_DAYS) }
     val allPoints = activeUsage?.dailyUsage.orEmpty()
@@ -97,7 +103,9 @@ internal fun UsageDashboard(
                     usage = activeUsage,
                     availableUsages = availableUsages,
                     selectedUsageIndex = selectedProviderIndex,
-                    onSelectUsageIndex = { selectedProviderIndex = it },
+                    onSelectUsageIndex = { index ->
+                        availableUsages.getOrNull(index)?.let { selectedProviderKey = providerKey(it) }
+                    },
                     connected = connected,
                     modifier = Modifier.fillMaxWidth(),
                     compact = true,
@@ -134,7 +142,9 @@ internal fun UsageDashboard(
                     usage = activeUsage,
                     availableUsages = availableUsages,
                     selectedUsageIndex = selectedProviderIndex,
-                    onSelectUsageIndex = { selectedProviderIndex = it },
+                    onSelectUsageIndex = { index ->
+                        availableUsages.getOrNull(index)?.let { selectedProviderKey = providerKey(it) }
+                    },
                     connected = connected,
                     modifier = Modifier
                         .width(quotaWidth)
@@ -177,7 +187,11 @@ private fun QuotaPanel(
     val isAgy = usage?.planType?.contains("Antigravity", ignoreCase = true) == true
     val windows = usage?.windows.orEmpty()
     val hasThreeP = windows.any { it.key.startsWith("3p") }
-    var selectedGroup by remember(usage) { mutableStateOf(0) } // 0 = Gemini, 1 = 3P
+    // 分组选择同样不能被额度刷新重置；3P 消失时回到 Gemini，回来不自动跳回 3P
+    var selectedGroup by remember { mutableStateOf(0) } // 0 = Gemini, 1 = 3P
+    LaunchedEffect(hasThreeP) {
+        if (!hasThreeP) selectedGroup = 0
+    }
 
     // 画条的两个窗口：先按 key 取（agy 的 primary/secondary），取不到就退到"前两个要画条的窗口"——
     // 这样新增提供商不用改这里也能显示（Command Code 的 key 就不是 primary/secondary）。
@@ -232,23 +246,32 @@ private fun QuotaPanel(
                 modifier = Modifier.weight(1f),
                 verticalArrangement = Arrangement.spacedBy(2.dp),
             ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        "${providerLabel(usage)} 额度",
-                        color = AgentGridColors.Text,
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.Bold,
-                    )
-                    if (availableUsages.size > 1) {
-                        ProviderSwitcher(
-                            usages = availableUsages,
-                            selectedIndex = selectedUsageIndex,
-                            onSelect = onSelectUsageIndex,
+                BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+                    // 极窄分屏里标题和三个切换键挤一行，会把 CODEX 逐字母折行、按钮被拉高。
+                    // 低于阈值就整组隐藏（要切提供商把窗口拉宽），比折行可用。
+                    val showProviderSwitcher =
+                        availableUsages.size > 1 && maxWidth >= 170.dp
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "${providerLabel(usage)} 额度",
+                            color = AgentGridColors.Text,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false),
                         )
+                        if (showProviderSwitcher) {
+                            ProviderSwitcher(
+                                usages = availableUsages,
+                                selectedIndex = selectedUsageIndex,
+                                onSelect = onSelectUsageIndex,
+                            )
+                        }
                     }
                 }
                 Text(
@@ -340,6 +363,8 @@ private fun ProviderSwitcher(
                     color = if (selected) AgentGridColors.Cyan else AgentGridColors.Muted,
                     fontSize = 8.sp,
                     fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    softWrap = false,
                 )
             }
         }
@@ -718,3 +743,7 @@ private fun quotaColor(remaining: Int?): Color = when {
     remaining < 20 -> AgentGridColors.Orange
     else -> AgentGridColors.Cyan
 }
+
+/** 提供商的稳定身份：跨越额度刷新仍是同一个值，选择状态才不会被重建的列表冲掉。 */
+private fun providerKey(usage: UsageSnapshot): String =
+    usage.planType ?: usage.limitID ?: ""

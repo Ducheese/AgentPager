@@ -80,9 +80,16 @@ object TaskDashboardProjector {
         require(visibleLimit > 0) { "可见任务数量必须大于零" }
 
         val orderedTasks = normalize(tasks).sortedWith(taskComparator)
-        val visibleTaskIDs = orderedTasks
-            .take(visibleLimit)
-            .map { it.id }
+        val focusedTaskID = preferredFocusedTaskID
+            ?.takeIf { preferred -> orderedTasks.any { it.id == preferred } }
+            ?: previous?.focusedTaskID
+                ?.takeIf { previousID -> orderedTasks.any { it.id == previousID } }
+            ?: orderedTasks.maxWithOrNull(focusComparator)?.id
+        // 聚焦任务可能要跳出可见上限（从完成通知点进来的是一个已经排到后面的旧任务）：
+        // 把它补进集合，但显示顺序仍按 orderedTasks，避免普通点击让行“跳”到最前。
+        val visibleIDs = orderedTasks.take(visibleLimit).mapTo(linkedSetOf()) { it.id }
+        focusedTaskID?.let(visibleIDs::add)
+        val visibleTaskIDs = orderedTasks.filter { it.id in visibleIDs }.map { it.id }
         val enteringVisibleTaskIDs = if (previous?.visibleTaskIDs.isNullOrEmpty()) {
             emptySet()
         } else {
@@ -105,11 +112,6 @@ object TaskDashboardProjector {
             idleDelayMillis = idleDelayMillis,
         )
         val automaticDashboardVisible = orderedTasks.isEmpty()
-        val focusedTaskID = preferredFocusedTaskID
-            ?.takeIf { preferred -> orderedTasks.any { it.id == preferred } }
-            ?: previous?.focusedTaskID
-                ?.takeIf { previousID -> orderedTasks.any { it.id == previousID } }
-            ?: orderedTasks.maxWithOrNull(focusComparator)?.id
         val urgentTaskID = orderedTasks.firstOrNull {
             it.lifecycle == AgentLifecycle.WAITING_APPROVAL ||
                 it.lifecycle == AgentLifecycle.WAITING_ANSWER

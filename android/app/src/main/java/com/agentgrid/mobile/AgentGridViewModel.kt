@@ -8,17 +8,21 @@ import androidx.core.content.edit
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.agentgrid.mobile.domain.ControlAction
+import com.agentgrid.mobile.domain.ControlResult
 import com.agentgrid.mobile.domain.PendingRequest
 import com.agentgrid.mobile.domain.StateSnapshotPayload
 import com.agentgrid.mobile.domain.TaskDashboardProjection
 import com.agentgrid.mobile.domain.TaskDashboardProjector
 import com.agentgrid.mobile.domain.TaskSnapshot
 import com.agentgrid.mobile.domain.UsageSnapshot
+import com.agentgrid.mobile.network.ControlDelivery
+import com.agentgrid.mobile.network.ControlSubmission
 import com.agentgrid.mobile.network.LinkState
 import com.agentgrid.mobile.network.PairingOutcome
 import com.agentgrid.mobile.network.PairingSummary
 import com.agentgrid.mobile.network.PhoneSessionFactory
 import com.agentgrid.mobile.network.PhoneSessionProblem
+import com.agentgrid.mobile.network.PhoneSessionState
 import com.agentgrid.mobile.service.LinkKeepAliveService
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -37,10 +41,23 @@ data class AgentGridUiState(
     val pairingError: String? = null,
     val terminalMode: Boolean = true,
     val speakingTaskId: String? = null,
+    val controlFeedback: Map<String, ControlFeedback> = emptyMap(),
+    /** 从完成通知点进来、还没消费的任务；等它出现在快照里再展开/滚动。 */
+    val openTaskRequest: String? = null,
+    val speechFailure: ReplySpeech.SpeechFailure? = null,
+    val speechRate: Float = 2.0f,
 ) {
     val focusedTask: TaskSnapshot?
         get() = taskProjection.focusedTask
 }
+
+enum class ControlFeedbackKind { SENDING, SENT, FAILED }
+
+data class ControlFeedback(
+    val action: ControlAction,
+    val kind: ControlFeedbackKind,
+    val message: String? = null,
+)
 
 class AgentGridViewModel(application: Application) : AndroidViewModel(application) {
     private val preferences =
@@ -48,6 +65,7 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
     private val mutableState = MutableStateFlow(
         AgentGridUiState(
             terminalMode = preferences.getBoolean("terminal-mode", true),
+            speechRate = preferences.getFloat("speech-rate", 2.0f),
         ),
     )
     val state: StateFlow<AgentGridUiState> = mutableState.asStateFlow()
@@ -67,15 +85,36 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
     private var keepAliveRequested = false
     private var latestSnapshot = StateSnapshotPayload(emptyList())
     private var dashboardTransitionJob: Job? = null
+    private var openTaskTimeout: Job? = null
+
+    private data class PendingControl(
+        val taskID: String,
+        val action: ControlAction,
+        val sentValue: String?,
+    )
+
+    private val pendingControls = mutableMapOf<String, PendingControl>()
+    private val feedbackJobs = mutableMapOf<String, Job>()
+
+    /** 只有这些动作值得占用一行反馈；mark-read/mute 之类静默发送，不打扰界面。 */
+    private val trackedActions = setOf(
+        ControlAction.PROMPT,
+        ControlAction.ANSWER,
+        ControlAction.APPROVE,
+        ControlAction.DENY,
+    )
 
     init {
         viewModelScope.launch {
             phoneSession.state.collect { session ->
                 val snapshotChanged = latestSnapshot != session.snapshot
                 latestSnapshot = session.snapshot
+                val requestedOpen = mutableState.value.openTaskRequest
+                    ?.takeIf { id -> session.snapshot.tasks.any { it.id == id } }
                 val projection = if (snapshotChanged) {
                     TaskDashboardProjector.project(
-                        snapshot = session.snapshot,
+                        tasks = session.snapshot.tasks,
+                        preferredFocusedTaskID = requestedOpen ?: session.snapshot.focusedTaskID,
                         previous = mutableState.value.taskProjection,
                         now = System.currentTimeMillis(),
                     )
@@ -95,6 +134,7 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
                 )
                 if (session.pairing != null) ensureKeepAliveService()
                 if (snapshotChanged) scheduleDashboardTransition(projection)
+                resolveControls(session)
             }
         }
         viewModelScope.launch {
@@ -103,6 +143,11 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             ReplySpeech.speakingTaskId.collect { speakingTaskId ->
                 mutableState.value = mutableState.value.copy(speakingTaskId = speakingTaskId)
+            }
+        }
+        viewModelScope.launch {
+            ReplySpeech.failure.collect { failure ->
+                mutableState.value = mutableState.value.copy(speechFailure = failure)
             }
         }
     }
@@ -162,6 +207,11 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
             ReplySpeech.stop()
             phoneSession.unpair()
             keepAliveRequested = false
+            pendingControls.clear()
+            feedbackJobs.values.forEach { it.cancel() }
+            feedbackJobs.clear()
+            promptDrafts.clear()
+            mutableState.value = mutableState.value.copy(controlFeedback = emptyMap())
             runCatching {
                 getApplication<Application>().stopService(
                     Intent(getApplication(), LinkKeepAliveService::class.java),
@@ -176,9 +226,117 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
         value: String? = null,
         values: List<String>? = null,
     ) {
-        viewModelScope.launch {
-            phoneSession.control(taskID, action, value, values)
+        if (action !in trackedActions) {
+            viewModelScope.launch { phoneSession.control(taskID, action, value, values) }
+            return
         }
+        if (action == ControlAction.PROMPT && value.isNullOrBlank()) return
+        // 同一个任务同一个动作还没有结果时不再发第二遍（按钮虽已禁用，这里兜住其它入口）
+        if (pendingControls.values.any { it.taskID == taskID && it.action == action }) return
+        setFeedback(taskID, ControlFeedback(action, ControlFeedbackKind.SENDING))
+        viewModelScope.launch {
+            val submission = runCatching { phoneSession.control(taskID, action, value, values) }
+                .getOrElse { ControlSubmission.Rejected(PhoneSessionProblem.TransportFailure) }
+            when (submission) {
+                is ControlSubmission.Rejected -> setFeedback(
+                    taskID,
+                    ControlFeedback(action, ControlFeedbackKind.FAILED, submission.problem.label()),
+                )
+                is ControlSubmission.Queued -> {
+                    pendingControls[submission.requestID] = PendingControl(taskID, action, value)
+                    // 回执可能比 control() 返回还快，立刻对一次当前状态，避免漏判
+                    resolveControls(phoneSession.state.value)
+                }
+            }
+        }
+    }
+
+    /**
+     * 把 control.ack 与快照变化归并成一次「发送中 → 已发送/失败」的判定。
+     * 旧版桥只在失败时回执，所以成功还要能从快照反推（prompt 已落到任务、提问卡已消失）。
+     */
+    private fun resolveControls(session: PhoneSessionState) {
+        if (pendingControls.isEmpty()) return
+        val tasks = session.snapshot.tasks.associateBy { it.id }
+        val waitingTaskIDs = session.snapshot.pendingRequests.mapTo(HashSet()) { it.taskID }
+        val finished = mutableListOf<String>()
+
+        for ((requestID, control) in pendingControls) {
+            when (val delivery = session.controls[requestID]) {
+                is ControlDelivery.Acknowledged -> {
+                    if (delivery.result == ControlResult.ACCEPTED) {
+                        succeed(control)
+                    } else {
+                        fail(control, delivery.reason ?: "服务器拒绝了这次操作")
+                    }
+                    finished += requestID
+                }
+                ControlDelivery.TimedOut -> {
+                    fail(control, "发送超时，未确认送达")
+                    finished += requestID
+                }
+                ControlDelivery.SendFailed -> {
+                    fail(control, "网络发送失败")
+                    finished += requestID
+                }
+                is ControlDelivery.Pending, null -> Unit
+            }
+            if (requestID in finished) continue
+
+            val reflected = when (control.action) {
+                ControlAction.PROMPT ->
+                    control.sentValue != null && tasks[control.taskID]?.userPrompt == control.sentValue
+                ControlAction.ANSWER, ControlAction.APPROVE, ControlAction.DENY ->
+                    control.taskID !in waitingTaskIDs
+                else -> false
+            }
+            if (reflected) {
+                succeed(control)
+                finished += requestID
+            }
+        }
+        finished.forEach { pendingControls.remove(it) }
+    }
+
+    private fun succeed(control: PendingControl) {
+        setFeedback(control.taskID, ControlFeedback(control.action, ControlFeedbackKind.SENT))
+        // 发送期间用户没有继续改，才清掉这条草稿；新版内容保留
+        if (control.action == ControlAction.PROMPT &&
+            control.sentValue != null &&
+            promptDrafts[control.taskID] == control.sentValue
+        ) {
+            promptDrafts.remove(control.taskID)
+        }
+        feedbackJobs.remove(control.taskID)?.cancel()
+        feedbackJobs[control.taskID] = viewModelScope.launch {
+            delay(2_500)
+            if (mutableState.value.controlFeedback[control.taskID]?.kind == ControlFeedbackKind.SENT) {
+                setFeedback(control.taskID, null)
+            }
+        }
+    }
+
+    private fun fail(control: PendingControl, message: String) {
+        setFeedback(
+            control.taskID,
+            ControlFeedback(control.action, ControlFeedbackKind.FAILED, message),
+        )
+    }
+
+    private fun setFeedback(taskID: String, feedback: ControlFeedback?) {
+        val current = mutableState.value.controlFeedback
+        val next = if (feedback == null) current - taskID else current + (taskID to feedback)
+        if (next != current) mutableState.value = mutableState.value.copy(controlFeedback = next)
+    }
+
+    private fun PhoneSessionProblem.label(): String = when (this) {
+        PhoneSessionProblem.NotPaired -> "未配对"
+        PhoneSessionProblem.NotConnected -> "连接已断开"
+        PhoneSessionProblem.TransportFailure -> "网络发送失败"
+        PhoneSessionProblem.SequenceFailure -> "发送序号异常"
+        PhoneSessionProblem.ProtocolFailure -> "消息编码失败"
+        PhoneSessionProblem.InvalidSecret -> "配对密钥无效"
+        else -> "发送失败"
     }
 
     fun focus(taskID: String) {
@@ -198,10 +356,52 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
         mutableState.value = mutableState.value.copy(terminalMode = enabled)
     }
 
+    /**
+     * 从完成通知进入：把该任务拉进可见集合（可能已跌出 5 条上限）、关掉额度面板、
+     * 标记已读，并留下一次「展开 + 滚到这行」的请求交给界面消费。
+     */
+    fun openTask(taskID: String) {
+        val current = mutableState.value
+        val projection = TaskDashboardProjector.project(
+            tasks = latestSnapshot.tasks,
+            preferredFocusedTaskID = taskID,
+            previous = current.taskProjection,
+            manualDashboardOverride = false,
+            now = System.currentTimeMillis(),
+        )
+        mutableState.value = current.copy(
+            taskProjection = projection,
+            openTaskRequest = taskID,
+        )
+        control(taskID, ControlAction.MARK_READ)
+        // 任务若一直没出现在快照里（被删除/桥重启前的事件），别让这个请求永久挂着
+        openTaskTimeout?.cancel()
+        openTaskTimeout = viewModelScope.launch {
+            delay(60_000)
+            consumeOpenTask(taskID)
+        }
+    }
+
+    fun consumeOpenTask(taskID: String) {
+        openTaskTimeout?.cancel()
+        openTaskTimeout = null
+        if (mutableState.value.openTaskRequest == taskID) {
+            mutableState.value = mutableState.value.copy(openTaskRequest = null)
+        }
+    }
+
+    fun setSpeechRate(rate: Float) {
+        preferences.edit { putFloat("speech-rate", rate) }
+        mutableState.value = mutableState.value.copy(speechRate = rate)
+    }
+
     override fun onCleared() {
         dashboardTransitionJob?.cancel()
-        // 会话是进程级单例：Activity/ViewModel 销毁不等于断开，保活服务还握着这条连接。
-        // 真正断开只有 unpair（或进程死亡）。
+        openTaskTimeout?.cancel()
+        feedbackJobs.values.forEach { it.cancel() }
+        feedbackJobs.clear()
+        // 会话是进程级单例：Activity/ViewModel 销毁不等于断开，保活服务还握着这条连接
+        // 真正断开只有 unpair（或进程死亡）
     }
 
     private fun scheduleDashboardTransition(projection: TaskDashboardProjection) {

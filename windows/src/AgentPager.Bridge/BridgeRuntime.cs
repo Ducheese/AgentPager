@@ -531,6 +531,8 @@ public sealed class BridgeRuntime : IAsyncDisposable
         // "Hook 审批通道已失效"）。这批以前全是静默的 ✗ —— App 上只看到"点了没反应"。
         if (acknowledgment.Result != ControlResult.Accepted)
             _log.Write("WARN", $"控制未被接受（{acknowledgment.Result}）：{request.Payload.Action} / 任务 {request.Payload.TaskID} / {acknowledgment.Reason}");
+        // 成功也要回执：手机端把「发送中…」落成「已发送」并清掉 prompt 草稿；
+        // 以前只回失败，等于让每一次成功操作在手机上 15 秒后必超时（旧 App 没人读所以没暴露）。
         var envelope = MessageEnvelope<ControlAckPayload>.Create("control.ack", acknowledgment);
         if (_lanServer is not null)
             await _lanServer.BroadcastAsync(JsonSerializer.Serialize(envelope, WireJson.Options));

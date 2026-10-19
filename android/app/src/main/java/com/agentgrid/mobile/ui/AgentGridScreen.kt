@@ -72,6 +72,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
@@ -85,6 +86,9 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.zIndex
 import com.agentgrid.mobile.AgentGridUiState
+import com.agentgrid.mobile.ControlFeedback
+import com.agentgrid.mobile.ControlFeedbackKind
+import com.agentgrid.mobile.ReplySpeech
 import com.agentgrid.mobile.SoundEngine
 import com.agentgrid.mobile.TaskSoundTracker
 import com.agentgrid.mobile.domain.AgentActivity
@@ -144,7 +148,9 @@ fun AgentGridScreen(
     onControl: (String, ControlAction, String?, List<String>?) -> Unit,
     onFocus: (String) -> Unit,
     onToggleDashboard: () -> Unit,
-    onExitTerminal: () -> Unit,
+    onToggleTerminalMode: () -> Unit,
+    onOpenTaskConsumed: (String) -> Unit,
+    onSpeechRateChange: (Float) -> Unit,
     onToggleReplySpeech: (String) -> Unit,
     inMultiWindow: Boolean,
     promptDrafts: Map<String, String>,
@@ -181,7 +187,9 @@ fun AgentGridScreen(
                     onControl = onControl,
                     onFocus = onFocus,
                     onToggleDashboard = onToggleDashboard,
-                    onExitTerminal = onExitTerminal,
+                    onToggleTerminalMode = onToggleTerminalMode,
+                    onOpenTaskConsumed = onOpenTaskConsumed,
+                    onSpeechRateChange = onSpeechRateChange,
                     onToggleReplySpeech = onToggleReplySpeech,
                     promptDrafts = promptDrafts,
                     onPromptDraftChange = onPromptDraftChange,
@@ -401,7 +409,9 @@ private fun TaskTerminal(
     onControl: (String, ControlAction, String?, List<String>?) -> Unit,
     onFocus: (String) -> Unit,
     onToggleDashboard: () -> Unit,
-    onExitTerminal: () -> Unit,
+    onToggleTerminalMode: () -> Unit,
+    onOpenTaskConsumed: (String) -> Unit,
+    onSpeechRateChange: (Float) -> Unit,
     onToggleReplySpeech: (String) -> Unit,
     promptDrafts: Map<String, String>,
     onPromptDraftChange: (String, String) -> Unit,
@@ -445,12 +455,34 @@ private fun TaskTerminal(
         else if (showDashboard) onToggleDashboard()
     }
 
+    // 从完成通知进入：等任务进入可见集合（可能刚随快照到达），再展开并滚到它。
+    LaunchedEffect(
+        state.openTaskRequest,
+        state.taskProjection.dashboardVisible,
+        visibleTasks.map { it.id },
+    ) {
+        val taskID = state.openTaskRequest ?: return@LaunchedEffect
+        if (state.taskProjection.dashboardVisible) return@LaunchedEffect
+        val index = visibleTasks.indexOfFirst { it.id == taskID }
+        if (index < 0) return@LaunchedEffect
+        expandedTaskID = taskID
+        taskListState.animateScrollToItem(index + 1)
+        onOpenTaskConsumed(taskID)
+    }
+
     BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
-            .background(AgentGridColors.Background),
+            .background(AgentGridColors.Background)
+            // 键盘 inset 由根容器承担：横屏的列表有 306dp 上限，若把 padding 加在列表上，
+            // 会变成 306 − 键盘高度（浮窗键盘 inset=0 时不受影响，也不会多出空白）。
+            .imePadding(),
     ) {
-        val isCompact = maxWidth < 600.dp || maxHeight > maxWidth
+        // 紧凑判定必须看**窗口**而不是键盘后的可用高度：竖屏键盘一弹，剩余高度可能小于宽度，
+        // 用 maxHeight > maxWidth 会把布局误判成横屏（正好会把横屏的问题带回来）。
+        val configuration = LocalConfiguration.current
+        val isPortraitWindow = configuration.screenHeightDp > configuration.screenWidthDp
+        val isCompact = maxWidth < 600.dp || isPortraitWindow
         val isVeryNarrow = maxWidth < 400.dp
 
         TopControls(
@@ -516,9 +548,7 @@ private fun TaskTerminal(
                         .then(
                             if (isCompact) Modifier.fillMaxHeight()
                             else Modifier.heightIn(max = 306.dp)
-                        )
-                        // 键盘弹起时列表底部让位（edge-to-edge 场景生效；adjustResize 时由窗口收缩兜底）
-                        .imePadding(),
+                        ),
                     verticalArrangement = Arrangement.spacedBy(0.dp),
                 ) {
                     item(key = TaskListAnchorKey) {
@@ -568,8 +598,10 @@ private fun TaskTerminal(
                             compact = isCompact,
                             speakingTaskId = state.speakingTaskId,
                             onToggleReplySpeech = onToggleReplySpeech,
-                            promptDraft = promptDrafts[task.id].orEmpty(),
-                            onPromptDraftChange = onPromptDraftChange,
+                                promptDraft = promptDrafts[task.id].orEmpty(),
+                                onPromptDraftChange = onPromptDraftChange,
+                                feedback = state.controlFeedback[task.id],
+                                speechFailure = state.speechFailure,
                             onClick = {
                                 val willExpand = expandedTaskID != task.id
                                 expandedTaskID = if (willExpand) task.id else null
@@ -601,8 +633,9 @@ private fun TaskTerminal(
                     sound.setEnabled(enabled)
                     soundEnabled = enabled
                 },
+                onSpeechRateChange = onSpeechRateChange,
                 onUnpair = onUnpair,
-                onExitTerminal = onExitTerminal,
+                onToggleTerminalMode = onToggleTerminalMode,
                 onControl = onControl,
                 // 矮窗口（横屏/悬浮窗）下 6 行会顶出可视区：面板限高 + 内部滚动，键才点得到。
                 panelMaxHeight = maxHeight - 60.dp,
@@ -749,10 +782,12 @@ private fun TaskRow(
     compact: Boolean = false,
     speakingTaskId: String?,
     promptDraft: String,
+    onPromptDraftChange: (String, String) -> Unit,
+    feedback: ControlFeedback? = null,
+    speechFailure: ReplySpeech.SpeechFailure? = null,
     onClick: () -> Unit,
     onControl: (String, ControlAction, String?, List<String>?) -> Unit,
     onToggleReplySpeech: (String) -> Unit,
-    onPromptDraftChange: (String, String) -> Unit,
 ) {
     val rowAlpha by animateFloatAsState(
         targetValue = if (dimmed) 0.34f else 1f,
@@ -858,6 +893,8 @@ private fun TaskRow(
                 onControl = onControl,
                 onToggleReplySpeech = onToggleReplySpeech,
                 onPromptDraftChange = onPromptDraftChange,
+                feedback = feedback,
+                speechFailure = speechFailure,
             )
         }
 
@@ -1019,8 +1056,19 @@ private fun TaskDetails(
     onControl: (String, ControlAction, String?, List<String>?) -> Unit,
     onToggleReplySpeech: (String) -> Unit,
     onPromptDraftChange: (String, String) -> Unit,
+    feedback: ControlFeedback? = null,
+    speechFailure: ReplySpeech.SpeechFailure? = null,
 ) {
     var answer by remember(task.id, pending?.summary) { mutableStateOf("") }
+    val answerFeedbackActions = remember {
+        setOf(ControlAction.APPROVE, ControlAction.DENY, ControlAction.ANSWER)
+    }
+    val promptFeedbackActions = remember { setOf(ControlAction.PROMPT) }
+    val sending = feedback?.kind == ControlFeedbackKind.SENDING
+    val answerBusy = feedback?.let {
+        it.kind == ControlFeedbackKind.SENDING && it.action in answerFeedbackActions
+    } == true
+    val promptBusy = sending && feedback?.action == ControlAction.PROMPT
     // 非完成态也显示：第三行会被后续工具步顶掉，展开后的 REPLY 面板是唯一能留住中途正文的地方。
     // 三家在回合中都会喂 ResponseBody（agy 的 PostInvocation、opencode 的 reply 事件、
     // Claude 的心跳全文），只是以前这里卡了 SUCCEEDED 才把它挡住。
@@ -1057,6 +1105,7 @@ private fun TaskDetails(
                     markdown = task.responseBody!!,
                     speaking = speaking,
                     canSpeak = task.isTerminal,
+                    failure = speechFailure?.takeIf { it.taskID == task.id }?.message,
                     onToggle = { onToggleReplySpeech(task.id) },
                 )
             }
@@ -1105,10 +1154,10 @@ private fun TaskDetails(
                     TaskCapability.APPROVE in task.capabilities
                 ) {
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        PixelButton("允许", AgentGridColors.Green) {
+                        PixelButton("允许", AgentGridColors.Green, enabled = !answerBusy) {
                             onControl(task.id, ControlAction.APPROVE, null, null)
                         }
-                        PixelButton("拒绝", AgentGridColors.Red) {
+                        PixelButton("拒绝", AgentGridColors.Red, enabled = !answerBusy) {
                             onControl(task.id, ControlAction.DENY, null, null)
                         }
                     }
@@ -1139,24 +1188,23 @@ private fun TaskDetails(
                             modifier = Modifier.fillMaxWidth(),
                             maxLines = 3,
                         )
-                        PixelButton("发送回答", AgentGridColors.Yellow) {
+                        PixelButton(
+                            "发送回答",
+                            AgentGridColors.Yellow,
+                            enabled = !answerBusy && (picked.isNotEmpty() || answer.isNotBlank()),
+                        ) {
                             if (picked.isNotEmpty() || answer.isNotBlank()) {
-                                val toSend = answer.ifBlank { null }
-                                val optionsToSend = picked
-                                answer = ""
-                                picked = emptyList()
                                 onControl(
                                     task.id,
                                     ControlAction.ANSWER,
-                                    toSend,
-                                    optionsToSend,
+                                    answer.ifBlank { null },
+                                    picked,
                                 )
                             }
                         }
                     } else {
                         targetPending.options.forEach { option ->
-                            PixelButton(option, AgentGridColors.Cyan) {
-                                answer = ""
+                            PixelButton(option, AgentGridColors.Cyan, enabled = !answerBusy) {
                                 onControl(task.id, ControlAction.ANSWER, option, null)
                             }
                         }
@@ -1166,15 +1214,18 @@ private fun TaskDetails(
                             modifier = Modifier.fillMaxWidth(),
                             maxLines = 3,
                         )
-                        PixelButton("发送回答", AgentGridColors.Yellow) {
+                        PixelButton(
+                            "发送回答",
+                            AgentGridColors.Yellow,
+                            enabled = !answerBusy && answer.isNotBlank(),
+                        ) {
                             if (answer.isNotBlank()) {
-                                val toSend = answer
-                                answer = ""
-                                onControl(task.id, ControlAction.ANSWER, toSend, null)
+                                onControl(task.id, ControlAction.ANSWER, answer, null)
                             }
                         }
                     }
                 }
+                ControlFeedbackLine(feedback, answerFeedbackActions)
             }
         }
         // 与 MODEL/TOKEN/REPLY 同一条可见性规则：收纳时一起收缩，
@@ -1212,15 +1263,15 @@ private fun TaskDetails(
                 PixelButton(
                     if (task.lifecycle == AgentLifecycle.RUNNING) "排队" else "发送",
                     AgentGridColors.Cyan,
+                    enabled = !promptBusy && promptDraft.isNotBlank(),
                 ) {
                     if (promptDraft.isNotBlank()) {
-                        val toSend = promptDraft.trim()
-                        // 只有发送成功才清空草稿；切换 task/收纳面板都不清
-                        onPromptDraftChange(task.id, "")
-                        onControl(task.id, ControlAction.PROMPT, toSend, null)
+                        // 草稿由 ViewModel 在「已确认送达」后清空；失败/超时保留原文
+                        onControl(task.id, ControlAction.PROMPT, promptDraft.trim(), null)
                     }
                 }
             }
+            ControlFeedbackLine(feedback, promptFeedbackActions)
         }
     }
 }
@@ -1321,38 +1372,44 @@ private fun ResponseSection(
     speaking: Boolean,
     canSpeak: Boolean,
     onToggle: () -> Unit,
+    failure: String? = null,
 ) {
     // 完成态才给「开读」；已在朗读时永远可停（哪怕任务又变回运行态，不留下停不掉的死角）。
     val clickable = speaking || canSpeak
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        // 不加粗（2026-10-16）：REPLY 原来带 FontWeight.Bold，而 PixelFontFamily 把同一个 ttf
-        // 同时注册成 Normal/Medium/Bold —— 没有独立粗体字面，系统就做**伪粗体**，描边向外双向扩，
-        // 左边缘跟着多出一点，三个标签里就它看着偏左。去掉后与 MODEL/TOKEN 同字面、同原点，
-        // 标签列严格对齐。
-        Text(
-            text = if (speaking) "STOP" else "REPLY",
-            color = if (speaking) AgentGridColors.Amber else AgentGridColors.Green,
-            fontSize = 9.sp,
-            modifier = Modifier
-                .width(58.dp)
-                .clickable(
-                    enabled = clickable,
-                    interactionSource = remember { MutableInteractionSource() },
-                    indication = null,
-                    onClick = onToggle,
-                )
-                .padding(vertical = 3.dp),
-        )
-        Box(
-            modifier = Modifier
-                .weight(1f)
-                .background(AgentGridColors.SurfaceRaised.copy(alpha = 0.6f))
-                .padding(8.dp),
+    Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            MarkdownView(markdown = markdown)
+            // 不加粗（2026-10-16）：REPLY 原来带 FontWeight.Bold，而 PixelFontFamily 把同一个 ttf
+            // 同时注册成 Normal/Medium/Bold —— 没有独立粗体字面，系统就做**伪粗体**，描边向外双向扩，
+            // 左边缘跟着多出一点，三个标签里就它看着偏左。去掉后与 MODEL/TOKEN 同字面、同原点，
+            // 标签列严格对齐。
+            Text(
+                text = if (speaking) "STOP" else "REPLY",
+                color = if (speaking) AgentGridColors.Amber else AgentGridColors.Green,
+                fontSize = 9.sp,
+                modifier = Modifier
+                    .width(58.dp)
+                    .clickable(
+                        enabled = clickable,
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = onToggle,
+                    )
+                    .padding(vertical = 3.dp),
+            )
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .background(AgentGridColors.SurfaceRaised.copy(alpha = 0.6f))
+                    .padding(8.dp),
+            ) {
+                MarkdownView(markdown = markdown)
+            }
+        }
+        if (failure != null) {
+            Text(failure, color = AgentGridColors.Red, fontSize = 9.sp, lineHeight = 12.sp)
         }
     }
 }
@@ -1361,10 +1418,12 @@ private fun ResponseSection(
 private fun PixelButton(
     label: String,
     color: Color,
+    enabled: Boolean = true,
     action: () -> Unit,
 ) {
     OutlinedButton(
         onClick = action,
+        enabled = enabled,
         shape = RectangleShape,
         colors = ButtonDefaults.outlinedButtonColors(contentColor = color),
         contentPadding = ButtonDefaults.TextButtonContentPadding,
@@ -1373,13 +1432,34 @@ private fun PixelButton(
     }
 }
 
+/** 一行极简回执：发送中… / 已发送 / 失败原因。不弹提示，失败时原文保留可重发。 */
+@Composable
+private fun ControlFeedbackLine(
+    feedback: ControlFeedback?,
+    actions: Set<ControlAction>,
+) {
+    if (feedback == null || feedback.action !in actions) return
+    val text = when (feedback.kind) {
+        ControlFeedbackKind.SENDING -> "发送中…"
+        ControlFeedbackKind.SENT -> "已发送"
+        ControlFeedbackKind.FAILED -> feedback.message ?: "发送失败"
+    }
+    val color = when (feedback.kind) {
+        ControlFeedbackKind.SENDING -> AgentGridColors.Cyan
+        ControlFeedbackKind.SENT -> AgentGridColors.Green
+        ControlFeedbackKind.FAILED -> AgentGridColors.Red
+    }
+    Text(text, color = color, fontSize = 9.sp, lineHeight = 12.sp)
+}
+
 @Composable
 private fun SettingsPanel(
     state: AgentGridUiState,
     soundEnabled: Boolean,
     onSoundEnabledChange: (Boolean) -> Unit,
+    onSpeechRateChange: (Float) -> Unit,
     onUnpair: () -> Unit,
-    onExitTerminal: () -> Unit,
+    onToggleTerminalMode: () -> Unit,
     onControl: (String, ControlAction, String?, List<String>?) -> Unit,
     panelMaxHeight: Dp,
 ) {
@@ -1405,8 +1485,19 @@ private fun SettingsPanel(
         ) {
             onSoundEnabledChange(!soundEnabled)
         }
-        PixelButton("解除配对", AgentGridColors.Red, onUnpair)
-        PixelButton("退出专用模式", AgentGridColors.Muted, onExitTerminal)
+        PixelButton(
+            "朗读语速：${formatSpeechRate(state.speechRate)}",
+            AgentGridColors.Muted,
+        ) {
+            onSpeechRateChange(nextSpeechRate(state.speechRate))
+        }
+        PixelButton(
+            if (state.terminalMode) "专用模式：开" else "专用模式：关",
+            if (state.terminalMode) AgentGridColors.Green else AgentGridColors.Muted,
+        ) {
+            onToggleTerminalMode()
+        }
+        PixelButton("解除配对", AgentGridColors.Red) { onUnpair() }
         // 关机：点两次才发（第一次布防，8 秒内没点第二次自动撤防），误触保护。
         // 发出去电脑 60 秒后关机（桥侧 shutdown /t 60），留反悔窗口，可在电脑上 shutdown /a 取消。
         var shutdownArmed by remember { mutableStateOf(false) }
@@ -1429,6 +1520,16 @@ private fun SettingsPanel(
         }
     }
 }
+
+private val SpeechRates = listOf(1.0f, 1.25f, 1.5f, 1.75f, 2.0f)
+
+private fun nextSpeechRate(current: Float): Float {
+    val index = SpeechRates.indexOfFirst { kotlin.math.abs(it - current) < 0.01f }
+    return SpeechRates[if (index < 0) SpeechRates.lastIndex else (index + 1) % SpeechRates.size]
+}
+
+private fun formatSpeechRate(rate: Float): String =
+    String.format(java.util.Locale.US, "%.2f", rate).trimEnd('0').trimEnd('.') + "x"
 
 private fun statusText(lifecycle: AgentLifecycle): String = when (lifecycle) {
     AgentLifecycle.OFFLINE -> "离线"

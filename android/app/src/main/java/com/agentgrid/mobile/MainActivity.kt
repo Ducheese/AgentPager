@@ -14,10 +14,12 @@ import androidx.activity.viewModels
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.core.content.ContextCompat
+import androidx.core.app.NotificationManagerCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import com.agentgrid.mobile.service.LinkKeepAliveService
 import com.agentgrid.mobile.ui.AgentGridScreen
 
 import android.content.res.Configuration
@@ -30,10 +32,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         multiWindowState.value = isInMultiWindowMode
         updateSystemBars()
-        importPairing(intent)
+        handleIntent(intent)
 
         setContent {
             val state by viewModel.state.collectAsStateWithLifecycle()
@@ -60,10 +61,12 @@ class MainActivity : ComponentActivity() {
                 onControl = viewModel::control,
                 onFocus = viewModel::focus,
                 onToggleDashboard = viewModel::toggleDashboard,
-                onExitTerminal = {
-                    viewModel.setTerminalMode(false)
-                    exitTerminalMode()
+                onToggleTerminalMode = {
+                    viewModel.setTerminalMode(!viewModel.state.value.terminalMode)
+                    updateSystemBars()
                 },
+                onOpenTaskConsumed = viewModel::consumeOpenTask,
+                onSpeechRateChange = viewModel::setSpeechRate,
                 onToggleReplySpeech = viewModel::toggleReplySpeech,
                 inMultiWindow = multiWindowState.value,
                 promptDrafts = viewModel.promptDrafts,
@@ -81,7 +84,7 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: android.content.Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        importPairing(intent)
+        handleIntent(intent)
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -104,9 +107,16 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun updateSystemBars() {
+        val dedicated = viewModel.state.value.terminalMode
+        // 常亮严格跟随专用模式开关：分屏/竖屏也生效，关闭时立刻恢复系统息屏策略
+        if (dedicated) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
         val isLandscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
-        // 分屏、小窗或竖屏模式下退出全屏沉浸，让系统手柄与系统栏正常可用；全屏横屏下保持沉浸
-        if (!isInMultiWindowMode && isLandscape && viewModel.state.value.terminalMode) {
+        // 分屏、小窗或竖屏模式下退出全屏沉浸，让系统手柄与系统栏正常可用；横屏专用模式保持沉浸
+        if (dedicated && !isInMultiWindowMode && isLandscape) {
             enterTerminalMode()
         } else {
             exitTerminalMode()
@@ -126,8 +136,16 @@ class MainActivity : ComponentActivity() {
         WindowCompat.setDecorFitsSystemWindows(window, true)
         WindowInsetsControllerCompat(window, window.decorView)
             .show(WindowInsetsCompat.Type.systemBars())
-        if (!viewModel.state.value.terminalMode) {
-            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+
+    private fun handleIntent(intent: android.content.Intent) {
+        importPairing(intent)
+        // 完成通知点击：定位到具体任务并吃掉这条提醒（summary 留给自己/下一次刷新）
+        intent.getStringExtra(EXTRA_TASK_ID)?.let { taskID ->
+            viewModel.openTask(taskID)
+            NotificationManagerCompat.from(this)
+                .cancel(LinkKeepAliveService.completionNotificationId(taskID))
+            intent.removeExtra(EXTRA_TASK_ID)
         }
     }
 
@@ -143,5 +161,6 @@ class MainActivity : ComponentActivity() {
     companion object {
         const val EXTRA_PAIRING = "pairing"
         const val EXTRA_PAIRING_BASE64 = "pairingBase64"
+        const val EXTRA_TASK_ID = "taskID"
     }
 }

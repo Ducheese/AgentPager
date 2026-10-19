@@ -42,6 +42,7 @@ class LinkKeepAliveService : Service() {
     private var screenReceiver: BroadcastReceiver? = null
     private var foregroundStarted = false
     private val completionTracker = TaskCompletionTracker()
+    private var lastAlertAt = 0L
 
     override fun onCreate() {
         super.onCreate()
@@ -171,24 +172,54 @@ class LinkKeepAliveService : Service() {
             ?.takeIf { it.isNotBlank() }
             ?.let { if (it.length > 140) it.take(140) + "…" else it }
         val text = preview?.let { "$label：$it" } ?: label
+        val notificationId = completionNotificationId(task.id)
+        // 批量完成只让第一条响：8 秒窗口内的后续进通知栏但静音。
+        // 不能指望 setOnlyAlertOnce —— 它只压制**同一个 id** 的更新，不同任务照响。
+        val now = System.currentTimeMillis()
+        val aloud = now - lastAlertAt >= COMPLETION_ALERT_WINDOW_MS
+        if (aloud) lastAlertAt = now
         val notification = NotificationCompat.Builder(this, COMPLETION_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_task_done)
             .setContentTitle(task.title)
             .setContentText(text)
             .setStyle(NotificationCompat.BigTextStyle().bigText(text))
-            .setContentIntent(launchAppIntent())
+            .setContentIntent(launchTaskIntent(task.id, notificationId))
             .setAutoCancel(true)
             .setShowWhen(true)
             .setCategory(NotificationCompat.CATEGORY_STATUS)
+            .setGroup(COMPLETION_GROUP)
+            .setSilent(!aloud)
             .build()
-        // 每条任务固定 id：同一任务重新跑完只替换旧提醒，不会叠一串
-        val notificationId = task.id.hashCode().let {
-            if (it == NOTIFICATION_ID || it == 0) it + 1 else it
-        }
         runCatching {
-            getSystemService(NotificationManager::class.java).notify(notificationId, notification)
+            val manager = getSystemService(NotificationManager::class.java)
+            manager.notify(notificationId, notification)
+            // 有子通知时才需要 summary；静默，不重复响铃。
+            manager.notify(
+                COMPLETION_SUMMARY_ID,
+                NotificationCompat.Builder(this, COMPLETION_CHANNEL_ID)
+                    .setSmallIcon(R.drawable.ic_task_done)
+                    .setContentTitle("AgentPager 任务完成")
+                    .setContentText("点开可回到对应任务")
+                    .setContentIntent(launchAppIntent())
+                    .setGroup(COMPLETION_GROUP)
+                    .setGroupSummary(true)
+                    .setSilent(true)
+                    .setOnlyAlertOnce(true)
+                    .setAutoCancel(true)
+                    .build(),
+            )
         }
     }
+
+    private fun launchTaskIntent(taskID: String, notificationId: Int): PendingIntent =
+        PendingIntent.getActivity(
+            this,
+            notificationId,
+            Intent(this, MainActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                .putExtra(MainActivity.EXTRA_TASK_ID, taskID),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
 
     private fun launchAppIntent(): PendingIntent = PendingIntent.getActivity(
         this,
@@ -201,6 +232,14 @@ class LinkKeepAliveService : Service() {
         private const val CHANNEL_ID = "agentpager-link"
         private const val COMPLETION_CHANNEL_ID = "agentpager-task-completion"
         private const val NOTIFICATION_ID = 0x4A47
+        private const val COMPLETION_SUMMARY_ID = 0x4A48
+        private const val COMPLETION_GROUP = "agentpager-completion"
+        private const val COMPLETION_ALERT_WINDOW_MS = 8_000L
         const val ACTION_STOP_SPEECH = "com.agentgrid.mobile.action.STOP_SPEECH"
+
+        /** 完成通知的固定 id：同一任务重跑完只替换旧提醒；MainActivity 取消时也用它。 */
+        fun completionNotificationId(taskID: String): Int = taskID.hashCode().let {
+            if (it == NOTIFICATION_ID || it == 0) it + 1 else it
+        }
     }
 }
