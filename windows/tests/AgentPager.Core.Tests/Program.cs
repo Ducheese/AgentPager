@@ -393,21 +393,21 @@ Check(!json.Contains("\"OpenCode\""), "wire has no PascalCase enum leakage");
 var temp = Path.Combine(Path.GetTempPath(), "ap-verify-plugins-" + Guid.NewGuid().ToString("N"));
 var installer = new OpenCodePluginConfiguration(temp);
 Check(installer.Status == OpenCodePluginStatus.NotInstalled, "status: 未安装");
-Check(OpenCodePluginConfiguration.EmbeddedVersion == 22, $"embedded plugin version = 22 (got {OpenCodePluginConfiguration.EmbeddedVersion})");
+Check(OpenCodePluginConfiguration.EmbeddedVersion == 23, $"embedded plugin version = 23 (got {OpenCodePluginConfiguration.EmbeddedVersion})");
 var first = installer.Install();
 Check(first.Changed && File.Exists(Path.Combine(temp, "plugins", "agentpager-opencode.js")), "install writes plugin");
 Check(installer.Status == OpenCodePluginStatus.Installed && installer.IsInstalled(), "status: 已写入（与内置一致）");
-Check(installer.InstalledVersion == 22, "installed version = 22");
+Check(installer.InstalledVersion == 23, "installed version = 23");
 var second = installer.Install();
 Check(!second.Changed, "reinstall is idempotent");
 var pluginPath = Path.Combine(temp, "plugins", "agentpager-opencode.js");
 var content = File.ReadAllText(pluginPath);
 Check(content.Contains("Managed by AgentPager (OpenCode)"), "managed marker present");
-Check(content.Contains("agentpager-opencode v22"), "version header present");
+Check(content.Contains("agentpager-opencode v23"), "version header present");
 Check(content.Contains("hook_source: \"opencode\"") && content.Contains("49361"), "plugin content sane");
 File.WriteAllText(pluginPath, content.Replace("const MAX_TEXT = 1000", "const MAX_TEXT = 500"));
 Check(installer.Status == OpenCodePluginStatus.Outdated, "status: 待更新（内容与内置不一致）");
-Check(installer.InstalledVersion == 22, "outdated file still reports v22");
+Check(installer.InstalledVersion == 23, "outdated file still reports v23");
 var repair = installer.Install();
 Check(repair.Changed && installer.Status == OpenCodePluginStatus.Installed, "repair restores 已写入");
 var uninstalled = installer.Uninstall();
@@ -749,6 +749,72 @@ Check(multiLine.LatestReply?.Contains('\n') == false, "claude body: third-line p
 Check(multiLine.LatestReplyFull?.Contains('\n') == true, "claude body: panel body keeps its newlines");
 Check(multiLine.LatestReplyFull == "先说一句。\n\n| 甲 | 乙 |\n|---|---|\n| 1 | 2 |",
     $"claude body: newlines survive verbatim (got '{multiLine.LatestReplyFull?.Replace("\n", "\\n")}')");
+
+// TOOL 行（实验）：取本轮最新一条 tool_result，保留换行；遇到新一轮用户输入即封口。
+var toolResultSnapshot = ReadTranscript(
+[
+    "{\"type\":\"user\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":\"跑一下测试\"}}",
+    "{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"tu_1\",\"name\":\"Bash\",\"input\":{\"command\":\"npm test\"}}]}}",
+    "{\"type\":\"user\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"tu_1\",\"content\":[{\"type\":\"text\",\"text\":\"line1\\nline2\"}]}]}}",
+    "{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"测试通过\"}]}}",
+]);
+Check(toolResultSnapshot.LatestToolOutput == "line1\nline2",
+    $"claude tool: latest tool_result keeps newlines (got '{toolResultSnapshot.LatestToolOutput?.Replace("\n", "\\n")}')");
+var toolTurnOver = ReadTranscript(
+[
+    "{\"type\":\"user\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":\"跑一下测试\"}}",
+    "{\"type\":\"user\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"tu_1\",\"content\":[{\"type\":\"text\",\"text\":\"line1\\nline2\"}]}]}}",
+    "{\"type\":\"user\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":\"新一轮\"}}",
+]);
+var parallelToolResults = ReadTranscript(
+[
+    "{\"type\":\"user\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":\"并行跑两个\"}}",
+    "{\"type\":\"user\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"tu_a\",\"content\":[{\"type\":\"text\",\"text\":\"first\"}]},{\"type\":\"tool_result\",\"tool_use_id\":\"tu_b\",\"content\":\"second\"}]}}",
+]);
+Check(parallelToolResults.LatestToolOutput == "second",
+    $"claude tool: a parallel-result line reports the last result (got '{parallelToolResults.LatestToolOutput}')");
+Check(toolTurnOver.LatestToolOutput is null, "claude tool: a new user prompt closes the old tool result");
+
+// opencode：completed part 的 output 落到 LatestToolOutput；新一轮也要清掉。
+var ocToolCatalog = new TaskCatalog();
+ocToolCatalog.Accept(
+    new OpenCodeHookPayload(
+        "chat.message",
+        JsonSerializer.SerializeToElement(new { sessionID = "ses_tool_out", text = "run tests" }, WireJson.Options),
+        null),
+    claudeNow);
+ocToolCatalog.Accept(
+    new OpenCodeHookPayload(
+        "message.part.updated",
+        JsonSerializer.SerializeToElement(new
+        {
+            sessionID = "ses_tool_out",
+            part = new
+            {
+                id = "p1",
+                tool = "bash",
+                state = new { status = "completed", output = "ok\nsecond" },
+            },
+        }, WireJson.Options),
+        null),
+    claudeNow.AddSeconds(1));
+var ocToolValue = ocToolCatalog.Projection().Tasks.First(t => t.Id == "ses_tool_out").LatestToolOutput;
+Check(ocToolValue == "ok\nsecond",
+    $"opencode tool: completed part output lands in LatestToolOutput (got '{ocToolValue?.Replace("\n", "\\n") ?? "<null>"}')");
+ocToolCatalog.Accept(
+    new OpenCodeHookPayload(
+        "session.idle",
+        JsonSerializer.SerializeToElement(new { sessionID = "ses_tool_out" }, WireJson.Options),
+        null),
+    claudeNow.AddSeconds(2));
+ocToolCatalog.Accept(
+    new OpenCodeHookPayload(
+        "chat.message",
+        JsonSerializer.SerializeToElement(new { sessionID = "ses_tool_out", text = "next" }, WireJson.Options),
+        null),
+    claudeNow.AddSeconds(3));
+Check(ocToolCatalog.Projection().Tasks.First(t => t.Id == "ses_tool_out").LatestToolOutput is null,
+    "opencode tool: a new turn clears the previous tool output");
 
 var titled = ClaudeEventReducer.ApplyTranscript(Claude(), claudeSnapshot);
 Check(titled.Title == "demo · 修复登录流程", $"claude: title composed as project · title (got '{titled.Title}')");

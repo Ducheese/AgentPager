@@ -29,17 +29,19 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -77,6 +79,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -210,7 +213,9 @@ private fun PairingScreen(
     BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
-            .background(AgentGridColors.Background),
+            .background(AgentGridColors.Background)
+            // edge-to-edge：状态栏/刘海/导航栏/键盘统一让位（配对页有粘贴输入框）
+            .windowInsetsPadding(WindowInsets.safeDrawing),
     ) {
         val isCompact = maxWidth < 600.dp || maxHeight > maxWidth
         // 嵌套 lambda 里没有 BoxWithConstraintsScope 的隐式接收者，先落成本地值
@@ -474,9 +479,9 @@ private fun TaskTerminal(
         modifier = Modifier
             .fillMaxSize()
             .background(AgentGridColors.Background)
-            // 键盘 inset 由根容器承担：横屏的列表有 306dp 上限，若把 padding 加在列表上，
-            // 会变成 306 − 键盘高度（浮窗键盘 inset=0 时不受影响，也不会多出空白）。
-            .imePadding(),
+            // Android 15+ 强制 edge-to-edge（decorFits 已失效）：状态栏/刘海/导航栏/键盘
+            // 统一用 safeDrawing 让位，背景仍铺满；浮窗键盘 inset=0 时与收起一致。
+            .windowInsetsPadding(WindowInsets.safeDrawing),
     ) {
         // 紧凑判定必须看**窗口**而不是键盘后的可用高度：竖屏键盘一弹，剩余高度可能小于宽度，
         // 用 maxHeight > maxWidth 会把布局误判成横屏（正好会把横屏的问题带回来）。
@@ -524,13 +529,11 @@ private fun TaskTerminal(
                     )
                 ).using(SizeTransform(clip = false))
             },
-            modifier = if (isCompact) {
-                Modifier
-                    .fillMaxSize()
-                    .padding(top = 46.dp, bottom = 12.dp)
-            } else {
-                Modifier.align(Alignment.Center)
-            },
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(top = 46.dp, bottom = 12.dp),
+            // 顶部 46dp 只留给右上角按钮；内容从下方开始铺满，不做横屏居中
+            //（状态栏自己占一截之后，居中反而显得上下不靠）。
             label = "任务态与状态态切换",
         ) { isDashboardVisible ->
             if (isDashboardVisible) {
@@ -1073,6 +1076,9 @@ private fun TaskDetails(
     // 三家在回合中都会喂 ResponseBody（agy 的 PostInvocation、opencode 的 reply 事件、
     // Claude 的心跳全文），只是以前这里卡了 SUCCEEDED 才把它挡住。
     val showResponseBody = showToken && !task.responseBody.isNullOrBlank()
+    // TOOL 行（实验）：本轮最新一次工具输出；显示/隐藏条件与 REPLY 相同（展开且非空），
+    // 清空也跟随 REPLY（新回合开始时由桥端把两者一起置空）。
+    val showToolOutput = showToken && !task.latestToolOutput.isNullOrBlank()
 
     Column(
         modifier = Modifier
@@ -1099,6 +1105,9 @@ private fun TaskDetails(
                     tokenDetailsText(task),
                     AgentGridColors.Cyan,
                 )
+            }
+            if (showToolOutput) {
+                ToolSection(task.latestToolOutput!!, compact)
             }
             if (showResponseBody) {
                 ResponseSection(
@@ -1367,6 +1376,43 @@ private fun DetailLine(label: String, value: String, color: Color) {
 }
 
 @Composable
+private fun ToolSection(output: String, compact: Boolean) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Text(
+            "TOOL",
+            color = AgentGridColors.Amber,
+            fontSize = 9.sp,
+            modifier = Modifier
+                .width(58.dp)
+                .padding(vertical = 3.dp),
+        )
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .background(AgentGridColors.SurfaceRaised.copy(alpha = 0.6f))
+                .padding(8.dp),
+        ) {
+            Column(
+                modifier = Modifier
+                    .heightIn(max = if (compact) 200.dp else 150.dp)
+                    .verticalScroll(rememberScrollState()),
+            ) {
+                Text(
+                    output,
+                    color = AgentGridColors.Text.copy(alpha = 0.9f),
+                    fontSize = 9.sp,
+                    lineHeight = 13.sp,
+                    fontFamily = FontFamily.Monospace,
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun ResponseSection(
     markdown: String,
     speaking: Boolean,
@@ -1387,7 +1433,7 @@ private fun ResponseSection(
             // 标签列严格对齐。
             Text(
                 text = if (speaking) "STOP" else "REPLY",
-                color = if (speaking) AgentGridColors.Amber else AgentGridColors.Green,
+                color = if (speaking) AgentGridColors.Red else AgentGridColors.Green,
                 fontSize = 9.sp,
                 modifier = Modifier
                     .width(58.dp)

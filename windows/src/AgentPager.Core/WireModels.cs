@@ -64,7 +64,8 @@ public sealed record TaskSnapshot(
     HashSet<TaskCapability> Capabilities,
     string? ModelName = null,
     bool PromptQueued = false,
-    string? ResponseBody = null)
+    string? ResponseBody = null,
+    string? LatestToolOutput = null)
 {
     [JsonIgnore]
     public bool IsTerminal => Lifecycle is AgentLifecycle.Succeeded or AgentLifecycle.Interrupted or AgentLifecycle.Offline;

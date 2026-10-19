@@ -2204,6 +2204,7 @@ public sealed class TaskCatalog
                             StartedAt = now,
                             LatestStep = null,
                             ResponseBody = null,
+                            LatestToolOutput = null,
                             CompletedAt = null,
                             UpdatedAt = now,
                             Capabilities = [],
@@ -3017,11 +3018,19 @@ public static class ClaudeEventReducer
         if (transcript?.Model is not null) result = result with { ModelName = transcript.Model };
         // 取全文那份（不过 Normalize、不截断）。用 FreshReply 会拿 120 字且被压平的单行预览
         // 覆盖 Stop 已落好的正文 —— 面板上多行正文会当场塌成一行。
-        if (result.Lifecycle == AgentLifecycle.Succeeded &&
-            FreshReplyFull(transcript, result.StartedAt) is { Length: > 0 } reply)
-        {
-            result = result with { ResponseBody = reply.Trim() };
-        }
+    if (result.Lifecycle == AgentLifecycle.Succeeded &&
+        FreshReplyFull(transcript, result.StartedAt) is { Length: > 0 } reply)
+    {
+        result = result with { ResponseBody = reply.Trim() };
+    }
+
+    // TOOL 行（实验）：本轮最近一条工具结果。必须带时间戳门控——UserPrompt 已清空该字段，
+    // 若转录本里还是上一轮的结果（新一轮尚未产生工具调用），不能把它捡回来。
+    if (transcript?.LatestToolOutput is { Length: > 0 } toolOutput &&
+        (transcript.LatestToolOutputAt is not { } toolAt || toolAt >= result.StartedAt))
+    {
+        result = result with { LatestToolOutput = toolOutput };
+    }
 
         // 排队：转录本里最后一条**非系统**队列操作是 enqueue，且时间晚于本轮起点，
         // 就说明"本轮跑着的时候用户又提交了一条"（opencode 的 queued 语义）。
@@ -3275,6 +3284,7 @@ public static class ClaudeEventReducer
             StartedAt = startsTurn ? now : task.StartedAt,
             LatestStep = startsTurn ? null : task.LatestStep,
             ResponseBody = startsTurn ? null : task.ResponseBody,
+            LatestToolOutput = startsTurn ? null : task.LatestToolOutput,
             CompletedAt = null,
             Capabilities = [],
         };
@@ -3663,6 +3673,10 @@ public static class OpenCodeEventReducer
                     Activity = AgentActivity.Thinking,
                     CompletedAt = null,
                     Capabilities = [],
+                    // 最新一次工具的输出；工具没有输出就清掉，保持"最新一次"的语义。
+                    // 必须用 RawText（保留换行），Text 会把空白压平，那是单行步骤用的。
+                    LatestToolOutput = ToolOutputText.Clean(
+                        state is { } done ? RawText(done, "output") : null),
                 }, step);
             case "error":
                 var failure = state is { } failed ? Text(failed, "error") : null;
@@ -3672,6 +3686,7 @@ public static class OpenCodeEventReducer
                     Activity = AgentActivity.Thinking,
                     CompletedAt = null,
                     Capabilities = [],
+                    LatestToolOutput = ToolOutputText.Clean(failure),
                 }, failure is null ? null : Clamp($"✗ {failure}", 220));
             default:
                 return task;
@@ -3799,6 +3814,7 @@ public static class OpenCodeEventReducer
             // 新一轮开始时清空第三行，让 lifecycle 文案兜底；轮内插入不清。
             LatestStep = startsTurn ? null : task.LatestStep,
             ResponseBody = startsTurn ? null : task.ResponseBody,
+            LatestToolOutput = startsTurn ? null : task.LatestToolOutput,
             CompletedAt = null,
             Capabilities = [],
         };
@@ -3994,4 +4010,28 @@ public static class ToolStepSanitizer
     /// </summary>
     public static bool EchoesPrompt(TaskSnapshot task, string candidate) =>
         task.UserPrompt is { Length: >= 4 } prompt && candidate.Contains(prompt, StringComparison.OrdinalIgnoreCase);
+}
+
+/// <summary>
+/// TOOL 行用的工具输出清洗：去 ANSI 颜色、统一换行、限长。保留换行（这是它与第三行
+/// 单行预览的根本区别），只做显示层最小处理；空文本返回 null 让手机侧整行隐藏。
+/// </summary>
+public static class ToolOutputText
+{
+    private static readonly Regex Ansi = new(
+        @"\x1B\[[0-9;?]*[ -/]*[@-~]",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    public const int Limit = 4000;
+
+    public static string? Clean(string? value, int limit = Limit)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        var text = Ansi.Replace(value, string.Empty)
+            .Replace("\r\n", "\n")
+            .Replace('\r', '\n')
+            .Trim();
+        if (text.Length == 0) return null;
+        return text.Length > limit ? text[..limit] : text;
+    }
 }

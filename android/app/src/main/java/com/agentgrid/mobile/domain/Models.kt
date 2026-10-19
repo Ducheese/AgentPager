@@ -149,6 +149,8 @@ data class TaskSnapshot(
     val modelName: String? = null,
     val promptQueued: Boolean = false,
     val responseBody: String? = null,
+    /** 实验性 TOOL 行：本轮最新一条工具输出（保留换行，桥端已限长）。 */
+    val latestToolOutput: String? = null,
 ) {
     val isTerminal: Boolean
         get() = lifecycle in setOf(

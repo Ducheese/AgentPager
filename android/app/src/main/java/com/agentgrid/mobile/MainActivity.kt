@@ -32,6 +32,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Android 15+（targetSdk 35+）强制 edge-to-edge，decorFits=true 已失效；
+        // 统一成 edge-to-edge，由界面用 safeDrawing inset 自己让出状态栏/刘海。
+        WindowCompat.setDecorFitsSystemWindows(window, false)
         multiWindowState.value = isInMultiWindowMode
         updateSystemBars()
         handleIntent(intent)
@@ -124,7 +127,6 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun enterTerminalMode() {
-        WindowCompat.setDecorFitsSystemWindows(window, false)
         WindowInsetsControllerCompat(window, window.decorView).apply {
             hide(WindowInsetsCompat.Type.systemBars())
             systemBarsBehavior =
@@ -133,7 +135,6 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun exitTerminalMode() {
-        WindowCompat.setDecorFitsSystemWindows(window, true)
         WindowInsetsControllerCompat(window, window.decorView)
             .show(WindowInsetsCompat.Type.systemBars())
     }

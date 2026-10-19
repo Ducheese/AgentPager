@@ -25,7 +25,14 @@ public sealed record ClaudeTranscriptSnapshot(
     /// </summary>
     string? LatestReplyFull = null,
     /// <summary>上面那条正文的 timestamp，用来判定它属于本轮（与 <see cref="LatestReplyAt"/> 同理）。</summary>
-    DateTimeOffset? LatestReplyFullAt = null);
+    DateTimeOffset? LatestReplyFullAt = null,
+    /// <summary>
+    /// 本轮**最新一条工具结果**（tool_result 的文本，保留换行，不压平）。
+    /// 只给新增的实验性 TOOL 行用；可能多段文本拼在一起，超长在读取端截断。
+    /// </summary>
+    string? LatestToolOutput = null,
+    /// <summary>工具结果那一条 user 行的 timestamp，用来判定它属于本轮。</summary>
+    DateTimeOffset? LatestToolOutputAt = null);
 
 /// <summary>
 /// Claude Code 转录本（<c>~/.claude/projects/&lt;slug&gt;/&lt;session_id&gt;.jsonl</c>）尾部读取器。
@@ -86,6 +93,9 @@ public static class ClaudeTranscriptReader
         // 可以跨过工具步往回找。
         string? bodyReply = null;
         DateTimeOffset? bodyReplyAt = null;
+        // 本轮最新一条工具结果（TOOL 行）：同样只在本回合内找，遇到真实用户输入即停止。
+        string? toolOutput = null;
+        DateTimeOffset? toolOutputAt = null;
         // 本回合"最新一步"已经定过没有（倒序扫到的第一条主会话 assistant 行即是）。
         var sawLatestStep = false;
         var queueSettled = false;
@@ -200,6 +210,12 @@ public static class ClaudeTranscriptReader
                         }
                         break;
                     case "user":
+                        if (!replySettled && toolOutput is null &&
+                            ReadToolResult(root) is { Length: > 0 } toolText)
+                        {
+                            toolOutput = toolText;
+                            toolOutputAt = Timestamp(root);
+                        }
                         if (TurnBoundaryText(root) is { } boundary)
                         {
                             replySettled = true;
@@ -234,7 +250,9 @@ public static class ClaudeTranscriptReader
             // 一整段纯文本，管道符和横线原样画出来 —— 实测就是"表格散架"的真正原因。
             // agy 的 fullResponse、opencode 的 fullText 都是原文，只有这里之前错了。
             string.IsNullOrWhiteSpace(bodyReply) ? null : bodyReply.Trim(),
-            bodyReplyAt);
+            bodyReplyAt,
+            ToolOutputText.Clean(toolOutput),
+            toolOutputAt);
     }
 
     /// <summary>
@@ -386,6 +404,49 @@ public static class ClaudeTranscriptReader
             builder.Append(value);
         }
         return builder.Length == 0 ? null : builder.ToString();
+    }
+
+    /// <summary>user 行里的 tool_result 块：content 可能是字符串或 [{type:text,text}] 数组。</summary>
+    private static string? ReadToolResult(JsonElement root)
+    {
+        if (IsSidechain(root)) return null;
+        if (!root.TryGetProperty("message", out var message)) return null;
+        if (!message.TryGetProperty("content", out var content) || content.ValueKind != JsonValueKind.Array)
+            return null;
+
+        string? found = null;
+        foreach (var block in content.EnumerateArray())
+        {
+            if (block.ValueKind != JsonValueKind.Object) continue;
+            if (!block.TryGetProperty("type", out var type) || type.GetString() != "tool_result") continue;
+            if (!block.TryGetProperty("content", out var payload)) continue;
+            if (payload.ValueKind == JsonValueKind.String)
+            {
+                if (!string.IsNullOrWhiteSpace(payload.GetString())) found = payload.GetString();
+                continue;
+            }
+            if (payload.ValueKind != JsonValueKind.Array) continue;
+
+            var builder = new StringBuilder();
+            foreach (var item in payload.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.Object) continue;
+                if (!item.TryGetProperty("type", out var itemType)) continue;
+                if (itemType.GetString() == "text" && item.TryGetProperty("text", out var text))
+                {
+                    var value = text.GetString();
+                    if (string.IsNullOrWhiteSpace(value)) continue;
+                    if (builder.Length > 0) builder.Append('\n');
+                    builder.Append(value);
+                }
+                else if (itemType.GetString() == "image" && builder.Length == 0)
+                {
+                    builder.Append("[image]");
+                }
+            }
+            if (builder.Length > 0) found = builder.ToString();
+        }
+        return found;
     }
 
     /// <summary>message.usage → TokenUsage：与 opencode 的 tokens 口径一一对应。</summary>

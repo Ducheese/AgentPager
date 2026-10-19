@@ -274,27 +274,33 @@ private fun QuotaPanel(
                         }
                     }
                 }
-                Text(
-                    when (providerName(usage)) {
-                        // agy 的 limitID 就是订阅名（Google AI Pro）
-                        "Antigravity" -> usage?.limitID?.uppercase() ?: "GOOGLE AI PRO"
-                        // Command Code 显示成 "COMMAND CODE GO 订阅"（GO 由 planId 推出）
-                        "Command Code" -> usage?.limitID?.uppercase()?.let { "$it 订阅" } ?: "订阅计划"
-                        else -> usage?.planType?.uppercase()?.let { "$it 计划" } ?: "订阅计划"
-                    },
-                    color = AgentGridColors.Muted,
-                    fontSize = 9.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        when (providerName(usage)) {
+                            // agy 的 limitID 就是订阅名（Google AI Pro）
+                            "Antigravity" -> usage?.limitID?.uppercase() ?: "GOOGLE AI PRO"
+                            // Command Code 显示成 "COMMAND CODE GO 订阅"（GO 由 planId 推出）
+                            "Command Code" -> usage?.limitID?.uppercase()?.let { "$it 订阅" } ?: "订阅计划"
+                            else -> usage?.planType?.uppercase()?.let { "$it 计划" } ?: "订阅计划"
+                        },
+                        color = AgentGridColors.Muted,
+                        fontSize = 9.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false),
+                    )
+                    if (hasThreeP) {
+                        GroupSwitcher(
+                            selectedGroup = selectedGroup,
+                            onSelectGroup = { selectedGroup = it },
+                        )
+                    }
+                }
             }
-        }
-
-        if (hasThreeP) {
-            GroupSwitcher(
-                selectedGroup = selectedGroup,
-                onSelectGroup = { selectedGroup = it },
-            )
         }
 
         PrimaryQuota(window = primary)
@@ -376,45 +382,37 @@ private fun GroupSwitcher(
     selectedGroup: Int,
     onSelectGroup: (Int) -> Unit,
 ) {
+    // 和 ProviderSwitcher 一致的一体化微型槽设计：8sp 粗体、外层 SurfaceRaised 底色、选中青色半透底。
     Row(
         modifier = Modifier
-            .fillMaxWidth()
             .background(AgentGridColors.SurfaceRaised)
-            .padding(2.dp),
-        horizontalArrangement = Arrangement.spacedBy(4.dp),
+            .padding(1.dp),
+        horizontalArrangement = Arrangement.spacedBy(2.dp),
     ) {
-        val geminiSelected = selectedGroup == 0
-        val threePSelected = selectedGroup == 1
-        Box(
-            modifier = Modifier
-                .weight(1f)
-                .background(if (geminiSelected) AgentGridColors.Surface else Color.Transparent)
-                .clickable { onSelectGroup(0) }
-                .padding(vertical = 3.dp),
-            contentAlignment = Alignment.Center,
-        ) {
-            Text(
-                "GEMINI",
-                color = if (geminiSelected) AgentGridColors.Cyan else AgentGridColors.Muted,
-                fontSize = 9.sp,
-                fontWeight = if (geminiSelected) FontWeight.Bold else FontWeight.Normal,
+        GroupTab("GEMINI", selectedGroup == 0) { onSelectGroup(0) }
+        GroupTab("3P 模型", selectedGroup == 1) { onSelectGroup(1) }
+    }
+}
+
+@Composable
+private fun GroupTab(label: String, selected: Boolean, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .background(
+                if (selected) AgentGridColors.Cyan.copy(alpha = 0.2f)
+                else Color.Transparent,
             )
-        }
-        Box(
-            modifier = Modifier
-                .weight(1f)
-                .background(if (threePSelected) AgentGridColors.Surface else Color.Transparent)
-                .clickable { onSelectGroup(1) }
-                .padding(vertical = 3.dp),
-            contentAlignment = Alignment.Center,
-        ) {
-            Text(
-                "3P 模型",
-                color = if (threePSelected) AgentGridColors.Cyan else AgentGridColors.Muted,
-                fontSize = 9.sp,
-                fontWeight = if (threePSelected) FontWeight.Bold else FontWeight.Normal,
-            )
-        }
+            .clickable(onClick = onClick)
+            .padding(horizontal = 6.dp, vertical = 2.dp),
+    ) {
+        Text(
+            label,
+            color = if (selected) AgentGridColors.Cyan else AgentGridColors.Muted,
+            fontSize = 8.sp,
+            fontWeight = FontWeight.Bold,
+            maxLines = 1,
+            softWrap = false,
+        )
     }
 }
 
@@ -441,6 +439,8 @@ private fun PrimaryQuota(window: UsageWindow?) {
                 displayLabel,
                 color = AgentGridColors.Muted,
                 fontSize = 10.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.padding(bottom = 5.dp),
             )
         }

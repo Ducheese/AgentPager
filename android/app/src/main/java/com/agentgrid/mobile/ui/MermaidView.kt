@@ -1,8 +1,11 @@
 package com.agentgrid.mobile.ui
 
 import android.annotation.SuppressLint
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color as AndroidColor
 import android.util.Base64
+import android.util.LruCache
 import android.view.View
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceError
@@ -10,11 +13,13 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -29,8 +34,11 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -61,15 +69,6 @@ fun MermaidBlockView(
         Base64.encodeToString(source.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
     }
 
-    // 页面加载失败（asset 缺失 / WebView 过旧）或迟迟没有回调时，照样回退源码，绝不空着
-    LaunchedEffect(source) {
-        delay(10_000)
-        if (contentHeightPx <= 0f && !isFailed) {
-            errorMessage = "渲染超时"
-            isFailed = true
-        }
-    }
-
     if (isFailed) {
         // 语法异常：直接以源码展示，顶部带红色小字提示
         Column(modifier = modifier.fillMaxWidth()) {
@@ -90,6 +89,7 @@ fun MermaidBlockView(
         val inlineHtml = remember(base64Code) { buildMermaidHtml(base64Code, isInteractive = false) }
         // 记录已加载的 html（按引用比较）：只有源码真的变了才重载，避免每次重组都把 3.5MB 脚本重跑一遍
         val loadedHtml = remember { arrayOfNulls<String>(1) }
+        val webViewRef = remember(source) { arrayOfNulls<WebView>(1) }
         val dynamicHeight = with(density) {
             if (contentHeightPx > 0f) {
                 (contentHeightPx.toDp() + 12.dp).coerceIn(80.dp, 600.dp)
@@ -127,89 +127,147 @@ fun MermaidBlockView(
                 )
             }
 
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(dynamicHeight),
+            BoxWithConstraints(
+                modifier = Modifier.fillMaxWidth(),
             ) {
-                AndroidView(
-                    modifier = Modifier.fillMaxSize(),
-                    factory = { context ->
-                        try {
-                            WebView(context).apply {
-                                configureInline()
-                                addJavascriptInterface(
-                                    object {
-                                        @JavascriptInterface
-                                        fun onSuccess(heightPx: Float) {
-                                            post {
-                                                contentHeightPx = heightPx
-                                                isFailed = false
-                                            }
-                                        }
+                val boxWidthPx = constraints.maxWidth
+                // 渲染过的宽度直接复用截图：滚出屏幕再回来不再重建 WebView、重跑 3.5MB 脚本
+                val cached = remember(source, boxWidthPx) {
+                    MermaidBitmapCache.get(MermaidBitmapCache.key(source, boxWidthPx))
+                }
+                val boxHeight = cached
+                    ?.let { with(density) { it.height.toDp() } }
+                    ?.coerceIn(80.dp, 600.dp)
+                    ?: dynamicHeight
 
-                                        @JavascriptInterface
-                                        fun onFailed(error: String) {
-                                            post {
-                                                errorMessage = error
-                                                isFailed = true
-                                            }
-                                        }
-                                    },
-                                    "AgentPagerBridge",
-                                )
-                                webViewClient = object : WebViewClient() {
-                                    override fun onReceivedError(
-                                        view: WebView,
-                                        request: WebResourceRequest,
-                                        error: WebResourceError,
-                                    ) {
-                                        // 只认主文档失败；子资源噪音（favicon 之类）不判死
-                                        if (!request.isForMainFrame) return
-                                        post {
-                                            errorMessage = "页面加载失败（错误码 ${error.errorCode}）"
-                                            isFailed = true
-                                        }
-                                    }
-                                }
-                                loadDataWithBaseURL(
-                                    "file:///android_asset/mermaid/",
-                                    inlineHtml,
-                                    "text/html",
-                                    "UTF-8",
-                                    null,
-                                )
-                                loadedHtml[0] = inlineHtml
-                            }
-                        } catch (e: Throwable) {
-                            errorMessage = e.message
-                            isFailed = true
-                            View(context)
+                // 20 秒兜底：既没有缓存、也没有任何回调时才降级源码。
+                // 慢设备上多张图同时渲染时，10 秒会误杀还在排队的图。
+                LaunchedEffect(source, cached != null) {
+                    if (cached != null) return@LaunchedEffect
+                    delay(20_000)
+                    if (contentHeightPx <= 0f && !isFailed) {
+                        errorMessage = "渲染超时"
+                        isFailed = true
+                    }
+                }
+
+                if (cached == null) {
+                    // 首次渲染（或新的宽度）：等高度稳定后抓一张图存缓存；
+                    // 当前这块仍用 WebView，不切换，避免抓到空图时把可见内容换掉。
+                    LaunchedEffect(source, boxWidthPx, contentHeightPx) {
+                        if (contentHeightPx <= 0f) return@LaunchedEffect
+                        delay(250)
+                        val view = webViewRef[0] ?: return@LaunchedEffect
+                        if (view.width <= 0 || view.height <= 0 || view.width != boxWidthPx) {
+                            return@LaunchedEffect
                         }
-                    },
-                    update = { view ->
-                        val webView = view as? WebView
-                        // 只在 html 真的换了才重载（之前每次重组都 load 一遍，又卡又闪）
-                        if (webView != null && loadedHtml[0] !== inlineHtml) {
-                            loadedHtml[0] = inlineHtml
-                            webView.loadDataWithBaseURL(
-                                "file:///android_asset/mermaid/",
-                                inlineHtml,
-                                "text/html",
-                                "UTF-8",
-                                null,
+                        withFrameNanos { }
+                        captureWebView(view)?.let { bitmap ->
+                            MermaidBitmapCache.put(
+                                MermaidBitmapCache.key(source, view.width),
+                                bitmap,
                             )
                         }
-                    },
-                    onRelease = { view -> (view as? WebView)?.destroy() },
-                )
+                    }
+                }
 
-                // 核心修复：覆盖在原生 WebView 上层的透明点击层，保证 100% 捕获点击唤起全屏
                 Box(
                     modifier = Modifier
-                        .matchParentSize()
-                        .clickable { fullscreen = true },
-                )
+                        .fillMaxWidth()
+                        .height(boxHeight),
+                ) {
+                    if (cached != null) {
+                        Image(
+                            bitmap = cached.asImageBitmap(),
+                            contentDescription = null,
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.FillWidth,
+                        )
+                    } else {
+                        AndroidView(
+                            modifier = Modifier.fillMaxSize(),
+                            factory = { context ->
+                                try {
+                                    WebView(context).apply {
+                                        configureInline()
+                                        webViewRef[0] = this
+                                        addJavascriptInterface(
+                                            object {
+                                                @JavascriptInterface
+                                                fun onSuccess(heightPx: Float) {
+                                                    post {
+                                                        contentHeightPx = heightPx
+                                                        isFailed = false
+                                                    }
+                                                }
+
+                                                @JavascriptInterface
+                                                fun onFailed(error: String) {
+                                                    post {
+                                                        errorMessage = error
+                                                        isFailed = true
+                                                    }
+                                                }
+                                            },
+                                            "AgentPagerBridge",
+                                        )
+                                        webViewClient = object : WebViewClient() {
+                                            override fun onReceivedError(
+                                                view: WebView,
+                                                request: WebResourceRequest,
+                                                error: WebResourceError,
+                                            ) {
+                                                // 只认主文档失败；子资源噪音（favicon 之类）不判死
+                                                if (!request.isForMainFrame) return
+                                                post {
+                                                    errorMessage = "页面加载失败（错误码 ${error.errorCode}）"
+                                                    isFailed = true
+                                                }
+                                            }
+                                        }
+                                        loadDataWithBaseURL(
+                                            "file:///android_asset/mermaid/",
+                                            inlineHtml,
+                                            "text/html",
+                                            "UTF-8",
+                                            null,
+                                        )
+                                        loadedHtml[0] = inlineHtml
+                                    }
+                                } catch (e: Throwable) {
+                                    errorMessage = e.message
+                                    isFailed = true
+                                    View(context)
+                                }
+                            },
+                            update = { view ->
+                                val webView = view as? WebView
+                                // 只在 html 真的换了才重载（之前每次重组都 load 一遍，又卡又闪）
+                                if (webView != null && loadedHtml[0] !== inlineHtml) {
+                                    loadedHtml[0] = inlineHtml
+                                    webView.loadDataWithBaseURL(
+                                        "file:///android_asset/mermaid/",
+                                        inlineHtml,
+                                        "text/html",
+                                        "UTF-8",
+                                        null,
+                                    )
+                                }
+                            },
+                            onRelease = { view ->
+                                webViewRef[0] = null
+                                (view as? WebView)?.destroy()
+                            },
+                        )
+                    }
+
+                    // 核心修复：覆盖在 WebView/截图上层，保证 100% 捕获点击唤起全屏
+                    Box(
+                        modifier = Modifier
+                            .matchParentSize()
+                            .clickable { fullscreen = true },
+                    )
+                }
             }
         }
     }
@@ -522,8 +580,23 @@ private fun buildMermaidHtml(base64Code: String, isInteractive: Boolean): String
             }).then(function(res) {
               document.getElementById("container").innerHTML = res.svg;
               if (window.AgentPagerBridge) {
-                const height = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
-                window.AgentPagerBridge.onSuccess(height);
+                // 高度不是"渲染完测一次"就完了：转屏/拖分屏后宽度变化，SVG 会重新排版、
+                // 高度跟着变。ResizeObserver + resize 每次重报，Compose 才有正确高度。
+                let lastReportedHeight = -1;
+                const reportHeight = function(force) {
+                  const height = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+                  if (!force && Math.abs(height - lastReportedHeight) < 1) return;
+                  lastReportedHeight = height;
+                  window.AgentPagerBridge.onSuccess(height);
+                };
+                reportHeight(true);
+                const scheduleReport = function() {
+                  requestAnimationFrame(function() { reportHeight(true); });
+                };
+                if (window.ResizeObserver) {
+                  new ResizeObserver(scheduleReport).observe(document.body);
+                }
+                window.addEventListener("resize", scheduleReport);
               }
             }).catch(function(err) {
               if (window.AgentPagerBridge) {
@@ -576,4 +649,63 @@ private fun WebView.configureInteractive() {
         useWideViewPort = true
         loadWithOverviewMode = true
     }
+}
+
+private object MermaidBitmapCache {
+    private const val MAX_BYTES = 24 * 1024 * 1024
+
+    private val cache = object : LruCache<String, Bitmap>(MAX_BYTES) {
+        override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
+    }
+
+    fun key(source: String, widthPx: Int): String = "${source.hashCode()}:$widthPx"
+
+    fun get(key: String): Bitmap? = cache.get(key)
+
+    fun put(key: String, value: Bitmap) {
+        cache.put(key, value)
+    }
+}
+
+/**
+ * 抓当前可见 WebView 的位图。WebView 的硬件层通常画不进软件 Canvas：
+ * 先直接画；得到空图（只剩页面底色）就临时切软件层重试一次，再切回硬件层。
+ * 抓不到或抓到空图返回 null，调用方不缓存，保持原 WebView 行为。
+ */
+private suspend fun captureWebView(view: WebView): Bitmap? {
+    return try {
+        var bitmap = drawWebView(view)
+        if (!looksRendered(bitmap)) {
+            view.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
+            withFrameNanos { }
+            bitmap = drawWebView(view)
+            view.setLayerType(View.LAYER_TYPE_HARDWARE, null)
+        }
+        if (looksRendered(bitmap)) bitmap else null
+    } catch (_: Throwable) {
+        null
+    }
+}
+
+private fun drawWebView(view: WebView): Bitmap {
+    val bitmap = Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888)
+    view.draw(Canvas(bitmap))
+    return bitmap
+}
+
+/** 页面底色是 #05070B；采样一圈，全是底色就视为空图/抓取失败。 */
+private fun looksRendered(bitmap: Bitmap): Boolean {
+    val background = 0xFF05070B.toInt()
+    val stepX = (bitmap.width / 32).coerceAtLeast(1)
+    val stepY = (bitmap.height / 32).coerceAtLeast(1)
+    var y = 0
+    while (y < bitmap.height) {
+        var x = 0
+        while (x < bitmap.width) {
+            if (bitmap.getPixel(x, y) != background) return true
+            x += stepX
+        }
+        y += stepY
+    }
+    return false
 }
