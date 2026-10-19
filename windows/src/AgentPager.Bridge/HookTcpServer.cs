@@ -11,7 +11,8 @@ namespace AgentPager.Bridge;
 public sealed class HookTcpServer(
     Func<HookEnvelope, Task> hookHandler,
     DailyFileLog log,
-    Func<bool>? isPhoneConnected = null)
+    Func<bool>? isPhoneConnected = null,
+    Action<string>? onPendingAbandoned = null)
     : ICodexPermissionResolver, IAsyncDisposable
 {
     // 没有手机连着就别抢提问：agy 的 ask_question 若无人可答，应当放行让终端自己弹框，
@@ -213,6 +214,25 @@ public sealed class HookTcpServer(
         return true;
     }
 
+    /// <summary>
+    /// 等这条挂住连接的**对端关掉**，然后摘掉待决记录并通知上层撤卡。
+    ///
+    /// 必须区分"对端自己走了"与"我方主动收尾"：回填/取消/被新请求顶替都会先删记录再 Dispose，
+    /// 此时条件删除会失败，不会误发"交回终端"。只有记录还在、对端却断了，才是 hook 进程真的没了。
+    /// </summary>
+    private async Task WatchHeldConnection(string sessionID, TcpClient client, HookSource source)
+    {
+        await PendingHold.WaitForPeerCloseAsync(client);
+
+        var held = new KeyValuePair<string, (TcpClient Client, HookSource Source)>(sessionID, (client, source));
+        var removed = ((ICollection<KeyValuePair<string, (TcpClient Client, HookSource Source)>>)_pending).Remove(held);
+        if (!removed) return;
+
+        log.Write("WARN", $"[{source}] 挂起的连接已断开（会话 {sessionID}）：本次询问交回终端");
+        try { onPendingAbandoned?.Invoke(sessionID); }
+        catch (Exception error) { log.Write("ERROR", $"[{source}] 撤卡通知失败：{error.Message}"); }
+    }
+
     private async Task AcceptLoop(CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
@@ -288,6 +308,9 @@ public sealed class HookTcpServer(
                 if (_pending.TryGetValue(sessionID, out var previous)) previous.Client.Dispose();
                 _pending[sessionID] = (client, source);
                 log.Write("INFO", $"[{source}] 挂起等待（会话 {sessionID}）");
+                // 看着这条连接：hook 进程自己退出（脚本超时/被杀/Claude 退出）时把死记录摘掉，
+                // 否则后续手机点"允许"会往死 socket 写，卡片也永远撤不掉。
+                _ = WatchHeldConnection(sessionID, client, source);
                 await hookHandler(envelope);
                 return;
             }

@@ -308,3 +308,44 @@ Claude Code hook ──stdin/stdout + exe --hook──► TCP 49361 ──► Ta
    但 `PostToolUse` / `PostToolUseFailure` 必须放行——它们正是"这一等结束了"的信号（手机放行、本机作答、工具被拒后照常返回）。
    一刀切锁死会让任务卡在等待态（本轮实现时先写成了一刀切，被测试当场抓住）。
 3. 同一 lifecycle+activity 的连续事件不重播动画（真实任务 revision 恒 0），重播只发生在状态真实迁移时。
+
+## 十、转录本纠偏与挂起连接释放（2026-10-19）
+
+> **来源**：思路参照上游 `afetmin/AgentPager` 的 `b162a7a`（Claude 生命周期纠偏）与 `b570f47`（挂起权限连接）两个提交。上游只有 macOS/Swift 实现，其 `windows/` 树自 `8421bd5` 起未再跟进这两个修复；本仓库是 C# 独立实现，**不是 cherry-pick**，与上游的差异见下表。
+
+| 上游（macOS/Swift） | 本仓库（Windows/C#） | 原因 |
+|---|---|---|
+| Running + 转录本无文件 + 静默 10 分钟 → `interrupted` | **不做**；离线仍由 `CheckClaudeRuntime` 按会话注册表判 `offline` | 注册表信号更硬；两条同时跑时注册表会覆盖转录本的裁决（实测），等于白写。分工：转录本管「回合结束」，注册表管「会话在不在」 |
+| 结束行无 timestamp 时回退文件 mtime | **不回退**，直接不判 | mtime 会随新行刷新，上一轮的旧 Stop 会被误判为晚于本轮 `StartedAt`，把还在跑的回合判完成 |
+| 按会话 id 全量枚举 projects 目录 | 优先用 hook 带来的 `transcript_path`，缺了才按 id 找 | 桥本就维护 `_claudeTranscripts`，绝大多数情况零枚举 |
+| 完成时只改任务 | 额外撤掉挂着的审批/作答卡与 `_waitingSince` | 本仓库的 catalog 有这些表，上游 `TaskStore` 没有 |
+| 断连/超时 → `expirePendingRequest` 判 `interrupted` | `AbandonRequest` 放回 `running` | 连接死 ≠ 回合死；与现有的 10 分钟 `ExpireStaleWaits`（交回终端）保持同一语义 |
+| 服务端 30 分钟超时 + `permissionExpired` 事件 | **不加** | 本仓库已有 10 分钟 `ExpireStaleWaits`，避免两套超时语义打架 |
+| `NWConnection` 状态回调发现断连 | `PendingHold` 读 1 字节等 EOF | Windows 侧没有等价的状态回调，读 EOF 是直接观测 |
+
+### 1. 转录本只回答「这一轮结束没有」
+
+Hook 是主通道，但有两种漏：Desktop 预热/恢复路径可能不发 `Stop`；脚本被超时杀掉时 `UserPromptSubmit` 与 `Stop` 都会消失。会话注册表（§一.4）能判「会话还在不在」，但判不了「这一轮完成没有」——后者只能看转录本。
+
+`TaskCatalog.ReconcileClaudeSessions` 一分钟一次，只处理 Claude 的 `starting` / `running`：
+
+| 现象 | 判据 | 裁定 |
+|---|---|---|
+| `Stop` 丢了 | 最后一条活动（`user`/`assistant`，排除 `isSidechain`）之后出现结束证据（`type=system, subtype=stop_hook_summary`，或 assistant `message.stop_reason` 为 `end_turn`/`stop_sequence`），且时间 >= `StartedAt` | `succeeded`（未读、撤卡、撤能力位） |
+| `UserPromptSubmit` 丢了 | 任务还停在 `starting`，转录本里已有本轮活动（同上，且晚于 `StartedAt`） | `running` / `thinking` |
+| `starting` 卡超 2 分钟 | 转录本里没有任何本轮活动 | `offline` |
+
+**刻意不做的事**：
+
+- 不按「文件多久没写」判死。工具（Bash）与模型调用可以合法长跑十分钟以上；「会话没了」交给 `CheckClaudeRuntime` 按会话注册表判 `offline`（同一轮里两个机制分工明确，单测钉住了这条边界）。
+- 文件不存在 = 未知，什么也不判；文件存在但没有结束证据 = 这一轮还开着。
+- 结束证据早于 `StartedAt`（上一轮的 `end_turn`）不许用：否则「用户刚发了新 prompt」会被误判成已完成。
+
+### 2. 挂起的审批/作答连接：对端没了就撤
+
+`HookTcpServer` 把连接挂进待决表时，同时起一个看护（`PendingHold`：读 1 字节等 EOF）。只有「记录还在、对端却断了」才算 hook 进程真的没了，此时：
+
+- 摘掉待决记录（后续点按不会再往死 socket 写）；
+- 回调 `TaskCatalog.AbandonRequest`：撤卡、把任务从 `waitingApproval`/`waitingAnswer` 放回 `running`（与 10 分钟 `ExpireStaleWaits` 同一语义——**连接死 ≠ 回合死**，终端会自己继续或改走本地审批）。
+
+回填、取消、被同会话的新请求顶替都是**先删记录再 Dispose**，看护的条件删除会失败，不会误发「交回终端」。

@@ -237,6 +237,107 @@ public static class ClaudeTranscriptReader
             bodyReplyAt);
     }
 
+    /// <summary>
+    /// 转录本里"这一轮结束没有"的最小证据（只给生命周期纠偏用，与上面的预览读取完全解耦）。
+    ///
+    /// 判据与上游 macOS 实现一致：最后一条**活动**（user / assistant，排除 isSidechain）之后
+    /// 没有出现结束证据，就是这一轮还开着。结束证据有两种：
+    ///   · <c>type=system, subtype=stop_hook_summary</c>（Stop 钩子落盘的摘要）；
+    ///   · assistant 的 <c>message.stop_reason</c> 为 <c>end_turn</c> / <c>stop_sequence</c>
+    ///     （Desktop 路径不一定发 Stop，但最终回复本身就能证明这一轮结束了）。
+    /// <c>StopAt</c> 是**最后一条**结束证据的时间；调用方必须同时确认 <see cref="HasOpenTurn"/>
+    /// 为 false 才可以用它（否则它属于更早的轮次）。
+    /// </summary>
+    public sealed record ClaudeTurnEvidence(
+        bool HasOpenTurn,
+        DateTimeOffset? StopAt,
+        DateTimeOffset? LastActivityAt);
+
+    /// <summary>
+    /// 读转录本尾部的轮次证据。文件不存在/读不了返回 null（未知，绝不当作"已结束"）；
+    /// 文件存在但没有可用行时返回空证据（<see cref="ClaudeTurnEvidence.HasOpenTurn"/> = false、
+    /// <see cref="ClaudeTurnEvidence.StopAt"/> = null）——这和"没有文件"是两件事：
+    /// 前者不能据此判中断，后者才可以。
+    /// </summary>
+    public static ClaudeTurnEvidence? ReadTurnEvidence(string? transcriptPath)
+    {
+        if (string.IsNullOrWhiteSpace(transcriptPath) || !File.Exists(transcriptPath)) return null;
+
+        string text;
+        var tailStartedMidFile = false;
+        try
+        {
+            var fileInfo = new FileInfo(transcriptPath);
+            var readSize = (int)Math.Min(fileInfo.Length, TailBytes);
+            if (readSize <= 0) return new ClaudeTurnEvidence(false, null, null);
+            tailStartedMidFile = readSize < fileInfo.Length;
+
+            var buffer = new byte[readSize];
+            using var stream = new FileStream(
+                transcriptPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            stream.Seek(-readSize, SeekOrigin.End);
+            var bytesRead = stream.Read(buffer, 0, readSize);
+            if (bytesRead <= 0) return new ClaudeTurnEvidence(false, null, null);
+            text = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+        }
+        catch
+        {
+            return null;
+        }
+
+        // 尾读可能从一行中间开始：丢掉不完整的首行，否则那半行会解析失败（无害）或误判。
+        if (tailStartedMidFile)
+        {
+            var newline = text.IndexOf('\n');
+            text = newline >= 0 ? text[(newline + 1)..] : string.Empty;
+        }
+
+        var lastActivityIndex = -1;
+        var lastStopIndex = -1;
+        DateTimeOffset? stopAt = null;
+        DateTimeOffset? lastActivityAt = null;
+        var index = -1;
+
+        foreach (var line in text.Split('\n'))
+        {
+            index++;
+            var trimmed = line.Trim();
+            if (trimmed.Length == 0) continue;
+            try
+            {
+                using var document = JsonDocument.Parse(trimmed);
+                var root = document.RootElement;
+                if (root.ValueKind != JsonValueKind.Object) continue;
+
+                if (Timestamp(root) is { } stamp && (lastActivityAt is null || stamp > lastActivityAt))
+                    lastActivityAt = stamp;
+
+                if (IsSidechain(root)) continue;
+                var type = Text(root, "type");
+                if (type is "user" or "assistant") lastActivityIndex = index;
+
+                if (type == "assistant" &&
+                    root.TryGetProperty("message", out var message) &&
+                    Text(message, "stop_reason") is "end_turn" or "stop_sequence")
+                {
+                    lastStopIndex = index;
+                    stopAt = Timestamp(root);
+                }
+                else if (type == "system" && Text(root, "subtype") == "stop_hook_summary")
+                {
+                    lastStopIndex = index;
+                    stopAt = Timestamp(root);
+                }
+            }
+            catch
+            {
+                // 半行或结构不认识：跳过。
+            }
+        }
+
+        return new ClaudeTurnEvidence(lastActivityIndex > lastStopIndex, stopAt, lastActivityAt);
+    }
+
     /// <summary>行内 ISO 时间戳（Claude 每行都带，形如 2026-10-08T12:34:56.789Z）。</summary>
     private static DateTimeOffset? Timestamp(JsonElement root) =>
         Text(root, "timestamp") is { Length: > 0 } stamp &&

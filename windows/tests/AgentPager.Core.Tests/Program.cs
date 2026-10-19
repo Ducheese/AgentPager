@@ -3738,6 +3738,134 @@ static System.Diagnostics.Process SpawnVictim()
     Check(folded[120 + 14] == 0x0D, "console keystrokes: folded line still ends with cr");
 }
 
+// ---------------------------------------------------------------------------
+// 6 Claude 生命周期纠偏（转录本）与挂起连接释放（2026-10-19）
+// ---------------------------------------------------------------------------
+{
+    static string NewRoot()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "ap-claude-reconcile", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        return root;
+    }
+    static string TranscriptPath(string root, string sessionID)
+    {
+        var dir = Path.Combine(root, "F--Git-demo");
+        Directory.CreateDirectory(dir);
+        return Path.Combine(dir, sessionID + ".jsonl");
+    }
+    static string ClaudeStamp(DateTimeOffset at) => at.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ");
+    static string UserLine(string text, DateTimeOffset at) =>
+        $"{{\"type\":\"user\",\"timestamp\":\"{ClaudeStamp(at)}\",\"message\":{{\"content\":\"{text}\"}}}}";
+    static string AssistantLine(DateTimeOffset at, string? stopReason = null) =>
+        $"{{\"type\":\"assistant\",\"timestamp\":\"{ClaudeStamp(at)}\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"ok\"}}]{(stopReason is null ? "" : $",\"stop_reason\":\"{stopReason}\"")}}}}}";
+    static string StopSummaryLine(DateTimeOffset at) =>
+        $"{{\"type\":\"system\",\"subtype\":\"stop_hook_summary\",\"timestamp\":\"{ClaudeStamp(at)}\"}}";
+    static TaskSnapshot Find(TaskCatalog catalog, string sessionID) =>
+        catalog.Projection().Tasks.First(task => task.Id == sessionID);
+    static void Write(string path, params string[] lines) => File.WriteAllText(path, string.Join('\n', lines) + "\n");
+
+    var reconcileT0 = DateTimeOffset.UtcNow;
+
+    // 6.1 Stop 丢了（Desktop 预热/超时杀脚本）：转录本里本回合已有 end_turn → 判成功
+    {
+        var root = NewRoot();
+        const string sid = "claude-lost-stop";
+        var path = TranscriptPath(root, sid);
+        var scoped = new TaskCatalog(claudeProjectsRoot: root);
+        scoped.Accept(C("UserPromptSubmit", new { session_id = sid, prompt = "跑一遍测试", transcript_path = path }), reconcileT0);
+        Check(Find(scoped, sid).Lifecycle == AgentLifecycle.Running, "claude reconcile: prompt starts a running task");
+
+        Write(path,
+            UserLine("跑一遍测试", reconcileT0.AddSeconds(1)),
+            AssistantLine(reconcileT0.AddSeconds(2), "end_turn"));
+        scoped.Maintain(reconcileT0.AddSeconds(61));
+
+        var done = Find(scoped, sid);
+        Check(done.Lifecycle == AgentLifecycle.Succeeded,
+            "claude reconcile: a missing Stop is recovered from the transcript");
+        Check(done.IsUnread && done.CompletedAt is not null,
+            "claude reconcile: recovered completion is unread and carries the stop time");
+    }
+
+    // 6.2 打开的轮次（工具在跑、没有结束证据）：绝不因为"没有 Stop"就判结束，也不能被静默扫描判中断
+    {
+        var root = NewRoot();
+        const string sid = "claude-open-turn";
+        var path = TranscriptPath(root, sid);
+        var scoped = new TaskCatalog(claudeProjectsRoot: root);
+        scoped.Accept(C("UserPromptSubmit", new { session_id = sid, prompt = "跑个长任务", transcript_path = path }), reconcileT0);
+        Write(path,
+            UserLine("跑个长任务", reconcileT0.AddSeconds(1)),
+            AssistantLine(reconcileT0.AddSeconds(2)));
+
+        scoped.Maintain(reconcileT0.AddSeconds(61));
+        Check(Find(scoped, sid).Lifecycle == AgentLifecycle.Running,
+            "claude reconcile: an open turn is never declared finished");
+        scoped.Maintain(reconcileT0.AddSeconds(11 * 60));
+        var aged = Find(scoped, sid);
+        Check(aged.Lifecycle != AgentLifecycle.Succeeded,
+            "claude reconcile: an open turn is never completed by the silence sweep");
+        Check(aged.Lifecycle == AgentLifecycle.Offline,
+            "claude reconcile: with no session registry entry, 'gone' is still the runtime sweep's call (Offline)");
+    }
+
+    // 6.4 结束证据属于上一轮（时间早于 StartedAt）：不能被当成这一轮已完成
+    {
+        var root = NewRoot();
+        const string sid = "claude-stale-stop";
+        var path = TranscriptPath(root, sid);
+        Write(path,
+            UserLine("上一轮", reconcileT0.AddSeconds(-120)),
+            AssistantLine(reconcileT0.AddSeconds(-110), "end_turn"),
+            UserLine("这一轮", reconcileT0.AddSeconds(-60)));
+        var scoped = new TaskCatalog(claudeProjectsRoot: root);
+        scoped.Accept(C("UserPromptSubmit", new { session_id = sid, prompt = "这一轮", transcript_path = path }), reconcileT0);
+
+        scoped.Maintain(reconcileT0.AddSeconds(61));
+        Check(Find(scoped, sid).Lifecycle == AgentLifecycle.Running,
+            "claude reconcile: an end_turn from an earlier turn does not complete this one");
+    }
+
+    // 6.5 证据读取本身：stop_hook_summary 也算结束证据，之后的用户输入重新打开轮次
+    {
+        var path = Path.Combine(Path.GetTempPath(), "ap-turn-evidence-" + Guid.NewGuid().ToString("N") + ".jsonl");
+        Write(path,
+            UserLine("你好", reconcileT0),
+            AssistantLine(reconcileT0.AddSeconds(1)),
+            StopSummaryLine(reconcileT0.AddSeconds(2)));
+        var closed = ClaudeTranscriptReader.ReadTurnEvidence(path);
+        Check(closed is { HasOpenTurn: false } && closed.StopAt is not null,
+            "claude reconcile: stop_hook_summary closes the turn");
+        Check(closed!.LastActivityAt is not null, "claude reconcile: evidence carries the last activity time");
+
+        File.AppendAllText(path, UserLine("再来", reconcileT0.AddSeconds(3)) + "\n");
+        var reopened = ClaudeTranscriptReader.ReadTurnEvidence(path);
+        Check(reopened is { HasOpenTurn: true }, "claude reconcile: a newer user line reopens the turn");
+        Check(ClaudeTranscriptReader.ReadTurnEvidence(path + ".missing") is null,
+            "claude reconcile: a missing transcript is unknown, never 'finished'");
+    }
+
+    // 6.6 挂住的连接对端关闭：PendingHold 必须放行（HookTcpServer 据此摘死记录并撤卡）
+    {
+        var listener = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((System.Net.IPEndPoint)listener.LocalEndpoint).Port;
+        var acceptTask = listener.AcceptTcpClientAsync();
+        using var held = new System.Net.Sockets.TcpClient();
+        held.Connect(System.Net.IPAddress.Loopback, port);
+        using var serverSide = await acceptTask;
+
+        var closed = PendingHold.WaitForPeerCloseAsync(serverSide);
+        await System.Threading.Tasks.Task.Delay(80);
+        Check(!closed.IsCompleted, "pending hold: waits while the peer is still connected");
+        held.Close();
+        Check(await System.Threading.Tasks.Task.WhenAny(closed, System.Threading.Tasks.Task.Delay(2000)) == closed,
+            "pending hold: peer close releases the waiter");
+        listener.Stop();
+    }
+}
+
 Console.WriteLine(failures.Count == 0 ? "ALL CHECKS PASSED" : $"FAILURES: {string.Join(", ", failures)}");
 return failures.Count == 0 ? 0 : 1;
 

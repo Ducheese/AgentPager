@@ -144,6 +144,12 @@ public sealed class TaskCatalog
     // 等待人类输入/审批的起始时刻：用于时钟顺延补偿，剔除人类作答等待时间
     private readonly Dictionary<string, DateTimeOffset> _waitingSince = new(StringComparer.Ordinal);
     private readonly int _capacity;
+    /// <summary>Claude 转录本根目录（<c>~/.claude/projects</c>）；测试注入临时目录，生产走默认。</summary>
+    private readonly string _claudeProjectsRoot;
+    /// <summary>上一次做转录本纠偏的时刻（一分钟一次，别跟着 300ms 的 Maintain 扫盘）。</summary>
+    private DateTimeOffset _claudeReconcileAt = DateTimeOffset.MinValue;
+    private static readonly TimeSpan ClaudeReconcileInterval = TimeSpan.FromMinutes(1);
+    private static readonly TimeSpan ClaudeStartingGrace = TimeSpan.FromMinutes(2);
     private ulong _revision;
 
     private readonly HashSet<string> _openCodeControlSeen = new(StringComparer.Ordinal);
@@ -151,11 +157,12 @@ public sealed class TaskCatalog
     public Func<bool>? HasOpenCodeControl { get; set; }
     public Func<Dictionary<string, ClaudeSessionRegistry.Entry>>? ClaudeRegistryScanner { get; set; }
 
-    public TaskCatalog(IEnumerable<TaskSnapshot>? restoring = null, int capacity = 20)
+    public TaskCatalog(IEnumerable<TaskSnapshot>? restoring = null, int capacity = 20, string? claudeProjectsRoot = null)
     {
         _tasks = restoring?.ToList() ?? [];
         _requests = [];
         _capacity = capacity;
+        _claudeProjectsRoot = claudeProjectsRoot ?? Path.Combine(ClaudeConfigDirectory.Home, "projects");
         Normalize(DateTimeOffset.UtcNow);
     }
 
@@ -1210,6 +1217,7 @@ public sealed class TaskCatalog
         changed = CheckAgyPreviewRecheck(currentTime) || changed;
         changed = MaintainAgyDatabase(currentTime) || changed;
         changed = CheckClaudePreviewRecheck(currentTime) || changed;
+        changed = ReconcileClaudeSessions(currentTime) || changed;
         changed = CheckClaudeRuntime(currentTime, log) || changed;
         changed = CheckClaudeDeliveries(currentTime) || changed;
         changed = CheckClaudeQueueHealth(currentTime, log) || changed;
@@ -1836,6 +1844,145 @@ public sealed class TaskCatalog
     ///
     /// 返回需要释放回话连接的会话 id（桥据此关掉挂住的那条 socket）。
     /// </summary>
+    /// <summary>
+    /// 用转录本给 **Claude** 的 Starting/Running 做纠偏（Hook 是主通道，这里只补它漏掉的那几种）。
+    ///
+    /// 两类缺口与对应裁定：
+    ///   1) **Stop 丢了**（Desktop 预热/恢复路径，或脚本被超时杀掉）：转录本里本回合最后一条
+    ///      结束证据（<c>stop_hook_summary</c> / assistant <c>stop_reason=end_turn</c>）晚于
+    ///      <c>StartedAt</c> → 判 <c>Succeeded</c>（未读、撤能力位）；
+    ///   2) **UserPromptSubmit 丢了**：任务还停在 Starting，但转录本里已有本轮用户轮次 → 纠正为 Running。
+    ///
+    /// **不在这里判"静默即死"**：那件事由 <see cref="CheckClaudeRuntime"/> 按会话注册表
+    /// （<c>~/.claude/sessions/&lt;pid&gt;.json</c>）负责——那个信号比"文件多久没写"可靠得多
+    /// （工具/模型可以合法地长跑十分钟以上），转录本只用来补"这一轮到底结束没有"。
+    ///
+    /// 一分钟一次；只在有候选任务时才碰磁盘；有路径就直接用，没路径才按会话 id 在 projects 下找一次。
+    /// </summary>
+    private bool ReconcileClaudeSessions(DateTimeOffset now)
+    {
+        if (now - _claudeReconcileAt < ClaudeReconcileInterval) return false;
+        _claudeReconcileAt = now;
+
+        var candidates = _tasks
+            .Where(task => task.Source == AgentSource.ClaudeCode &&
+                           task.Lifecycle is AgentLifecycle.Starting or AgentLifecycle.Running)
+            .ToList();
+        if (candidates.Count == 0) return false;
+
+        var changed = false;
+        foreach (var task in candidates)
+        {
+            var path = _claudeTranscripts.GetValueOrDefault(task.Id);
+            var evidence = ClaudeTranscriptReader.ReadTurnEvidence(path);
+            if (evidence is null && path is null)
+            {
+                path = FindClaudeTranscript(task.Id);
+                if (path is not null)
+                {
+                    _claudeTranscripts[task.Id] = path;
+                    evidence = ClaudeTranscriptReader.ReadTurnEvidence(path);
+                }
+            }
+
+            // 1) 本回合已有结束证据：补上丢掉的 Stop。
+            if (evidence is { HasOpenTurn: false, StopAt: { } stopAt } && stopAt >= task.StartedAt)
+            {
+                // 回合已经结束：还挂着的审批/作答卡不可能再有答案，顺手撤掉（同 Stop 分支）。
+                DropClaudeRequest(task.Id);
+                _waitingSince.Remove(task.Id);
+                Upsert(task with
+                {
+                    Lifecycle = AgentLifecycle.Succeeded,
+                    Activity = null,
+                    CompletedAt = stopAt,
+                    IsUnread = true,
+                    Capabilities = [],
+                    UpdatedAt = Max(task.UpdatedAt, stopAt),
+                });
+                changed = true;
+                continue;
+            }
+
+            // 2) 停在 Starting，但转录本里已经有本轮的活动：说明 UserPromptSubmit 漏了。
+            if (task.Lifecycle == AgentLifecycle.Starting &&
+                evidence is { HasOpenTurn: true, LastActivityAt: { } activeAt } && activeAt >= task.StartedAt)
+            {
+                Upsert(task with
+                {
+                    Lifecycle = AgentLifecycle.Running,
+                    Activity = AgentActivity.Thinking,
+                    CompletedAt = null,
+                    Capabilities = [],
+                    UpdatedAt = Max(task.UpdatedAt, activeAt),
+                });
+                changed = true;
+                continue;
+            }
+
+            // Starting 卡太久且没有任何活动：这张卡没有意义了（正常在会话里发第一条 prompt 就会离开）。
+            if (task.Lifecycle == AgentLifecycle.Starting && now - task.UpdatedAt >= ClaudeStartingGrace)
+            {
+                Upsert(task with
+                {
+                    Lifecycle = AgentLifecycle.Offline,
+                    Activity = null,
+                    Capabilities = [],
+                    UpdatedAt = now,
+                });
+                changed = true;
+            }
+        }
+
+        if (changed) Changed();
+        return changed;
+    }
+
+    private string? FindClaudeTranscript(string sessionID)
+    {
+        try
+        {
+            if (!Directory.Exists(_claudeProjectsRoot)) return null;
+            return Directory
+                .EnumerateFiles(_claudeProjectsRoot, sessionID + ".jsonl", SearchOption.AllDirectories)
+                .FirstOrDefault();
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 挂住的审批/作答连接**对端已经没了**（hook 进程退出、被杀、脚本超时）：这次询问无法再从手机答复。
+    /// 撤卡并把任务交回运行中——与 <see cref="ExpireStaleWaits"/> 同一语义：终端自己会继续或改走本地审批，
+    /// **不判 Interrupted**（连接死不等于回合死）。
+    /// </summary>
+    public bool AbandonRequest(string sessionID)
+    {
+        var changed = _requests.ContainsKey(sessionID);
+        DropClaudeRequest(sessionID);
+        _waitingSince.Remove(sessionID);
+
+        var task = _tasks.FirstOrDefault(candidate => candidate.Id == sessionID);
+        if (task is not null &&
+            task.Lifecycle is AgentLifecycle.WaitingApproval or AgentLifecycle.WaitingAnswer)
+        {
+            Upsert(task with
+            {
+                Lifecycle = AgentLifecycle.Running,
+                Activity = AgentActivity.Thinking,
+                CompletedAt = null,
+                Capabilities = [],
+                UpdatedAt = DateTimeOffset.UtcNow,
+            });
+            changed = true;
+        }
+
+        if (changed) Changed();
+        return changed;
+    }
+
     public IReadOnlyList<string> ExpireStaleWaits(TimeSpan limit, DateTimeOffset? now = null)
     {
         var currentTime = now ?? DateTimeOffset.UtcNow;

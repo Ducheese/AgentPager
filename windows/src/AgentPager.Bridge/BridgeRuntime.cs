@@ -33,6 +33,8 @@ public sealed class BridgeRuntime : IAsyncDisposable
     private sealed record PhoneCountEvent(int Count) : BridgeEvent;
     private sealed record UsageEvent(UsageSnapshot? Usage, List<UsageSnapshot>? Usages = null) : BridgeEvent;
     private sealed record MaintenanceEvent : BridgeEvent;
+    /// <summary>挂住的审批/作答连接被对端断开：撤卡并把任务交回运行中。</summary>
+    private sealed record RequestAbandonedEvent(string SessionID) : BridgeEvent;
 
     /// <summary>
     /// 人类等待答复的上限（审批与提问同一口径，三家共用）：到点就把这次询问交回终端。
@@ -125,7 +127,9 @@ public sealed class BridgeRuntime : IAsyncDisposable
                 envelope => _events.Writer.WriteAsync(new HookEvent(envelope), token).AsTask(),
                 _log,
                 // "有没有手机连着" —— agy 的提问拦截只在有人能作答时才成立（见 HookTcpServer 的说明）。
-                () => Volatile.Read(ref _phoneCount) > 0);
+                () => Volatile.Read(ref _phoneCount) > 0,
+                // 挂住的连接对端断了（hook 进程没了）：回到事件循环里撤卡，catalog 不是线程安全的。
+                sessionID => _events.Writer.TryWrite(new RequestAbandonedEvent(sessionID)));
             _hookServer.Start();
             _lanServer = new(
                 PairingText,
@@ -371,6 +375,9 @@ public sealed class BridgeRuntime : IAsyncDisposable
                     case PhoneCountEvent count:
                         _phoneCount = count.Count;
                         changed = true;
+                        break;
+                    case RequestAbandonedEvent abandoned:
+                        changed = _catalog.AbandonRequest(abandoned.SessionID);
                         break;
                     case UsageEvent usage:
                         _usage = usage.Usage;
