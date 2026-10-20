@@ -82,6 +82,12 @@ public sealed class TaskCatalog
     private readonly Dictionary<string, string> _claudeQueuedText = new(StringComparer.Ordinal);
     // Claude Code：会话 → 转录本路径（每个 hook 事件都带 transcript_path），供 Maintain 心跳复用。
     private readonly Dictionary<string, string> _claudeTranscripts = new(StringComparer.Ordinal);
+    // Claude Code：会话 → 本次工具起点。心跳重读转录本时，早于它的 tool_result 属于上一个工具，
+    // 不得回填（否则 PreToolUse 的清空会被旧输出回潮）。
+    private readonly Dictionary<string, DateTimeOffset> _claudeToolStartAt = new(StringComparer.Ordinal);
+    // agy：会话 → 本次工具起点。与 Claude 同理——转录本回填必须晚于它，否则"本次工具无输出"
+    // 清空后，下一次 PreInvocation/PostInvocation 会把上一条 GENERIC 重新填回来。
+    private readonly Dictionary<string, DateTimeOffset> _agyToolStartAt = new(StringComparer.Ordinal);
     // Claude Code：会话 → 工作目录（hook 载荷里的 cwd）。远程注入的 CLI 回退子进程拿它当
     // 工作目录——--resume 的转录本按会话定位不受进程 cwd 影响，但子进程里工具的相对路径、
     // 以及"回退进程该从哪个目录看这个项目"要吃的就是它。
@@ -293,6 +299,17 @@ public sealed class TaskCatalog
         // 在真跑起来后才发 hook）——清掉投递确认，不再重投。
         _claudeDeliveries.Remove(hook.SessionID);
 
+        // 工具起点：工具**运行期间**用它挡住上一个工具的 tool_result（心跳与事件路径同一条门控）。
+        // 成功结束即撤掉——floor 记的是桥的收包时间，hook 稍有延迟就会晚于结果时间，
+        // 留着会把整轮后续回填全部拒掉（实测：agy 的 TOOL 行因此冻结一整轮）。
+        // 失败不撤：那时转录本里只有上一个工具的成功结果，放行会冲掉错误原文。
+        if (hook.HookEventName == "PreToolUse")
+            _claudeToolStartAt[hook.SessionID] = now;
+        else if (hook.HookEventName == "PostToolUse")
+            _claudeToolStartAt.Remove(hook.SessionID);
+        DateTimeOffset? claudeToolStart =
+            _claudeToolStartAt.TryGetValue(hook.SessionID, out var claudeStarted) ? claudeStarted : null;
+
         var transcript = ReadClaudeTranscript(hook);
 
         // 记下"我们曾把它显示成排队中"的那条提示词。用途只有一个：**排队消息被投递时不算新回合**
@@ -305,7 +322,7 @@ public sealed class TaskCatalog
         var queuedDelivery = hook.HookEventName == "UserPromptSubmit" &&
             _claudeQueuedText.TryGetValue(hook.SessionID, out var queuedPrompt) &&
             queuedPrompt == ClaudeEventReducer.NormalizePrompt(hook.Prompt);
-        Upsert(ClaudeEventReducer.Reduce(hook, existing, transcript, now, queuedDelivery));
+        Upsert(ClaudeEventReducer.Reduce(hook, existing, transcript, now, queuedDelivery, claudeToolStart));
         if (queuedDelivery) _claudeQueuedText.Remove(hook.SessionID);
 
         switch (hook.HookEventName)
@@ -722,12 +739,18 @@ public sealed class TaskCatalog
 
     /// <summary>
     /// 只在需要转录本的时机读（512 KB 尾部）：会话/回合边界取标题与 Token，回合结束取正文预览。
-    /// 工具事件一律不读——每次工具调用读一遍文件是纯浪费，而它并不提供第三行需要的东西。
+    /// 工具事件不读：PostToolUse 首帧转录本里还没有本次 tool_result，读到的是上一条（实测）。
+    /// TOOL 行的唯一来源是转录本；本次工具结果由心跳（mtime 门控）读到，按本次工具起点过滤旧结果。
     /// </summary>
-    private static ClaudeTranscriptSnapshot? ReadClaudeTranscript(ClaudeHookPayload hook) =>
-        hook.HookEventName is "SessionStart" or "UserPromptSubmit" or "Stop" or "StopFailure"
-            ? ClaudeTranscriptReader.Read(hook.TranscriptPath)
-            : null;
+    private ClaudeTranscriptSnapshot? ReadClaudeTranscript(ClaudeHookPayload hook)
+    {
+        if (hook.HookEventName is not ("SessionStart" or "UserPromptSubmit" or "Stop" or "StopFailure"))
+            return null;
+        var path = !string.IsNullOrWhiteSpace(hook.TranscriptPath)
+            ? hook.TranscriptPath
+            : _claudeTranscripts.GetValueOrDefault(hook.SessionID);
+        return ClaudeTranscriptReader.Read(path);
+    }
 
     public bool Accept(OpenCodeHookPayload hook, DateTimeOffset? receivedAt = null)
     {
@@ -875,7 +898,16 @@ public sealed class TaskCatalog
 
         // 4. 顶层主任务状态流转
         var existing = _tasks.FirstOrDefault(task => task.Id == sessionID);
-        var updated = AgyEventReducer.Reduce(hook, existing, dbInfo, now, answerable);
+        // 工具起点：工具**运行期间**用它挡住上一个工具的 GENERIC（本次工具无输出时尤其要紧）。
+        // 成功结束即撤掉——floor 是桥的收包时间，hook 延迟时会晚于结果时间，
+        // 留着会把整轮后续回填全部拒掉（实测卡死一整轮）。失败不撤：转录本里此刻
+        // 只有上一个工具的成功结果，放行会冲掉错误原文。
+        if (hook.EffectiveEvent == "PreToolUse")
+            _agyToolStartAt[sessionID] = now;
+        else if (hook.EffectiveEvent == "PostToolUse" && string.IsNullOrWhiteSpace(hook.Error))
+            _agyToolStartAt.Remove(sessionID);
+        DateTimeOffset? agyToolStart = _agyToolStartAt.TryGetValue(sessionID, out var agyStarted) ? agyStarted : null;
+        var updated = AgyEventReducer.Reduce(hook, existing, dbInfo, now, answerable, agyToolStart);
         Upsert(updated);
 
         // 侦测父任务调用的 invoke_subagent，记录子代理绑定关系与先验派发窗口
@@ -1640,7 +1672,8 @@ public sealed class TaskCatalog
         _claudeTranscriptMtimes[task.Id] = modified;
 
         var snapshot = ClaudeTranscriptReader.Read(path);
-        var updated = ClaudeEventReducer.ApplyTranscript(task, snapshot);
+        DateTimeOffset? toolStart = _claudeToolStartAt.TryGetValue(task.Id, out var started) ? started : null;
+        var updated = ClaudeEventReducer.ApplyTranscript(task, snapshot, toolStart);
 
         // 心跳**只喂正文面板，不再往第三行送中途正文**（2026-10-15 用户裁定）。
         //
@@ -2369,6 +2402,12 @@ public sealed class TaskCatalog
             if (dropped > 0)
                 log?.Invoke("WARN", $"[ClaudeCode] 任务回收，桥端队列 {dropped} 条未投递 Prompt 已丢弃（会话 {victim.Id}）");
         }
+        // per-tool floor 只在会话存活期间有意义；任务回收后一并清掉，避免字典无限增长。
+        foreach (var victim in _tasks.Where(IsPurged))
+        {
+            _claudeToolStartAt.Remove(victim.Id);
+            _agyToolStartAt.Remove(victim.Id);
+        }
         _tasks.RemoveAll(task => IsPurged(task));
         for (var index = 0; index < _tasks.Count; index++)
         {
@@ -2735,7 +2774,8 @@ public static class ClaudeEventReducer
         TaskSnapshot? existing,
         ClaudeTranscriptSnapshot? transcript,
         DateTimeOffset now,
-        bool queuedDelivery = false)
+        bool queuedDelivery = false,
+        DateTimeOffset? toolOutputFloor = null)
     {
         var task = existing ?? new(
             hook.SessionID,
@@ -2752,7 +2792,7 @@ public static class ClaudeEventReducer
         // （曾按"另两家都用稳定目录"的理由冻结成首次取值，被用户裁定撤销——别再用直觉改语义）。
         task = ApplyTranscript(
             task with { ProjectName = hook.ProjectName, UpdatedAt = now },
-            hook, transcript);
+            hook, transcript, toolOutputFloor);
 
         switch (hook.HookEventName)
         {
@@ -2812,6 +2852,8 @@ public static class ClaudeEventReducer
                     Activity = AgentActivity.Thinking,
                     CompletedAt = null,
                     Capabilities = [],
+                    // TOOL 行只认转录本里的 tool_result（非结构文本）；钩子首帧还没有本次结果，
+                    // 这里不动，等心跳读到新结果再更新。
                 };
             case "PostToolUseFailure":
                 if (IsTerminalState(task)) return task;
@@ -2825,6 +2867,9 @@ public static class ClaudeEventReducer
                     CompletedAt = hook.IsInterrupt == true ? now : null,
                     IsUnread = hook.IsInterrupt == true || task.IsUnread,
                     Capabilities = [],
+                    // 失败原文本身就是非结构文本，直接用；转录本结果稍后到达时会被同一段文本覆盖。
+                    LatestToolOutput = ToolOutputText.Clean(hook.ErrorDetails)
+                        ?? ToolOutputText.Clean(hook.Error),
                 };
             case "PreCompact":
                 // 压缩只是回合中的一件事，不迁移生命周期。旧实现把它当"运行中"写回，
@@ -2996,9 +3041,12 @@ public static class ClaudeEventReducer
     /// 缺了才回落 payload 的 session_title；**绝不从 prompt 自造**——与 opencode/agy 同一条规范（G1）。
     /// </summary>
     private static TaskSnapshot ApplyTranscript(
-        TaskSnapshot task, ClaudeHookPayload hook, ClaudeTranscriptSnapshot? transcript)
+        TaskSnapshot task,
+        ClaudeHookPayload hook,
+        ClaudeTranscriptSnapshot? transcript,
+        DateTimeOffset? toolOutputFloor = null)
     {
-        var result = ApplyTranscript(task, transcript);
+        var result = ApplyTranscript(task, transcript, toolOutputFloor);
         // 即便没有转录本，session_title（用户自设标题）也随 SessionStart / UserPromptSubmit 到达。
         if (!string.IsNullOrWhiteSpace(hook.SessionTitle))
             result = result with { Title = ClaudeTitle(result.ProjectName, hook.SessionTitle!) };
@@ -3006,7 +3054,10 @@ public static class ClaudeEventReducer
     }
 
     /// <summary>心跳路径（无 hook 载荷）也能复用的同一份套用逻辑。</summary>
-    public static TaskSnapshot ApplyTranscript(TaskSnapshot task, ClaudeTranscriptSnapshot? transcript)
+    public static TaskSnapshot ApplyTranscript(
+        TaskSnapshot task,
+        ClaudeTranscriptSnapshot? transcript,
+        DateTimeOffset? toolOutputFloor = null)
     {
         var result = task;
 
@@ -3026,10 +3077,14 @@ public static class ClaudeEventReducer
 
     // TOOL 行（实验）：本轮最近一条工具结果。必须带时间戳门控——UserPrompt 已清空该字段，
     // 若转录本里还是上一轮的结果（新一轮尚未产生工具调用），不能把它捡回来。
-    if (transcript?.LatestToolOutput is { Length: > 0 } toolOutput &&
-        (transcript.LatestToolOutputAt is not { } toolAt || toolAt >= result.StartedAt))
+    // toolOutputFloor 是本次 PreToolUse 的起点：心跳在工具执行期间重读时，旧结果早于它，
+    // 必须拒绝，否则“清空”会被上一条输出回潮。
+    // 空串是有效结果（工具没有输出）→ Clean 后为 null → 清空 TOOL 行。
+    if (transcript?.LatestToolOutput is { } toolOutput &&
+        (transcript.LatestToolOutputAt is not { } toolAt || toolAt >= result.StartedAt) &&
+        (toolOutputFloor is not { } floor || transcript.LatestToolOutputAt is not { } toolAt2 || toolAt2 >= floor))
     {
-        result = result with { LatestToolOutput = toolOutput };
+        result = result with { LatestToolOutput = ToolOutputText.Clean(toolOutput) };
     }
 
         // 排队：转录本里最后一条**非系统**队列操作是 enqueue，且时间晚于本轮起点，

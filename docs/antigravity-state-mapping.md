@@ -3,6 +3,8 @@
 本文档定义 Google Antigravity（`agy`，闭源 CLI / 运行时，基于 `hooks.json` 与转录本日志）到 AgentPager `TaskSnapshot` 的完整映射规范。
 范围：Windows Bridge + Android。macOS 遵循对应事件逻辑（忽略差异）。
 
+> TOOL 行（工具输出）的规则见 [tool-output-row.md](tool-output-row.md)。
+
 ---
 
 ## 一、通道机制与架构推演

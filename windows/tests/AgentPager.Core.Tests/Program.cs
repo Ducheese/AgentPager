@@ -774,6 +774,74 @@ var parallelToolResults = ReadTranscript(
 Check(parallelToolResults.LatestToolOutput == "second",
     $"claude tool: a parallel-result line reports the last result (got '{parallelToolResults.LatestToolOutput}')");
 Check(toolTurnOver.LatestToolOutput is null, "claude tool: a new user prompt closes the old tool result");
+var emptyToolResult = ReadTranscript(
+[
+    "{\"type\":\"user\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":\"跑一下\"}}",
+    "{\"type\":\"user\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"tu_e\",\"content\":\"\"}]}}",
+]);
+Check(emptyToolResult.LatestToolOutput == "",
+    "claude tool: an empty tool_result is surfaced as empty (so the row can clear)");
+
+// Claude TOOL 行：只认转录本里的 tool_result；钩子首帧的 tool_response 不再参与。
+var claudeToolPath = Path.Combine(Path.GetTempPath(), "ap-verify-claude-tool-" + Guid.NewGuid().ToString("N") + ".jsonl");
+File.WriteAllLines(claudeToolPath,
+[
+    "{\"type\":\"user\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":\"跑一下\"}}",
+    "{\"type\":\"assistant\",\"isSidechain\":false,\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"tu_old\",\"name\":\"Bash\",\"input\":{\"command\":\"echo old\"}}]}}",
+    "{\"type\":\"user\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"tu_old\",\"content\":\"old result\"}]}}",
+]);
+var claudeToolCatalog = new TaskCatalog();
+claudeToolCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_tool_resp", prompt = "跑一下", transcript_path = claudeToolPath }), claudeNow);
+claudeToolCatalog.Accept(C("PreToolUse", new
+{
+    session_id = "claude_tool_resp",
+    tool_name = "Bash",
+    tool_input = new { command = "npm test" },
+    tool_use_id = "tu_new",
+    transcript_path = claudeToolPath,
+}), claudeNow.AddSeconds(1));
+Check(claudeToolCatalog.Projection().Tasks.First(t => t.Id == "claude_tool_resp").LatestToolOutput is null,
+    "claude tool: a new round starts with a blank tool row");
+claudeToolCatalog.Accept(C("PostToolUse", new
+{
+    session_id = "claude_tool_resp",
+    tool_name = "Bash",
+    tool_use_id = "tu_new",
+    tool_response = "fresh result",
+    transcript_path = claudeToolPath,
+}), claudeNow.AddSeconds(2));
+Check(claudeToolCatalog.Projection().Tasks.First(t => t.Id == "claude_tool_resp").LatestToolOutput is null,
+    "claude tool: PostToolUse ignores tool_response (transcript is the only source)");
+File.Delete(claudeToolPath);
+
+// Claude floor 同样在成功的 PostToolUse 后撤销：否则收包时间晚于结果时间时整轮冻结。
+var claudeReleasePath = Path.Combine(Path.GetTempPath(), "ap-verify-claude-release-" + Guid.NewGuid().ToString("N") + ".jsonl");
+File.WriteAllLines(claudeReleasePath,
+[
+    "{\"type\":\"user\",\"isSidechain\":false,\"timestamp\":\"" + claudeNow.AddSeconds(-5).ToString("O") + "\",\"message\":{\"role\":\"user\",\"content\":\"跑一下\"}}",
+    "{\"type\":\"user\",\"isSidechain\":false,\"timestamp\":\"" + claudeNow.AddSeconds(-5).ToString("O") + "\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"tu_rel\",\"content\":\"older result\"}]}}",
+]);
+var claudeReleaseCatalog = new TaskCatalog();
+claudeReleaseCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_release", prompt = "跑一下", transcript_path = claudeReleasePath }), claudeNow.AddSeconds(-20));
+claudeReleaseCatalog.Accept(C("PreToolUse", new
+{
+    session_id = "claude_release",
+    tool_name = "Bash",
+    tool_input = new { command = "npm test" },
+    tool_use_id = "tu_rel",
+    transcript_path = claudeReleasePath,
+}), claudeNow.AddSeconds(-2));
+claudeReleaseCatalog.Accept(C("PostToolUse", new
+{
+    session_id = "claude_release",
+    tool_name = "Bash",
+    tool_use_id = "tu_rel",
+    transcript_path = claudeReleasePath,
+}), claudeNow.AddSeconds(-1));
+claudeReleaseCatalog.Accept(C("Stop", new { session_id = "claude_release", transcript_path = claudeReleasePath }), claudeNow);
+Check(claudeReleaseCatalog.Projection().Tasks.First(t => t.Id == "claude_release").LatestToolOutput == "older result",
+    "claude release: a successful tool drops the floor so Stop can read the result");
+File.Delete(claudeReleasePath);
 
 // opencode：completed part 的 output 落到 LatestToolOutput；新一轮也要清掉。
 var ocToolCatalog = new TaskCatalog();
@@ -815,6 +883,204 @@ ocToolCatalog.Accept(
     claudeNow.AddSeconds(3));
 Check(ocToolCatalog.Projection().Tasks.First(t => t.Id == "ses_tool_out").LatestToolOutput is null,
     "opencode tool: a new turn clears the previous tool output");
+
+// agy TOOL 行：转录本中 GENERIC 步骤的 content 落到 LatestToolOutput，保留换行；
+// 新一轮开聊清空，元数据前缀剥完后为空也清空。
+var agyToolTemp = Path.Combine(Path.GetTempPath(), "ap-verify-agy-tool-" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(agyToolTemp);
+var agyToolLog = Path.Combine(agyToolTemp, "transcript_full.jsonl");
+File.WriteAllLines(agyToolLog,
+[
+    "{\"step_index\":1,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"跑测试\"}",
+    "{\"step_index\":2,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"tool_calls\":[{\"name\":\"run_command\",\"args\":{\"CommandLine\":\"npm test\"}}]}",
+    "{\"step_index\":3,\"source\":\"MODEL\",\"type\":\"GENERIC\",\"created_at\":\"2026-10-20T03:00:00Z\",\"content\":\"line1\\nline2\"}",
+]);
+var agySnap = AgyTranscriptReader.Read(agyToolLog);
+Check(agySnap.LatestToolOutput == "line1\nline2",
+    $"agy tool: latest GENERIC content keeps newlines (got '{agySnap.LatestToolOutput?.Replace("\n", "\\n")}')");
+
+// 前缀剥离：agy 给 GENERIC 加的 Created At / Completed At 不进 TOOL 行；
+// 只剩元数据 = 这次工具没有可显示内容（空串，由应用端清空 TOOL 行）。
+var agyStripTemp = Path.Combine(Path.GetTempPath(), "ap-verify-agy-strip-" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(agyStripTemp);
+var agyStripLog = Path.Combine(agyStripTemp, "transcript_full.jsonl");
+File.WriteAllLines(agyStripLog,
+[
+    "{\"step_index\":1,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"跑\"}",
+    "{\"step_index\":2,\"source\":\"MODEL\",\"type\":\"GENERIC\",\"created_at\":\"2026-10-20T03:00:00Z\",\"content\":\"Created At: 2026-10-20T01:32:48+08:00\\nCompleted At: 2026-10-20T01:32:49+08:00\\nThe following changes were made\"}",
+]);
+var agyStripValue = AgyTranscriptReader.Read(agyStripLog).LatestToolOutput;
+Check(agyStripValue == "The following changes were made",
+    $"agy tool: Created At / Completed At prefix is stripped (got '{agyStripValue?.Replace("\n", "\\n") ?? "<null>"}')");
+
+var agyMetaTemp = Path.Combine(Path.GetTempPath(), "ap-verify-agy-meta-" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(agyMetaTemp);
+var agyMetaOnlyLog = Path.Combine(agyMetaTemp, "transcript_full.jsonl");
+File.WriteAllLines(agyMetaOnlyLog,
+[
+    "{\"step_index\":1,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"跑\"}",
+    "{\"step_index\":2,\"source\":\"MODEL\",\"type\":\"GENERIC\",\"created_at\":\"2026-10-20T03:00:00Z\",\"content\":\"Created At: 2026-10-20T01:32:48+08:00\\nCompleted At: 2026-10-20T01:32:49+08:00\"}",
+]);
+var agyMetaValue = AgyTranscriptReader.Read(agyMetaOnlyLog).LatestToolOutput;
+Check(agyMetaValue == "",
+    $"agy tool: a metadata-only GENERIC is surfaced as empty (got '{agyMetaValue?.Replace("\n", "\\n") ?? "<null>"}')");
+
+// 应用层：新一轮输出后，最新一条 GENERIC 若只剩元数据，TOOL 行必须清空，且不得回落到更早的 GENERIC。
+var agyClearTemp = Path.Combine(Path.GetTempPath(), "ap-verify-agy-clear-" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(agyClearTemp);
+var agyClearLog = Path.Combine(agyClearTemp, "transcript_full.jsonl");
+File.WriteAllLines(agyClearLog,
+[
+    "{\"step_index\":1,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"created_at\":\"" + agyNow.AddSeconds(-5).ToString("O") + "\",\"content\":\"跑\"}",
+    "{\"step_index\":2,\"source\":\"MODEL\",\"type\":\"GENERIC\",\"created_at\":\"" + agyNow.AddSeconds(1).ToString("O") + "\",\"content\":\"real output\"}",
+]);
+var agyClearCatalog = new TaskCatalog();
+agyClearCatalog.Accept(A("PreInvocation", new { conversationId = "ses_agy_clear", transcriptPath = agyClearLog }), agyNow);
+var agyClearFirst = agyClearCatalog.Projection().Tasks.First(t => t.Id == "ses_agy_clear").LatestToolOutput;
+Check(agyClearFirst == "real output",
+    $"agy tool: a normal GENERIC lands in the tool row (got '{agyClearFirst?.Replace("\n", "\\n") ?? "<null>"}')");
+File.AppendAllLines(agyClearLog,
+[
+    "{\"step_index\":3,\"source\":\"MODEL\",\"type\":\"GENERIC\",\"created_at\":\"" + agyNow.AddSeconds(2).ToString("O") + "\",\"content\":\"Created At: 2026-10-20T01:32:48+08:00\\nCompleted At: 2026-10-20T01:32:49+08:00\"}",
+]);
+agyClearCatalog.Accept(A("PostInvocation", new { conversationId = "ses_agy_clear", transcriptPath = agyClearLog }), agyNow.AddSeconds(3));
+Check(agyClearCatalog.Projection().Tasks.First(t => t.Id == "ses_agy_clear").LatestToolOutput is null,
+    "agy tool: a metadata-only GENERIC clears the row instead of keeping the older result");
+Directory.Delete(agyStripTemp, true);
+Directory.Delete(agyMetaTemp, true);
+Directory.Delete(agyClearTemp, true);
+
+var agyToolCatalog = new TaskCatalog();
+agyToolCatalog.Accept(A("PreInvocation", new { conversationId = "ses_agy_tool", workspacePaths = new[] { @"F:\Git\demo" } }), agyNow);
+agyToolCatalog.Accept(A("PreToolUse", new { conversationId = "ses_agy_tool", transcriptPath = agyToolLog, toolCall = new { name = "run_command", args = new { CommandLine = "npm test" } } }), agyNow.AddSeconds(1));
+Check(agyToolCatalog.Projection().Tasks.First(t => t.Id == "ses_agy_tool").LatestToolOutput is null,
+    "agy tool: a new round starts with a blank tool row");
+
+// 转录本优先：PostToolUse 不读任何文件，TOOL 行保持空，等 GENERIC 落盘后由
+// PreInvocation/PostInvocation/Stop 的转录本读取更新。
+agyToolCatalog.Accept(A("PostToolUse", new
+{
+    conversationId = "ses_agy_tool",
+    transcriptPath = agyToolLog,
+    toolCall = new { name = "run_command" },
+}), agyNow.AddSeconds(2));
+Check(agyToolCatalog.Projection().Tasks.First(t => t.Id == "ses_agy_tool").LatestToolOutput is null,
+    "agy tool: PostToolUse does not touch the tool row (transcript is the only source)");
+
+// 失败：hook 的 error 本身就是非结构文本，直接显示。
+agyToolCatalog.Accept(A("PreToolUse", new
+{
+    conversationId = "ses_agy_tool",
+    transcriptPath = agyToolLog,
+    toolCall = new { name = "run_command" },
+}), agyNow.AddSeconds(5));
+agyToolCatalog.Accept(A("PostToolUse", new
+{
+    conversationId = "ses_agy_tool",
+    transcriptPath = agyToolLog,
+    toolCall = new { name = "run_command" },
+    error = "boom",
+}), agyNow.AddSeconds(6));
+Check(agyToolCatalog.Projection().Tasks.First(t => t.Id == "ses_agy_tool").LatestToolOutput == "boom",
+    "agy tool: hook error is shown as the tool output");
+
+// floor：本次工具起点之后的回填才有效；转录本里上一条 GENERIC 不得盖掉本次工具的结果。
+var agyFloorTemp = Path.Combine(Path.GetTempPath(), "ap-verify-agy-floor-" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(agyFloorTemp);
+var agyFloorLog = Path.Combine(agyFloorTemp, "transcript_full.jsonl");
+File.WriteAllLines(agyFloorLog,
+[
+    "{\"step_index\":1,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"created_at\":\"" + agyNow.AddSeconds(-5).ToString("O") + "\",\"content\":\"跑\"}",
+    "{\"step_index\":2,\"source\":\"MODEL\",\"type\":\"GENERIC\",\"created_at\":\"" + agyNow.AddSeconds(3).ToString("O") + "\",\"content\":\"old tool output\"}",
+]);
+var agyFloorCatalog = new TaskCatalog();
+agyFloorCatalog.Accept(A("PreInvocation", new { conversationId = "ses_agy_floor", transcriptPath = agyFloorLog }), agyNow);
+Check(agyFloorCatalog.Projection().Tasks.First(t => t.Id == "ses_agy_floor").LatestToolOutput == "old tool output",
+    "agy floor: a transcript result inside the round lands first");
+agyFloorCatalog.Accept(A("PreToolUse", new
+{
+    conversationId = "ses_agy_floor",
+    transcriptPath = agyFloorLog,
+    toolCall = new { name = "run_command" },
+}), agyNow.AddSeconds(5));
+agyFloorCatalog.Accept(A("PostToolUse", new
+{
+    conversationId = "ses_agy_floor",
+    transcriptPath = agyFloorLog,
+    toolCall = new { name = "run_command" },
+    error = "boom",
+}), agyNow.AddSeconds(6));
+Check(agyFloorCatalog.Projection().Tasks.First(t => t.Id == "ses_agy_floor").LatestToolOutput == "boom",
+    "agy floor: the current tool's error text is shown");
+agyFloorCatalog.Accept(A("PreInvocation", new { conversationId = "ses_agy_floor", transcriptPath = agyFloorLog }), agyNow.AddSeconds(7));
+Check(agyFloorCatalog.Projection().Tasks.First(t => t.Id == "ses_agy_floor").LatestToolOutput == "boom",
+    "agy floor: the previous GENERIC cannot overwrite the current tool's output");
+Directory.Delete(agyFloorTemp, true);
+
+// floor 的生命周期：失败保留（防止旧成功冲掉错误），成功撤销（否则收包延迟会冻结整轮）。
+var agyReleaseTemp = Path.Combine(Path.GetTempPath(), "ap-verify-agy-release-" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(agyReleaseTemp);
+var agyReleaseLog = Path.Combine(agyReleaseTemp, "transcript_full.jsonl");
+File.WriteAllLines(agyReleaseLog,
+[
+    "{\"step_index\":1,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"created_at\":\"" + agyNow.AddSeconds(-10).ToString("O") + "\",\"content\":\"跑\"}",
+    "{\"step_index\":2,\"source\":\"MODEL\",\"type\":\"GENERIC\",\"created_at\":\"" + agyNow.AddSeconds(-5).ToString("O") + "\",\"content\":\"latest result\"}",
+]);
+var agyReleaseCatalog = new TaskCatalog();
+agyReleaseCatalog.Accept(A("PreInvocation", new { conversationId = "ses_agy_release", transcriptPath = agyReleaseLog }), agyNow.AddSeconds(-20));
+Check(agyReleaseCatalog.Projection().Tasks.First(t => t.Id == "ses_agy_release").LatestToolOutput == "latest result",
+    "agy release: the round's first result lands in the tool row");
+agyReleaseCatalog.Accept(A("PreToolUse", new { conversationId = "ses_agy_release", transcriptPath = agyReleaseLog, toolCall = new { name = "run_command" } }), agyNow.AddSeconds(-2));
+agyReleaseCatalog.Accept(A("PostToolUse", new { conversationId = "ses_agy_release", transcriptPath = agyReleaseLog, toolCall = new { name = "run_command" }, error = "boom" }), agyNow.AddSeconds(-1.5));
+agyReleaseCatalog.Accept(A("PostInvocation", new { conversationId = "ses_agy_release", transcriptPath = agyReleaseLog }), agyNow.AddSeconds(-1));
+Check(agyReleaseCatalog.Projection().Tasks.First(t => t.Id == "ses_agy_release").LatestToolOutput == "boom",
+    "agy release: a failed tool keeps the floor so the old result cannot overwrite its error");
+agyReleaseCatalog.Accept(A("PreToolUse", new { conversationId = "ses_agy_release", transcriptPath = agyReleaseLog, toolCall = new { name = "run_command" } }), agyNow.AddSeconds(-0.5));
+agyReleaseCatalog.Accept(A("PostToolUse", new { conversationId = "ses_agy_release", transcriptPath = agyReleaseLog, toolCall = new { name = "run_command" } }), agyNow);
+agyReleaseCatalog.Accept(A("PostInvocation", new { conversationId = "ses_agy_release", transcriptPath = agyReleaseLog }), agyNow.AddSeconds(1));
+Check(agyReleaseCatalog.Projection().Tasks.First(t => t.Id == "ses_agy_release").LatestToolOutput == "latest result",
+    "agy release: a successful tool drops the floor so later reads are not frozen");
+Directory.Delete(agyReleaseTemp, true);
+
+// 同提示词连发：文本相同，但 USER_INPUT 时间戳晚于上一轮结束，仍应视为新回合。
+var agySameTemp = Path.Combine(Path.GetTempPath(), "ap-verify-agy-same-" + Guid.NewGuid().ToString("N"));
+Directory.CreateDirectory(agySameTemp);
+var agySameLog = Path.Combine(agySameTemp, "transcript_full.jsonl");
+File.WriteAllLines(agySameLog,
+[
+    "{\"step_index\":1,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"created_at\":\"" + agyNow.AddSeconds(10).ToString("O") + "\",\"content\":\"继续\"}",
+]);
+var samePromptExisting = new TaskSnapshot(
+    "ses_agy_same", AgentSource.Antigravity, "demo", "demo",
+    "继续", null, null, [],
+    AgentLifecycle.Succeeded, null,
+    agyNow.AddSeconds(-20), agyNow.AddSeconds(-10), agyNow.AddSeconds(-5),
+    false, false, false, []);
+var samePromptTask = AgyEventReducer.Reduce(
+    A("PreInvocation", new { conversationId = "ses_agy_same", transcriptPath = agySameLog }),
+    samePromptExisting with { LatestToolOutput = "old", LatestStep = "old step" },
+    agyNow.AddSeconds(10));
+Check(samePromptTask.StartedAt == agyNow.AddSeconds(10),
+    $"agy: identical prompt after a finished round starts a new round (got {samePromptTask.StartedAt:O})");
+Check(samePromptTask.LatestToolOutput is null && samePromptTask.LatestStep is null,
+    "agy: identical prompt new round clears TOOL and step");
+Directory.Delete(agySameTemp, true);
+
+File.AppendAllLines(agyToolLog,
+[
+    "{\"step_index\":4,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"下一轮\"}",
+]);
+var agyOverSnap = AgyTranscriptReader.Read(agyToolLog);
+Check(agyOverSnap.LatestToolOutput is null, "agy tool: new USER_INPUT boundary closes old tool output");
+
+// 持久化脱敏：Save 绝不落盘 LatestToolOutput
+var persistTemp = Path.Combine(Path.GetTempPath(), "ap-verify-persist-" + Guid.NewGuid().ToString("N") + ".json");
+var persistence = new TaskSnapshotPersistence(persistTemp);
+persistence.Save([agyToolCatalog.Projection().Tasks.First(t => t.Id == "ses_agy_tool") with { Lifecycle = AgentLifecycle.Succeeded }]);
+var persistedText = File.ReadAllText(persistTemp);
+Check(!persistedText.Contains("line1"), "agy tool persistence: LatestToolOutput stripped on Save");
+File.Delete(persistTemp);
+Directory.Delete(agyToolTemp, true);
 
 var titled = ClaudeEventReducer.ApplyTranscript(Claude(), claudeSnapshot);
 Check(titled.Title == "demo · 修复登录流程", $"claude: title composed as project · title (got '{titled.Title}')");
@@ -3183,7 +3449,8 @@ Check(!agyStopCatalog.Projection().Tasks.First(t => t.Id == "agy-qs").PromptQueu
     Check(parent.Capabilities.Contains(TaskCapability.Prompt),
         "agy addressing: a running subagent does not take the parent's prompt entry away");
     Check(familyCatalog.AgyHostPidServes("agy-par"), "agy addressing: the gate treats parent and child as one terminal");
-    Check(familyCatalog.AgyHostPidOf("agy-par") == livePid,
+    var expectedHostPid = AgyProcessResolver.ResolveHostPid(livePid);
+    Check(familyCatalog.AgyHostPidOf("agy-par") == expectedHostPid,
         "agy addressing: the parent keeps its pid mapping while the child reports from the same terminal");
 }
 

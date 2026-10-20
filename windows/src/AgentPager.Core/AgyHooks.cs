@@ -167,8 +167,36 @@ public static class AgyHistoryReader
     }
 }
 
+public sealed record AgyTranscriptSnapshot(
+    string? UserPrompt,
+    string? LatestResponse,
+    TokenUsage? Tokens,
+    string? ResponseBody,
+    string? LatestToolOutput = null,
+    DateTimeOffset? LatestToolOutputAt = null,
+    DateTimeOffset? PromptAt = null);
+
 public static class AgyTranscriptReader
 {
+    /// <summary>
+    /// 若同目录下存在未截断的完整转录本 transcript_full.jsonl，优先读取它，避免大长输出被 truncated_fields 截断。
+    /// </summary>
+    public static string ResolveTranscriptPath(string transcriptPath)
+    {
+        if (string.IsNullOrWhiteSpace(transcriptPath)) return transcriptPath;
+        try
+        {
+            var dir = Path.GetDirectoryName(transcriptPath);
+            if (dir is not null)
+            {
+                var full = Path.Combine(dir, "transcript_full.jsonl");
+                if (File.Exists(full)) return full;
+            }
+        }
+        catch { }
+        return transcriptPath;
+    }
+
     /// <summary>
     /// agy 会话目录（<c>~/.gemini/antigravity-cli/brain</c>）的根。可注入，供测试构造
     /// "某个会话的转录本长什么样"的场景（真实路径在用户目录下，测试不该往里写东西）。
@@ -181,6 +209,28 @@ public static class AgyTranscriptReader
     public static string TranscriptPathFor(string conversationId) =>
         Path.Combine(BrainRoot, conversationId, ".system_generated", "logs", "transcript.jsonl");
 
+    /// <summary>
+    /// 剥掉 agy 给 GENERIC 内容加的元数据前缀（开头的 "Created At: …" / "Completed At: …" 行）。
+    /// 只剥开头连续的那几行，正文里出现同样格式不受影响。剥完可能为空串——那表示这次工具
+    /// 没有可显示内容，调用方据此清空 TOOL 行。
+    /// </summary>
+    private static string StripGenericMetadata(string raw)
+    {
+        var text = raw.TrimStart('﻿');
+        var normalized = text.Replace("\r\n", "\n");
+        var lines = normalized.Split('\n');
+        var index = 0;
+        while (index < lines.Length)
+        {
+            var line = lines[index].TrimStart();
+            if (!line.StartsWith("Created At:", StringComparison.Ordinal) &&
+                !line.StartsWith("Completed At:", StringComparison.Ordinal))
+                break;
+            index++;
+        }
+        return index == 0 ? text : string.Join('\n', lines[index..]).TrimStart('\n', '\r', ' ', '\t');
+    }
+
     private static readonly Regex UserRequestRegex = new(
         @"<USER_REQUEST>([\s\S]*?)</USER_REQUEST>",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
@@ -189,31 +239,40 @@ public static class AgyTranscriptReader
         @"<(?:ADDITIONAL_METADATA|USER_SETTINGS_CHANGE)>[\s\S]*?</(?:ADDITIONAL_METADATA|USER_SETTINGS_CHANGE)>",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
-    public static (string? UserPrompt, string? LatestResponse, TokenUsage? Tokens, string? ResponseBody) ExtractLatest(string? transcriptPath)
+    public static AgyTranscriptSnapshot Read(string? transcriptPath)
     {
-        if (string.IsNullOrWhiteSpace(transcriptPath) || !File.Exists(transcriptPath))
-            return (null, null, null, null);
+        if (string.IsNullOrWhiteSpace(transcriptPath))
+            return new(null, null, null, null);
+
+        var resolvedPath = ResolveTranscriptPath(transcriptPath);
+        if (!File.Exists(resolvedPath))
+            return new(null, null, null, null);
 
         try
         {
-            var fileInfo = new FileInfo(transcriptPath);
+            var fileInfo = new FileInfo(resolvedPath);
             var readSize = (int)Math.Min(fileInfo.Length, 256 * 1024); // 读取尾部最多 256KB
-            if (readSize <= 0) return (null, null, null, null);
+            if (readSize <= 0) return new(null, null, null, null);
 
             byte[] buffer = new byte[readSize];
-            using (var stream = new FileStream(transcriptPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            int bytesRead;
+            using (var stream = new FileStream(resolvedPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
             {
                 stream.Seek(-readSize, SeekOrigin.End);
-                int bytesRead = stream.Read(buffer, 0, readSize);
-                if (bytesRead <= 0) return (null, null, null, null);
+                bytesRead = stream.Read(buffer, 0, readSize);
+                if (bytesRead <= 0) return new(null, null, null, null);
             }
 
-            var text = Encoding.UTF8.GetString(buffer);
+            var text = Encoding.UTF8.GetString(buffer, 0, bytesRead);
             var lines = text.Split('\n');
             string? userPrompt = null;
             string? latestResponse = null;
             string? fullResponse = null;
             TokenUsage? tokens = null;
+            string? toolOutput = null;
+            var toolOutputSeen = false;
+            DateTimeOffset? toolOutputAt = null;
+            DateTimeOffset? promptAt = null;
             var foundLatestPlannerInTurn = false;
             var turnBoundaryReached = false;
 
@@ -232,9 +291,35 @@ public static class AgyTranscriptReader
                     if (!turnBoundaryReached && (type == "USER_INPUT" || type == "USER_EXPLICIT"))
                     {
                         turnBoundaryReached = true;
+                        // 同一条提示词连发时文本比较会失效，用它自己的时间戳判定新一轮。
+                        if (promptAt is null &&
+                            root.TryGetProperty("created_at", out var promptCreated) &&
+                            DateTimeOffset.TryParse(promptCreated.GetString(), out var promptTime))
+                        {
+                            promptAt = promptTime;
+                        }
                         if (userPrompt is null && root.TryGetProperty("content", out var contentProp) && contentProp.GetString() is { Length: > 0 } rawContent)
                         {
                             userPrompt = CleanUserPrompt(rawContent);
+                        }
+                    }
+                    else if (type == "GENERIC")
+                    {
+                        // TOOL 行：工具执行结果（tool_result）。严格限定在当前回合内，且取倒序第一条（最新一条）。
+                        // 用独立的 seen 标记而不是 toolOutput is null：空结果也是"本次工具的结果"，
+                        // 必须挡住更早的 GENERIC（与 Claude 的 tool_result 三态同义）。
+                        if (!turnBoundaryReached && !toolOutputSeen &&
+                            root.TryGetProperty("content", out var contentProp) &&
+                            contentProp.GetString() is { Length: > 0 } output)
+                        {
+                            toolOutputSeen = true;
+                            // 剥掉 agy 加的 Created At / Completed At 前缀；剥完为空 = 这次工具没有可显示内容。
+                            toolOutput = StripGenericMetadata(output);
+                            if (root.TryGetProperty("created_at", out var createdProp) &&
+                                DateTimeOffset.TryParse(createdProp.GetString(), out var createdAt))
+                            {
+                                toolOutputAt = createdAt;
+                            }
                         }
                     }
                     else if (type == "PLANNER_RESPONSE")
@@ -278,12 +363,18 @@ public static class AgyTranscriptReader
                     break;
             }
 
-            return (userPrompt, latestResponse, tokens, fullResponse);
+            return new(userPrompt, latestResponse, tokens, fullResponse, toolOutput, toolOutputAt, promptAt);
         }
         catch
         {
-            return (null, null, null, null);
+            return new(null, null, null, null);
         }
+    }
+
+    public static (string? UserPrompt, string? LatestResponse, TokenUsage? Tokens, string? ResponseBody) ExtractLatest(string? transcriptPath)
+    {
+        var snapshot = Read(transcriptPath);
+        return (snapshot.UserPrompt, snapshot.LatestResponse, snapshot.Tokens, snapshot.ResponseBody);
     }
 
     private static readonly Regex SubagentSenderRegex = new(
@@ -391,7 +482,13 @@ public static class AgyEventReducer
     /// 这次提问**能不能在手机上作答**（= 桥此刻挂住了这条连接，而桥只在有手机连着时才挂）。
     /// 没有手机连着就不该抢提问：桥放行、终端自己弹框，卡片也就不该给出作答入口。
     /// </param>
-    public static TaskSnapshot Reduce(AgyHookPayload hook, TaskSnapshot? existing, AgyConversationSummary? dbInfo, DateTimeOffset now, bool answerable = true)
+    public static TaskSnapshot Reduce(
+        AgyHookPayload hook,
+        TaskSnapshot? existing,
+        AgyConversationSummary? dbInfo,
+        DateTimeOffset now,
+        bool answerable = true,
+        DateTimeOffset? toolOutputFloor = null)
     {
         var sessionID = hook.SessionID;
         var project = hook.ProjectName;
@@ -427,10 +524,21 @@ public static class AgyEventReducer
         string? latestResponse = null;
         string? fullResponse = null;
         TokenUsage? tokens = null;
+        string? toolOutput = null;
+        DateTimeOffset? toolOutputAt = null;
+        DateTimeOffset? promptAt = null;
+
         if (hook.EffectiveEvent is "PreInvocation" or "PostInvocation" or "Stop" &&
             !string.IsNullOrWhiteSpace(hook.TranscriptPath))
         {
-            (userPrompt, latestResponse, tokens, fullResponse) = AgyTranscriptReader.ExtractLatest(hook.TranscriptPath);
+            var transcriptSnapshot = AgyTranscriptReader.Read(hook.TranscriptPath);
+            userPrompt = transcriptSnapshot.UserPrompt;
+            latestResponse = transcriptSnapshot.LatestResponse;
+            tokens = transcriptSnapshot.Tokens;
+            fullResponse = transcriptSnapshot.ResponseBody;
+            toolOutput = transcriptSnapshot.LatestToolOutput;
+            toolOutputAt = transcriptSnapshot.LatestToolOutputAt;
+            promptAt = transcriptSnapshot.PromptAt;
             if (userPrompt is not null && !task.PromptQueued)
             {
                 task = task with { UserPrompt = userPrompt };
@@ -448,7 +556,14 @@ public static class AgyEventReducer
         // 判定是否进入新一轮对话（OpenCode 规范）：
         // 1) 首次创建任务；2) 上一轮为终态/闲置；3) 用户提示词发生变化（等待态作答退出除外）；4) 此前处于排队提示词状态
         var wasWaitingBefore = existing?.Lifecycle is AgentLifecycle.WaitingApproval or AgentLifecycle.WaitingAnswer;
-        var isNewPrompt = !wasWaitingBefore && existing?.UserPrompt is not null && userPrompt is not null && existing.UserPrompt != userPrompt;
+        // 同一句提示词连发两次（例如两次"继续"）时文本比较失效：用转录本里这条 USER_INPUT 的
+        // 创建时间对上一轮结束时刻，晚于它才算新回合（排队接单由 wasQueued 排除）。
+        var previousRoundEnded = existing?.Lifecycle is AgentLifecycle.Succeeded or AgentLifecycle.Interrupted
+            or AgentLifecycle.Offline or AgentLifecycle.Idle;
+        var samePromptNewRound = promptAt is { } promptTime && existing is { } previous &&
+            previousRoundEnded && promptTime > (previous.CompletedAt ?? previous.UpdatedAt);
+        var isNewPrompt = !wasWaitingBefore && existing?.UserPrompt is not null && userPrompt is not null &&
+            (existing.UserPrompt != userPrompt || samePromptNewRound);
         var wasQueued = existing?.PromptQueued == true;
         // 计时与第三行**只认"用户在本轮之外重新开口"**（2026-10-11 两轮实测修正）：
         //
@@ -485,6 +600,17 @@ public static class AgyEventReducer
             };
         }
 
+        // TOOL 行：本轮最近一条工具结果。必须带时间戳门控——新一轮开聊已清空该字段，
+        // 若转录本里还是上一轮的结果，不能把它捡回来；toolOutputFloor 再挡一层：
+        // 早于本次工具起点的 GENERIC 属于上一个工具，哪怕同在本轮内也不得回填。
+        // 空串是有效结果（工具没有可显示内容）→ Clean 后为 null → 清空 TOOL 行。
+        if (toolOutput is { } &&
+            (toolOutputAt is not { } toolAt || toolAt >= task.StartedAt) &&
+            (toolOutputFloor is not { } floor || toolOutputAt is not { } toolAt2 || toolAt2 >= floor))
+        {
+            task = task with { LatestToolOutput = ToolOutputText.Clean(toolOutput) };
+        }
+
         switch (hook.EffectiveEvent)
         {
             case "PreInvocation":
@@ -497,6 +623,7 @@ public static class AgyEventReducer
                     // 新一轮开聊时清空第三行，让 lifecycle 文案兜底；轮内插入与"被唤醒续跑"都不清空
                     LatestStep = startsNewRound ? null : task.LatestStep,
                     ResponseBody = startsNewRound ? null : task.ResponseBody,
+                    LatestToolOutput = startsNewRound ? null : task.LatestToolOutput,
                     CompletedAt = null,
                     Capabilities = [],
                     PromptQueued = false, // 排队接单，标记解除
@@ -583,6 +710,8 @@ public static class AgyEventReducer
                         Lifecycle = AgentLifecycle.Running,
                         Activity = AgentActivity.Thinking,
                         CompletedAt = null,
+                        // 失败原文本身就是非结构文本，直接用；转录本 GENERIC 稍后到达时同理。
+                        LatestToolOutput = ToolOutputText.Clean(hook.Error),
                     }, $"✗ {NormalizeText(hook.Error)}");
                 }
 
@@ -591,6 +720,8 @@ public static class AgyEventReducer
                     Lifecycle = AgentLifecycle.Running,
                     Activity = task.Subagents.Any(s => !s.IsTerminal) ? AgentActivity.Delegating : AgentActivity.Thinking,
                     CompletedAt = null,
+                    // TOOL 行只认转录本里的 GENERIC（非结构文本）；钩子首帧还没有本次结果，
+                    // 这里不动，等下一次 PreInvocation/PostInvocation/Stop 读到再更新。
                 };
             }
 

@@ -210,8 +210,10 @@ public static class ClaudeTranscriptReader
                         }
                         break;
                     case "user":
+                        // toolText 允许为空串：空 tool_result 也是"本次工具的结果"，
+                        // 必须让它把上一条顶掉（否则无输出工具会永远显示旧内容）。
                         if (!replySettled && toolOutput is null &&
-                            ReadToolResult(root) is { Length: > 0 } toolText)
+                            ReadToolResult(root) is { } toolText)
                         {
                             toolOutput = toolText;
                             toolOutputAt = Timestamp(root);
@@ -251,7 +253,8 @@ public static class ClaudeTranscriptReader
             // agy 的 fullResponse、opencode 的 fullText 都是原文，只有这里之前错了。
             string.IsNullOrWhiteSpace(bodyReply) ? null : bodyReply.Trim(),
             bodyReplyAt,
-            ToolOutputText.Clean(toolOutput),
+            // 原样返回，保留"空串 = 有结果但没内容"这一态；清理（剥 ANSI / 截断）在应用端做。
+            toolOutput,
             toolOutputAt);
     }
 
@@ -406,7 +409,11 @@ public static class ClaudeTranscriptReader
         return builder.Length == 0 ? null : builder.ToString();
     }
 
-    /// <summary>user 行里的 tool_result 块：content 可能是字符串或 [{type:text,text}] 数组。</summary>
+    /// <summary>
+    /// user 行里的 tool_result 块：content 可能是字符串或 [{type:text,text}] 数组。
+    /// 返回值三态：null = 这行没有 tool_result；"" = 有结果但内容为空（调用方据此清空 TOOL 行）；
+    /// 非空串 = 正常文本。
+    /// </summary>
     private static string? ReadToolResult(JsonElement root)
     {
         if (IsSidechain(root)) return null;
@@ -415,17 +422,27 @@ public static class ClaudeTranscriptReader
             return null;
 
         string? found = null;
+        var seen = false;
         foreach (var block in content.EnumerateArray())
         {
             if (block.ValueKind != JsonValueKind.Object) continue;
             if (!block.TryGetProperty("type", out var type) || type.GetString() != "tool_result") continue;
-            if (!block.TryGetProperty("content", out var payload)) continue;
-            if (payload.ValueKind == JsonValueKind.String)
+            seen = true;
+            if (!block.TryGetProperty("content", out var payload))
             {
-                if (!string.IsNullOrWhiteSpace(payload.GetString())) found = payload.GetString();
+                found = string.Empty;
                 continue;
             }
-            if (payload.ValueKind != JsonValueKind.Array) continue;
+            if (payload.ValueKind == JsonValueKind.String)
+            {
+                found = payload.GetString() ?? string.Empty;
+                continue;
+            }
+            if (payload.ValueKind != JsonValueKind.Array)
+            {
+                found = string.Empty;
+                continue;
+            }
 
             var builder = new StringBuilder();
             foreach (var item in payload.EnumerateArray())
@@ -444,9 +461,9 @@ public static class ClaudeTranscriptReader
                     builder.Append("[image]");
                 }
             }
-            if (builder.Length > 0) found = builder.ToString();
+            found = builder.ToString();
         }
-        return found;
+        return seen ? found : null;
     }
 
     /// <summary>message.usage → TokenUsage：与 opencode 的 tokens 口径一一对应。</summary>

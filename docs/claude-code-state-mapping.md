@@ -3,6 +3,8 @@
 本文档定义 Claude Code（闭源 CLI，本机实测 **2.1.236**）到 AgentPager `TaskSnapshot` 的完整映射。
 范围：Windows Bridge + Android。macOS 遵循同一逻辑（差异见第六节）。
 
+> TOOL 行（工具输出）的规则见 [tool-output-row.md](tool-output-row.md)。
+
 > **与另外两篇的关系**：opencode / Antigravity 两篇写于"实现之前"，是纯设计稿；Claude 这篇写于实现**之后**——仓库里已有一套 Claude 实现（早于 opencode/agy，`0cf9f6c` 起），但从未按统一规范校订过。
 > 因此本文的写法是：**每节先给"目标基线"（应该是什么），再用 `现:` 标注当前代码的实际行为**。逐条差距、证据与取舍集中在配套的 `claude-code-integration-notes.md`（差距编号 G1…G24，与本文的 `——Gx` 标注一一对应）。
 > **本文只做研究，不改代码。**所有"事实"都附取证路径；无法确证的标 `待实测`。

@@ -3,6 +3,8 @@
 本文档定义 opencode（1.18.x，插件事件总线）到 AgentPager `TaskSnapshot` 的完整映射。
 范围：Windows Bridge + Android。macOS 不在本次范围内（忽略）。
 
+> TOOL 行（工具输出）的规则见 [tool-output-row.md](tool-output-row.md)；opencode 是该行的**基准实现**。
+
 ## 一、通道机制
 
 - 载体：opencode 插件（JS），安装到 `~/.config/opencode/plugins/agentpager-opencode.js`（或 `$XDG_CONFIG_HOME` / `$OPENCODE_CONFIG_DIR` 对应目录），由 opencode 启动时自动加载。
