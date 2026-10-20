@@ -473,7 +473,7 @@ public static class AgyTranscriptReader
 public static class AgyEventReducer
 {
     private static readonly string[] SpecificArgKeys =
-        ["CommandLine", "TargetFile", "AbsolutePath", "filePath", "path", "command", "pattern", "query", "Url", "url", "Action", "TypeName", "Role", "description"];
+        ["CommandLine", "Path", "TargetFile", "AbsolutePath", "filePath", "path", "command", "pattern", "query", "Url", "url", "Action", "TypeName", "Role", "description"];
 
     public static TaskSnapshot Reduce(AgyHookPayload hook, TaskSnapshot? existing, DateTimeOffset now) =>
         Reduce(hook, existing, null, now);
@@ -872,11 +872,16 @@ public static class AgyEventReducer
         if (lower == "run_command" && value.TryGetProperty("CommandLine", out var cmd))
             return NormalizeText(cmd.GetString());
 
-        if (lower is "view_file" or "read_resource" && value.TryGetProperty("AbsolutePath", out var absPath))
-            return RelativizePath(absPath.GetString(), cwd);
+        // agy 1.4.3 起工具改名并收敛参数键：read_file/Path、write_file|edit_file/Path。
+        // 1.4.2 及更早是 view_file/AbsolutePath、write_to_file|replace_file_content/TargetFile。
+        // 两代键名都认——运行中的旧会话转录本、手机上看历史任务时仍按原样显示。
+        if (lower is "read_file" or "view_file" &&
+            FirstString(value, "Path", "AbsolutePath") is { } readPath)
+            return RelativizePath(readPath, cwd);
 
-        if (lower is "write_to_file" or "replace_file_content" && value.TryGetProperty("TargetFile", out var target))
-            return RelativizePath(target.GetString(), cwd);
+        if (lower is "write_file" or "edit_file" or "write_to_file" or "replace_file_content" &&
+            FirstString(value, "Path", "TargetFile") is { } writePath)
+            return RelativizePath(writePath, cwd);
 
         if (lower is "search_web" && value.TryGetProperty("query", out var query))
             return NormalizeText(query.GetString());
@@ -895,15 +900,23 @@ public static class AgyEventReducer
         if (lower is "manage_subagents" && value.TryGetProperty("Action", out var act))
             return NormalizeText(act.GetString());
 
-        if (lower is "invoke_subagent" && value.TryGetProperty("Subagents", out var subs) && subs.ValueKind == JsonValueKind.Array)
+        if (lower is "invoke_subagent")
         {
-            var first = subs.EnumerateArray().FirstOrDefault();
-            if (first.ValueKind == JsonValueKind.Object)
+            // 1.4.3 起子代理参数平铺在根层级（TypeName / Role / Prompt），不再包一层数组；
+            // 1.4.2 及更早是 Subagents: [{ Role, TypeName, Prompt }]。Prompt 一律不显示。
+            if (value.TryGetProperty("Subagents", out var subs) && subs.ValueKind == JsonValueKind.Array)
             {
-                var role = first.TryGetProperty("Role", out var r) ? r.GetString() : null;
-                var type = first.TryGetProperty("TypeName", out var t) ? t.GetString() : null;
-                return NormalizeText(role ?? type ?? "subagent");
+                var first = subs.EnumerateArray().FirstOrDefault();
+                if (first.ValueKind == JsonValueKind.Object)
+                {
+                    var role = first.TryGetProperty("Role", out var r) ? r.GetString() : null;
+                    var type = first.TryGetProperty("TypeName", out var t) ? t.GetString() : null;
+                    return NormalizeText(role ?? type ?? "subagent");
+                }
             }
+
+            if (FirstString(value, "Role", "TypeName") is { } flat)
+                return NormalizeText(flat);
         }
 
         // 白名单参数扫描（严格不含 Prompt）
@@ -933,6 +946,19 @@ public static class AgyEventReducer
     /// </summary>
     private static string? RelativizePath(string? path, string cwd) => PathDisplay.Shorten(path, cwd);
 
+    /// <summary>按顺序取第一个非空字符串参数（同一语义的新旧键名兼容用）。</summary>
+    private static string? FirstString(JsonElement value, params string[] keys)
+    {
+        foreach (var key in keys)
+        {
+            if (value.TryGetProperty(key, out var prop) &&
+                prop.ValueKind == JsonValueKind.String &&
+                prop.GetString() is { Length: > 0 } text)
+                return text;
+        }
+        return null;
+    }
+
     private static string? CleanActionVerb(string toolName, string? action)
     {
         if (string.IsNullOrWhiteSpace(action)) return null;
@@ -945,13 +971,13 @@ public static class AgyEventReducer
     public static AgentActivity ActivityFor(string toolName, JsonElement? args)
     {
         var lower = toolName.ToLowerInvariant();
-        if (lower is "view_file" or "read_url_content" or "read_resource" or "list_resources")
+        if (lower is "read_file" or "view_file" or "read_url_content" or "read_resource" or "list_resources")
             return AgentActivity.Reading;
 
         if (lower is "search_web")
             return AgentActivity.Browsing;
 
-        if (lower is "write_to_file" or "replace_file_content")
+        if (lower is "write_file" or "edit_file" or "write_to_file" or "replace_file_content")
             return AgentActivity.Editing;
 
         if (lower is "run_command")

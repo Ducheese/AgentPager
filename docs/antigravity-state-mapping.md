@@ -19,7 +19,9 @@ Antigravity（`agy`）为 Google Deepmind 研发的闭源 Native 二进制程序
    - 每次会话在 `<appDataDir>/brain/<conversationId>/.system_generated/logs/transcript.jsonl` 持久化结构化行式 JSON。
    - 完整记录 `USER_INPUT`（用户原始输入）、`PLANNER_RESPONSE`（模型思考、正文回答、Token 用量与工具调用列表）以及 `GENERIC`（工具执行输出结果）。
 3. **系统提示词与工具调用契约**：
-   - 工具调用统一遵循标准 JSON Schema，原生工具（`run_command`、`view_file`、`write_to_file`、`replace_file_content`、`ask_question`、`invoke_subagent` 等）均携带结构化的 `toolAction` 与 `toolSummary` 元数据。
+   - 工具调用统一遵循标准 JSON Schema。**1.4.3 起**原生文件工具改名并收敛参数：`read_file`（旧 `view_file`）、`write_file`（旧 `write_to_file`）、`edit_file`（旧 `replace_file_content`），路径参数统一为 `Path`（旧 `AbsolutePath` / `TargetFile`），正文参数为 `Content`，编辑参数收敛为 `Target` / `Replacement`。
+   - **1.4.3 起** `invoke_subagent` 的参数平铺在根层级（`TypeName` / `Role` / `Prompt`），不再包一层 `Subagents[]`。
+   - 1.4.3 的文件工具**不再携带** `toolAction` / `toolSummary` 元数据（仅 `run_command` 保留 `toolSummary`）。桥对两代工具名与键名同时兼容：旧版会话的转录本、手机上的历史任务仍按原样显示。
 
 ### 2. 通道设计：轻量级 Node.js 胶水脚本 + TCP 49361
 不同于 OpenCode 可在单一 Node.js 进程内常驻加载插件，Antigravity 的钩子为外部命令调用机制。为杜绝进程开销引发的终端卡顿与时序挂起，架构确立如下分工：
@@ -57,7 +59,7 @@ Antigravity (agy.exe)
         "args": {
           "CommandLine": "npm test",
           "toolSummary": "Run test suite",
-          "toolAction": "Running tests"
+          "WaitMsBeforeAsync": 5000
         }
       },
       "error": null,
@@ -78,7 +80,7 @@ Antigravity (agy.exe)
 |---|---|---|---|---|---|---|
 | 1 | `PreInvocation`（首轮或会话新建） | 用户提交 Prompt，模型即将调用 | `running` | `thinking` | `UserPrompt`（从 `transcript.jsonl` 尾部提取并剔除 `<USER_REQUEST>` 标签）、`StartedAt=now`（本轮起表）、清空第三行与完成标记 | 任务进入工作状态；新一轮清空第三行 |
 | 2 | `PreInvocation`（轮内继续） | 工具执行完毕后模型继续思考 | `running` | `thinking` | 保持本轮 `StartedAt` 不重置；第三行保持工具粘滞或清空 | 不冲掉本轮计时 |
-| 3 | `PreToolUse`（普通工具） | 任意工具即将执行 | `running` | 工具活动映射（见第三节） | `LatestStep=ToolStep.Compose(toolName, summary)`；粘滞显示 | 覆盖 `run_command`、`view_file`、`write_to_file` 等 |
+| 3 | `PreToolUse`（普通工具） | 任意工具即将执行 | `running` | 工具活动映射（见第三节） | `LatestStep=ToolStep.Compose(toolName, summary)`；粘滞显示 | 覆盖 `run_command`、`read_file`/`view_file`、`write_file`/`write_to_file` 等 |
 | 4 | `PreToolUse`（`ask_question`） | 模型主动提问或等待确认 | `waitingAnswer` | `thinking` | `PendingRequest(question, questionText, options)`、第三行=`问题全文`、Capabilities=∅ | 手机端触发强辉光与提示音，卡片只读显示 |
 | 5 | `PreToolUse`（`invoke_subagent`） | 模型派生子代理任务 | `running` | `delegating` | 更新父任务 `Subagents` 列表（见下方子代理映射） | 手机端自动展开子代理抽屉 |
 | 6 | `PostToolUse`（工具正常结束） | 工具执行成功 | `running` | `thinking` | 保持上一工具标题（粘滞至下一事件） | 等待后续模型生成或下一工具 |
@@ -102,7 +104,7 @@ Antigravity 拥有原生首类子代理系统（`invoke_subagent` / `manage_suba
 
 | Antigravity 子代理动作 | 触发源 | `SubagentSnapshot` 字段与状态 | 视觉与行为 |
 |---|---|---|---|
-| 派生子代理（`invoke_subagent`） | `PreToolUse` 的 `toolCall.args.Subagents[]` | `Id = TypeName + "-" + Role.HashCode`<br>`DisplayName = Role ?? TypeName`<br>`Path = "/" + TypeName`<br>`Lifecycle = Running`<br>`Activity = Executing`<br>`LatestStep = Prompt` 摘要 | 父任务进入 `Activity = Delegating`；手机端自动展开面板展示 `ANTIGRAVITY (N)` |
+| 派生子代理（`invoke_subagent`） | `PreToolUse` 的 `toolCall.args`（1.4.3 起为根层级 `TypeName`/`Role`/`Prompt`；更早为 `args.Subagents[]`） | 子代理行由**真实子会话**建立（其钩子到达时按父级路由，`Id = 子会话 conversationId`）：`DisplayName = Role ?? db.title ?? agentName`<br>`Path = "/" + agentName`<br>`Lifecycle = Running`<br>`Activity = Thinking`<br>`LatestStep` = 子会话自己的工具步 | 父任务进入 `Activity = Delegating`；手机端自动展开面板展示 `ANTIGRAVITY (N)` |
 | 子代理运行完成 | 转录本中 `invoke_subagent` 返回或会话轮次结束 | `Lifecycle = Succeeded`<br>`Activity = null` | 子代理打勾完成，约 4 秒后从列表淡出 |
 | 子代理执行出错 | 转录本报错或 `manage_subagents` 报告 errored | `Lifecycle = Interrupted`<br>`LatestStep = "✗ 出错"` | 红色中断提示 |
 
@@ -114,9 +116,9 @@ Antigravity 拥有原生首类子代理系统（`invoke_subagent` / `manage_suba
 
 | 工具名 / 特征 | 映射 Activity | 说明 |
 |---|---|---|
-| `view_file`、`read_url_content`、`read_resource`、`list_resources` | `reading` | 文件只读查阅、文档抓取与静态资源读取 |
+| `read_file`（旧 `view_file`）、`read_url_content`、`read_resource`、`list_resources` | `reading` | 文件只读查阅、文档抓取与静态资源读取 |
 | `search_web` | `browsing` | 网页搜索与外部网络检索 |
-| `write_to_file`、`replace_file_content` | `editing` | 源码创建、块替换与文件写入 |
+| `write_file`（旧 `write_to_file`）、`edit_file`（旧 `replace_file_content`） | `editing` | 源码创建、块替换与文件写入 |
 | `run_command`（命令含独立词 `test`/`pytest`/`jest`/`vitest`，词边界匹配；`latest` 不误报、`gradlew build` 不算测试） | `testing` | 测试套件与自动化单元测试执行 |
 | `run_command`（其他命令行操作） | `executing` | 构建、工具运行与系统 Shell 执行 |
 | `ask_question` | `thinking` | 触发 `waitingAnswer` 交互态 |
@@ -181,7 +183,7 @@ Antigravity 拥有原生首类子代理系统（`invoke_subagent` / `manage_suba
    - 状态变为「正在运行」，耗时从 0 起算；
    - 像素图呈现「四角轮流 + 中心脉动」动画。
 4. 工具执行阶段：
-   - 调用 `view_file` 时，第三行显示 `Read docs/hooks.md`，像素图切换为横向扫描线（`reading`）；
+   - 调用 `read_file`（旧版 `view_file`）时，第三行显示 `Read docs/hooks.md`，像素图切换为横向扫描线（`reading`）；
    - 调用 `run_command` 执行测试时，第三行显示 `Bash npm test`，像素图切换为斜向扫线（`testing`）。
 5. 触发子代理：
    - 派发 `invoke_subagent` 时，父任务显示「正在协作」，自动展开子代理抽屉 `ANTIGRAVITY (1)`，显示子代理角色与步骤。
@@ -225,9 +227,9 @@ Antigravity (hooks.json + transcript) ──脚本(TCP 49361)──► TaskSnaps
 
 | 工具（按第三节规则命中） | Activity | 像素图动画 |
 |---|---|---|
-| `view_file` / `read_url_content` / `read_resource` | `reading` | 横向扫描线（自上而下掠过） |
+| `read_file`（旧 `view_file`） / `read_url_content` / `read_resource` | `reading` | 横向扫描线（自上而下掠过） |
 | MCP 检索工具（含 search/find/query） | `searching` | 外圈 8 格跑马灯 |
-| `write_to_file` / `replace_file_content` | `editing` | 横向书写波 + 中列光标闪 |
+| `write_file`（旧 `write_to_file`） / `edit_file`（旧 `replace_file_content`） | `editing` | 横向书写波 + 中列光标闪 |
 | `run_command` 含独立词 test/pytest/jest/vitest | `testing` | 斜向扫线 + 末尾判定脉冲 |
 | `run_command` 其他 / 通用 MCP | `executing` | 竖直流光柱（逐格下落） |
 | `search_web` | `browsing` | 翻页带自上而下 |

@@ -442,6 +442,19 @@ Check(agy.LatestStep == "Bash npm test" && agy.Activity == AgentActivity.Testing
 agy = AgyEventReducer.Reduce(A("PreToolUse", new { conversationId = "agy_1", workspacePaths = new[] { @"F:\Git\demo" }, toolCall = new { name = "view_file", args = new { AbsolutePath = @"F:\Git\demo\src\app.ts" } } }), agy, agyInfo, agyNow.AddSeconds(2));
 Check(agy.LatestStep == "Read src/app.ts", $"agy: view_file -> Read + relative path (got '{agy.LatestStep}')");
 
+// agy 1.4.3 工具改名与参数收敛：read_file/Path、write_file|edit_file/Path（旧名 view_file/AbsolutePath 仍兼容）
+agy = AgyEventReducer.Reduce(A("PreToolUse", new { conversationId = "agy_1", workspacePaths = new[] { @"F:\Git\demo" }, toolCall = new { name = "read_file", args = new { Path = @"F:\Git\demo\src\app.ts", StartLine = 1, EndLine = 30 } } }), agy, agyInfo, agyNow.AddSeconds(2));
+Check(agy.LatestStep == "Read src/app.ts" && agy.Activity == AgentActivity.Reading,
+    $"agy 1.4.3: read_file/Path -> Read + reading (got '{agy.LatestStep}/{agy.Activity}')");
+
+agy = AgyEventReducer.Reduce(A("PreToolUse", new { conversationId = "agy_1", workspacePaths = new[] { @"F:\Git\demo" }, toolCall = new { name = "write_file", args = new { Path = @"F:\Git\demo\src\app.ts", Content = "console.log(1)" } } }), agy, agyInfo, agyNow.AddSeconds(2));
+Check(agy.LatestStep == "Write src/app.ts" && agy.Activity == AgentActivity.Editing,
+    $"agy 1.4.3: write_file/Path -> Write + editing (got '{agy.LatestStep}/{agy.Activity}')");
+
+agy = AgyEventReducer.Reduce(A("PreToolUse", new { conversationId = "agy_1", workspacePaths = new[] { @"F:\Git\demo" }, toolCall = new { name = "edit_file", args = new { Path = @"F:\Git\demo\src\app.ts", Target = "old", Replacement = "new" } } }), agy, agyInfo, agyNow.AddSeconds(2));
+Check(agy.LatestStep == "Edit src/app.ts" && agy.Activity == AgentActivity.Editing,
+    $"agy 1.4.3: edit_file/Path -> Edit + editing (got '{agy.LatestStep}/{agy.Activity}')");
+
 // agy: 测试判定按独立词（与桥共享 ShellTestRun）
 Check(AgyEventReducer.ActivityFor("run_command", JsonSerializer.SerializeToElement(new { CommandLine = "gradlew build" })) == AgentActivity.Executing, "agy: gradlew build -> executing");
 Check(AgyEventReducer.ActivityFor("run_command", JsonSerializer.SerializeToElement(new { CommandLine = "Get-Content latest.log" })) == AgentActivity.Executing, "agy: latest substring -> executing");
@@ -2276,6 +2289,42 @@ agySubCatalog.Maintain(subT0.AddSeconds(9));
 var pTaskPruned = agySubCatalog.Projection().Tasks.First(x => x.Id == "parent_agy");
 Check(pTaskPruned.Subagents.Count == 0, "agy sub: child faded out after 4 seconds");
 File.Delete(subTranscript);
+
+// agy 1.4.3：invoke_subagent 参数平铺在根层级（TypeName/Role/Prompt），Role 仍要作为子代理显示名；
+// Prompt 绝不出现在第三行。
+var agyFlatCatalog = new TaskCatalog();
+var flatT0 = subT0.AddMinutes(5);
+agyFlatCatalog.Accept(A("PreInvocation", new { conversationId = "parent_flat", workspacePaths = new[] { @"C:\test" } }), flatT0);
+agyFlatCatalog.Accept(A("PreToolUse", new
+{
+    conversationId = "parent_flat",
+    toolCall = new
+    {
+        name = "invoke_subagent",
+        args = new { TypeName = "self", Role = "Codebase Researcher", Prompt = "调查这个仓库" }
+    }
+}), flatT0.AddSeconds(1));
+var flatParent = agyFlatCatalog.Projection().Tasks.First(x => x.Id == "parent_flat");
+Check(flatParent.LatestStep == "Task Codebase Researcher",
+    $"agy 1.4.3: flat invoke_subagent shows role, not prompt (got '{flatParent.LatestStep}')");
+agyFlatCatalog.Accept(A("PreInvocation", new { conversationId = "child_flat" }), flatT0.AddSeconds(2));
+var flatWithSub = agyFlatCatalog.Projection().Tasks.First(x => x.Id == "parent_flat");
+Check(flatWithSub.Subagents is [{ DisplayName: "Codebase Researcher" }],
+    $"agy 1.4.3: flat invoke_subagent role names the child (got {flatWithSub.Subagents.Count})");
+
+// Role 缺失（1.4.3 里 schema 必填，纯防御）时回退 TypeName，与第三行步骤同优先级；
+// 不能落成调用方注入的 "Subagent"。
+var agyNoRoleCatalog = new TaskCatalog();
+agyNoRoleCatalog.Accept(A("PreInvocation", new { conversationId = "parent_norole", workspacePaths = new[] { @"C:\test" } }), flatT0.AddSeconds(10));
+agyNoRoleCatalog.Accept(A("PreToolUse", new
+{
+    conversationId = "parent_norole",
+    toolCall = new { name = "invoke_subagent", args = new { TypeName = "research", Prompt = "调查这个仓库" } }
+}), flatT0.AddSeconds(11));
+agyNoRoleCatalog.Accept(A("PreInvocation", new { conversationId = "child_norole" }), flatT0.AddSeconds(12));
+var noRoleParent = agyNoRoleCatalog.Projection().Tasks.First(x => x.Id == "parent_norole");
+Check(noRoleParent.Subagents is [{ DisplayName: "Research" }],
+    $"agy 1.4.3: missing Role falls back to TypeName (got {noRoleParent.Subagents.FirstOrDefault()?.DisplayName})");
 
 // ===================== 27. 1a/1c 回归（子代理只进面板 / 掐掉要同步 / agy 主对话不被误删）=====================
 

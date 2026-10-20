@@ -1113,18 +1113,35 @@ public sealed class TaskCatalog
                 if (arrayElement.ValueKind == JsonValueKind.Array)
                 {
                     foreach (var item in arrayElement.EnumerateArray())
-                    {
-                        if (item.TryGetProperty("Role", out var roleProp) && roleProp.GetString() is { Length: > 0 } role)
-                        {
-                            result.Add(role);
-                        }
-                    }
+                        if (SubagentName(item) is { } name) result.Add(name);
                 }
                 parsedDoc?.Dispose();
             }
+
+            // agy 1.4.3 起子代理参数平铺在根层级（TypeName / Role / Prompt），不再有 Subagents 数组。
+            if (result.Count == 0 && SubagentName(args.Value) is { } flat)
+                result.Add(flat);
         }
         catch { }
         return result;
+    }
+
+    /// <summary>
+    /// 子代理显示名的来源：<c>Role</c> 优先，缺失或空白时回退 <c>TypeName</c>。
+    /// 与第三行步骤（<c>AgyHooks.ExtractToolDetail</c> 的 <c>Role ?? TypeName</c>）同一优先级；
+    /// 1.4.3 schema 里 Role 必填，这里只是防御——两个分支（数组 / 根层级平铺）保持对称。
+    /// </summary>
+    private static string? SubagentName(JsonElement item)
+    {
+        foreach (var key in new[] { "Role", "TypeName" })
+        {
+            if (item.TryGetProperty(key, out var prop) &&
+                prop.ValueKind == JsonValueKind.String &&
+                prop.GetString() is { Length: > 0 } text &&
+                !string.IsNullOrWhiteSpace(text))
+                return text;
+        }
+        return null;
     }
 
     private static TaskSnapshot ApplyAgySubagent(TaskSnapshot parent, AgyHookPayload hook, AgyConversationSummary? dbInfo, string? customRole, DateTimeOffset now)
@@ -2552,8 +2569,8 @@ internal static class ToolStep
         "bash" or "shell" or "exec" or "exec_command" or "terminal_interaction" or "run_command" => "Bash",
         "powershell" => "PowerShell",
         "apply_patch" or "patch" => "Patch",
-        "edit" or "replace_file_content" or "multiedit" => "Edit",
-        "write" or "write_to_file" => "Write",
+        "edit" or "edit_file" or "replace_file_content" or "multiedit" => "Edit",
+        "write" or "write_file" or "write_to_file" => "Write",
         "notebookedit" => "NotebookEdit",
         "read" or "read_file" or "view" or "view_file" or "read_url_content" or "read_resource" or "list_resources" => "Read",
         "glob" => "Glob",
