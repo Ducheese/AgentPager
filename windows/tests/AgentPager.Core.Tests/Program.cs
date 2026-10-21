@@ -3896,6 +3896,40 @@ finally
     ClaudeSessionRegistry.Forget("cl_alive");
 }
 
+// 关机/崩溃残留幽灵注册表条目：文件在但 PID 已死，不能被误判为存活，须顺利转 Offline
+var clGhostCatalog = new TaskCatalog();
+var ghostT0 = DateTimeOffset.UtcNow;
+var ghostPid = 999976;
+var ghostPrevChecker = ClaudeSessionRegistry.ProcessAliveChecker;
+try
+{
+    ClaudeSessionRegistry.ProcessAliveChecker = pid => pid == ghostPid ? false : ghostPrevChecker(pid);
+    clGhostCatalog.ClaudeRegistryScanner = () => new Dictionary<string, ClaudeSessionRegistry.Entry>
+    {
+        ["cl_ghost"] = new("cl_ghost", "test", "derived", "idle", 0, null, ghostPid, @"C:\test", "interactive", "cli")
+    };
+    clGhostCatalog.Accept(C("UserPromptSubmit", new { session_id = "cl_ghost", prompt = "昨晚任务" }), ghostT0);
+    clGhostCatalog.Accept(C("Stop", new { session_id = "cl_ghost" }), ghostT0.AddSeconds(5));
+    Check(clGhostCatalog.Projection().Tasks.First(t => t.Id == "cl_ghost").Lifecycle == AgentLifecycle.Succeeded,
+        "claude ghost: task initially succeeded");
+
+    // 幽灵条目虽在注册表扫描结果中，但 PID 死亡：不能提供 Prompt 能力
+    var ghostBeforeMaintain = clGhostCatalog.Projection().Tasks.First(t => t.Id == "cl_ghost");
+    Check(!ghostBeforeMaintain.Capabilities.Contains(TaskCapability.Prompt),
+        "claude ghost: dead pid registry entry CANNOT receive prompt");
+
+    // Maintain 12 分钟后（超过静默限额）：不吃幽灵条目掩护，顺利滑落到 Offline
+    clGhostCatalog.Maintain(ghostT0.AddMinutes(12));
+    var ghostAfterMaintain = clGhostCatalog.Projection().Tasks.First(t => t.Id == "cl_ghost");
+    Check(ghostAfterMaintain.Lifecycle == AgentLifecycle.Offline,
+        $"claude ghost: dead pid registry entry falls to Offline (got {ghostAfterMaintain.Lifecycle})");
+}
+finally
+{
+    ClaudeSessionRegistry.ProcessAliveChecker = ghostPrevChecker;
+    ClaudeSessionRegistry.Forget("cl_ghost");
+}
+
 // b) OpenCode: 控制通道在线时保持 Succeeded 与 Prompt 能力，通道断开立即转 Offline
 var ocAliveCatalog = new TaskCatalog();
 var ocControlUp = true;
@@ -4036,6 +4070,12 @@ Check(!PairingSecret.Matches(pairingKey, "not-base64-at-all"), "auth: garbage he
 // 长度不同不能抛异常 —— 抛出去就是 500，而不是干净的 401
 Check(!PairingSecret.Matches(pairingKey, pairingKeyText + "AA"), "auth: longer secret is rejected without throwing");
 Check(!PairingSecret.Matches(pairingKey, pairingKeyText[..8]), "auth: truncated secret is rejected without throwing");
+
+// 密钥轮换：新密钥生效，旧密钥失效
+var rotatedKey = new byte[] { 8, 7, 6, 5, 4, 3, 2, 1 };
+var rotatedKeyText = Convert.ToBase64String(rotatedKey);
+Check(PairingSecret.Matches(rotatedKey, rotatedKeyText), "auth: rotated secret is accepted");
+Check(!PairingSecret.Matches(rotatedKey, pairingKeyText), "auth: old secret is rejected after rotation");
 
 // ---------------------------------------------------------------------------
 // ngrok 孤儿治理（2026-10-19 实测：强杀桥留下孤儿 ngrok，占住免费版单会话名额，

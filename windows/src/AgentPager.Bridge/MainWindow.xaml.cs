@@ -171,6 +171,17 @@ public partial class MainWindow : Window
         if (!_refreshing) _runtime.SetTunnelHost(TunnelHostBox.Text);
     }
 
+    private void RotateSecret_Click(object sender, RoutedEventArgs e)
+    {
+        var result = System.Windows.MessageBox.Show(
+            "轮换配对密钥将断开当前已连接的设备，手机需要重新扫码配对。\n\n是否继续？",
+            "轮换配对密钥",
+            System.Windows.MessageBoxButton.YesNo,
+            System.Windows.MessageBoxImage.Warning);
+        if (result == System.Windows.MessageBoxResult.Yes)
+            _runtime.RotatePairingSecret();
+    }
+
     private void CopyPairing_Click(object sender, RoutedEventArgs e)
     {
         if (!string.IsNullOrEmpty(PairingTextBox.Text))

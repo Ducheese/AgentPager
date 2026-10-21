@@ -58,7 +58,8 @@ public sealed class BridgeRuntime : IAsyncDisposable
     private readonly OpenCodePluginConfiguration _openCodePluginConfiguration = new();
     private readonly AgyHookConfiguration _agyHookConfiguration = new();
     private readonly ReplayGuard _replayGuard = new();
-    private readonly byte[] _pairingSecret;
+    private readonly PairingSecretStore _secretStore = new();
+    private byte[] _pairingSecret;
     private readonly TaskCatalog _catalog;
     private readonly NgrokTunnelService _ngrokService;
     private string _tunnelStatusText = "未启动";
@@ -87,7 +88,7 @@ public sealed class BridgeRuntime : IAsyncDisposable
         // 两家额度拉取都可能静默返回 null——没有日志就只能靠猜（实测踩过）。
         _agyUsageLoader.Log = _log.Write;
         _commandCodeUsageLoader.Log = _log.Write;
-        _pairingSecret = new PairingSecretStore().LoadOrCreate();
+        _pairingSecret = _secretStore.LoadOrCreate();
         _catalog = new(_persistence.Load());
         _ngrokService = new(
             _log,
@@ -137,7 +138,8 @@ public sealed class BridgeRuntime : IAsyncDisposable
                 SnapshotText,
                 text => _events.Writer.WriteAsync(new ControlEvent(text), token).AsTask(),
                 count => _events.Writer.TryWrite(new PhoneCountEvent(count)),
-                _log);
+                _log,
+                RotatePairingSecretAndGetPairingText);
             await _lanServer.StartAsync(token);
             if (Settings.EnableNgrokTunnel)
             {
@@ -335,6 +337,29 @@ public sealed class BridgeRuntime : IAsyncDisposable
     /// WebSocket 握手鉴权。走隧道时端口挂在公网上，没这道门谁拿到域名都能连上收走全部快照。
     /// </summary>
     private bool Authorize(string? provided) => PairingSecret.Matches(_pairingSecret, provided);
+
+    /// <summary>
+    /// 轮换配对密钥：重新生成 32 字节随机密钥并写入 DPAPI 本地存储，断开已有客户端连接，刷新界面与配对码。
+    /// </summary>
+    public void RotatePairingSecret()
+    {
+        _pairingSecret = _secretStore.Rotate();
+        _log.Write("INFO", "已轮换配对密钥，正在断开旧客户端连接。");
+        if (_lanServer is not null)
+        {
+            _ = _lanServer.DisconnectAllAsync("Secret rotated");
+        }
+        PublishState();
+    }
+
+    /// <summary>
+    /// 供 /pairing/rotate 端点调用：轮换密钥并返回最新的配对配置 JSON。
+    /// </summary>
+    public string RotatePairingSecretAndGetPairingText()
+    {
+        RotatePairingSecret();
+        return PairingText();
+    }
 
     public void RefreshNetworks()
     {

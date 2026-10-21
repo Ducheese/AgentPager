@@ -113,7 +113,16 @@ public sealed class PairingSecretStore
     {
         Directory.CreateDirectory(AgentPagerPaths.DataRoot);
         if (File.Exists(_path))
-            return Unprotect(File.ReadAllBytes(_path));
+        {
+            try { return Unprotect(File.ReadAllBytes(_path)); }
+            catch { /* 若 DPAPI 解密失败（如跨机器或损坏），自动轮换刷新 */ }
+        }
+        return Rotate();
+    }
+
+    public byte[] Rotate()
+    {
+        Directory.CreateDirectory(AgentPagerPaths.DataRoot);
         var value = RandomNumberGenerator.GetBytes(32);
         File.WriteAllBytes(_path, Protect(value));
         return value;

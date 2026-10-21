@@ -16,7 +16,8 @@ public sealed class LanBridgeServer(
     Func<string> snapshotProvider,
     Func<string, Task> messageHandler,
     Action<int> countChanged,
-    DailyFileLog log) : IAsyncDisposable
+    DailyFileLog log,
+    Func<string>? rotateProvider = null) : IAsyncDisposable
 {
     /// <summary>
     /// 手机在 WebSocket 握手上带配对密钥的请求头。密钥就是配对文本里那个 Base64 串。
@@ -69,23 +70,7 @@ public sealed class LanBridgeServer(
 
         app.MapGet("/pairing", async context =>
         {
-            // 严防反向代理/公网隧道访问本地配对密钥接口：
-            // 1. Host 必须为 127.0.0.1 或 localhost 回环；
-            // 2. RemoteIpAddress 必须为 Loopback 本地回环；
-            // 3. 任何带有反向代理/公网穿透请求头的（X-Forwarded-*, Forwarded, X-Real-IP, ngrok-trace-id 等），直接拒绝。
-            // 避免 ngrok 或任何公网反代在本地端口转发时把配对文本（含 secret）裸露给公网。
-            var hostHeader = context.Request.Host.Host;
-            var isLoopbackHost = hostHeader.Equals("127.0.0.1", StringComparison.OrdinalIgnoreCase) ||
-                                 hostHeader.Equals("localhost", StringComparison.OrdinalIgnoreCase);
-            if (!isLoopbackHost ||
-                context.Connection.RemoteIpAddress is null ||
-                !IPAddress.IsLoopback(context.Connection.RemoteIpAddress) ||
-                context.Request.Headers.ContainsKey("X-Forwarded-For") ||
-                context.Request.Headers.ContainsKey("X-Forwarded-Proto") ||
-                context.Request.Headers.ContainsKey("X-Forwarded-Host") ||
-                context.Request.Headers.ContainsKey("Forwarded") ||
-                context.Request.Headers.ContainsKey("X-Real-IP") ||
-                context.Request.Headers.ContainsKey("ngrok-trace-id"))
+            if (!IsLoopbackRequest(context))
             {
                 context.Response.StatusCode = StatusCodes.Status403Forbidden;
                 return;
@@ -94,9 +79,63 @@ public sealed class LanBridgeServer(
             await context.Response.WriteAsync(pairingProvider());
         });
 
+        app.MapPost("/pairing/rotate", async context =>
+        {
+            if (rotateProvider is null)
+            {
+                context.Response.StatusCode = StatusCodes.Status404NotFound;
+                return;
+            }
+            if (!IsLoopbackRequest(context))
+            {
+                context.Response.StatusCode = StatusCodes.Status403Forbidden;
+                return;
+            }
+            context.Response.ContentType = "application/json; charset=utf-8";
+            await context.Response.WriteAsync(rotateProvider());
+        });
+
         app.Map("/agentgrid", HandleWebSocket);
         await app.StartAsync(cancellationToken);
         _application = app;
+    }
+
+    private static bool IsLoopbackRequest(HttpContext context)
+    {
+        // 严防反向代理/公网隧道访问本地配对密钥接口：
+        // 1. Host 必须为 127.0.0.1 或 localhost 回环；
+        // 2. RemoteIpAddress 必须为 Loopback 本地回环；
+        // 3. 任何带有反向代理/公网穿透请求头的（X-Forwarded-*, Forwarded, X-Real-IP, ngrok-trace-id 等），直接拒绝。
+        // 避免 ngrok 或任何公网反代在本地端口转发时把配对文本（含 secret）裸露给公网。
+        var hostHeader = context.Request.Host.Host;
+        var isLoopbackHost = hostHeader.Equals("127.0.0.1", StringComparison.OrdinalIgnoreCase) ||
+                             hostHeader.Equals("localhost", StringComparison.OrdinalIgnoreCase);
+        return isLoopbackHost &&
+               context.Connection.RemoteIpAddress is not null &&
+               (IPAddress.IsLoopback(context.Connection.RemoteIpAddress) ||
+                (context.Connection.RemoteIpAddress.IsIPv4MappedToIPv6 && IPAddress.IsLoopback(context.Connection.RemoteIpAddress.MapToIPv4()))) &&
+               !context.Request.Headers.ContainsKey("Origin") &&
+               !context.Request.Headers.ContainsKey("X-Forwarded-For") &&
+               !context.Request.Headers.ContainsKey("X-Forwarded-Proto") &&
+               !context.Request.Headers.ContainsKey("X-Forwarded-Host") &&
+               !context.Request.Headers.ContainsKey("Forwarded") &&
+               !context.Request.Headers.ContainsKey("X-Real-IP") &&
+               !context.Request.Headers.ContainsKey("ngrok-trace-id");
+    }
+
+    public async Task DisconnectAllAsync(string reason = "Secret rotated")
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        foreach (var pair in _clients.ToList())
+        {
+            try
+            {
+                if (pair.Value.Socket.State is WebSocketState.Open or WebSocketState.CloseReceived)
+                    await pair.Value.Socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, reason, cts.Token);
+            }
+            catch (Exception) { }
+            await Remove(pair.Key);
+        }
     }
 
     public async Task BroadcastAsync(string text)

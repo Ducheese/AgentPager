@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -548,14 +549,14 @@ public static class ClaudeSessionRegistry
     // 被 /resume 切走（parked）的会话会从注册表里消失，但宿主进程往往还活着——这张表回答
     // "这个会话还能不能被唤醒"（远程注入靠 `claude --resume` 回退子进程续接）。
     // 边界（接受）：桥重启后此表为空，重启前就已切走的会话退化成"10 分钟兜底判离线"。
-    private static readonly Dictionary<string, int> HostPids = new(StringComparer.Ordinal);
+    private static readonly ConcurrentDictionary<string, int> HostPids = new(StringComparer.Ordinal);
 
     /// <summary>该会话最近一次的宿主进程 PID；没记录过返回 null（不确定，不代表死）。</summary>
     public static int? HostPidOf(string sessionID) =>
         HostPids.TryGetValue(sessionID, out var pid) ? pid : null;
 
     /// <summary>丢掉一个会话的宿主记录（判离线时调用：防 PID 复用把死宿主"复活"成 parked）。</summary>
-    public static void Forget(string sessionID) => HostPids.Remove(sessionID);
+    public static void Forget(string sessionID) => HostPids.TryRemove(sessionID, out _);
 
     /// <summary>
     /// 从注册表扫描结果里记"谁是宿主"。只认 kind=="interactive" && entrypoint=="cli"：
@@ -571,6 +572,7 @@ public static class ClaudeSessionRegistry
             if (!string.Equals(entry.Kind, "interactive", StringComparison.Ordinal)) continue;
             if (!string.Equals(entry.Entrypoint, "cli", StringComparison.Ordinal)) continue;
             if (entry.Pid is not { } pid) continue;
+            if (!ProcessAliveChecker(pid)) continue;
             if (HostPids.TryGetValue(entry.SessionID, out var incumbent) &&
                 incumbent != pid &&
                 ProcessAliveChecker(incumbent))

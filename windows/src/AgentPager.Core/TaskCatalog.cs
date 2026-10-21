@@ -1542,7 +1542,10 @@ public sealed class TaskCatalog
             if (task.Lifecycle == AgentLifecycle.Offline) continue;
             if (task.Subagents.Any(child => !child.IsTerminal)) continue;   // 还在等子代理的父任务不算死（与 OpenCode 对齐）
 
-            if (registry.ContainsKey(task.Id))
+            var isAliveInRegistry = registry.TryGetValue(task.Id, out var entry) &&
+                (entry.Pid is null || ClaudeSessionRegistry.ProcessAliveChecker(entry.Pid.Value));
+
+            if (isAliveInRegistry)
             {
                 _claudeRegistrySeen.Add(task.Id);
             }
@@ -1558,6 +1561,16 @@ public sealed class TaskCatalog
                      now - task.UpdatedAt > TimeSpan.FromMinutes(10))
             {
                 _claudeRegistrySeen.Remove(task.Id);
+                // 顺手清理确认已死的幽灵文件，避免 ~/.claude/sessions 残留堆积（如远程关机/崩溃未触发 unlink）
+                if (entry is { Pid: { } deadPid } && !ClaudeSessionRegistry.ProcessAliveChecker(deadPid))
+                {
+                    try
+                    {
+                        var deadFile = Path.Combine(ClaudeSessionRegistry.Directory, $"{deadPid}.json");
+                        if (File.Exists(deadFile)) File.Delete(deadFile);
+                    }
+                    catch { }
+                }
                 // 会话没了，挂起卡也随之失效：不清的话手机会永久留一张点不动的卡
                 // （权限挂起中被杀 = 死会话带死卡）。
                 DropClaudeRequest(task.Id);
