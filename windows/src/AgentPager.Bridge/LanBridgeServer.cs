@@ -2,11 +2,14 @@ using System.Collections.Concurrent;
 using System.Net;
 using System.Net.WebSockets;
 using System.Text;
+using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using AgentPager.Core;
 
 namespace AgentPager.Bridge;
 
@@ -65,6 +68,10 @@ public sealed class LanBridgeServer(
         builder.Logging.ClearProviders();
         builder.WebHost.UseUrls($"http://0.0.0.0:{PhonePort}");
         builder.Services.AddRouting();
+        // multipart 在 ReadFormAsync 里就会缓冲：把上限压到 1MB + 头部余量，
+        // 让超限请求在缓冲阶段就被拒，而不是先吃下 30MB 再检查。
+        builder.Services.Configure<FormOptions>(options =>
+            options.MultipartBodyLengthLimit = AttachmentStore.MaxFileBytes + 64 * 1024);
         var app = builder.Build();
         app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSeconds(20) });
 
@@ -96,6 +103,72 @@ public sealed class LanBridgeServer(
         });
 
         app.Map("/agentgrid", HandleWebSocket);
+
+        app.MapPost("/api/attachments/upload", async context =>
+        {
+            var provided = context.Request.Headers[SecretHeader].ToString();
+            if (!authorize(string.IsNullOrEmpty(provided) ? null : provided))
+            {
+                log.Write("WARN", $"附件上传被拒：配对密钥无效（{context.Connection.RemoteIpAddress}）");
+                context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                return;
+            }
+            if (!context.Request.HasFormContentType)
+            {
+                context.Response.StatusCode = StatusCodes.Status400BadRequest;
+                await context.Response.WriteAsync("需要 multipart/form-data（字段名 file）");
+                return;
+            }
+            // Content-Length 能提前判的就在缓冲前判掉（Kestrel 的 multipart 上限是第二道闸）。
+            var maxRequestBytes = AttachmentStore.MaxFileBytes + 64 * 1024;
+            if (context.Request.ContentLength is long declared && declared > maxRequestBytes)
+            {
+                context.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
+                await context.Response.WriteAsync($"文件超过上限（{AttachmentStore.MaxFileBytes} 字节）");
+                return;
+            }
+            IFormCollection form;
+            try
+            {
+                form = await context.Request.ReadFormAsync(context.RequestAborted);
+            }
+            catch (InvalidDataException)
+            {
+                context.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
+                await context.Response.WriteAsync($"文件超过上限（{AttachmentStore.MaxFileBytes} 字节）");
+                return;
+            }
+            var file = form.Files["file"] ?? form.Files.FirstOrDefault();
+            if (file is null || file.Length == 0)
+            {
+                context.Response.StatusCode = StatusCodes.Status400BadRequest;
+                await context.Response.WriteAsync("没有收到文件");
+                return;
+            }
+            if (file.Length > AttachmentStore.MaxFileBytes)
+            {
+                context.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
+                await context.Response.WriteAsync($"文件超过上限（{AttachmentStore.MaxFileBytes} 字节）");
+                return;
+            }
+            AttachmentStore.SavedAttachment saved;
+            try
+            {
+                // 直接把上传流写盘：不再 MemoryStream + ToArray 复制两份。
+                // meta 是手机端的压缩参数（q60_1440x810），Bridge 过滤后拼进文件名便于排查。
+                await using var source = file.OpenReadStream();
+                saved = AttachmentStore.Save(source, file.FileName, meta: form["meta"].ToString());
+            }
+            catch (InvalidDataException error)
+            {
+                context.Response.StatusCode = StatusCodes.Status400BadRequest;
+                await context.Response.WriteAsync(error.Message);
+                return;
+            }
+            log.Write("INFO", $"[附件] 已暂存 {saved.FileName}（{saved.Size} 字节）");
+            context.Response.ContentType = "application/json; charset=utf-8";
+            await context.Response.WriteAsync(JsonSerializer.Serialize(saved, WireJson.Options));
+        });
         await app.StartAsync(cancellationToken);
         _application = app;
     }

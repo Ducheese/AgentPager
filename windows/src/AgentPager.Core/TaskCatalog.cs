@@ -1260,6 +1260,9 @@ public sealed class TaskCatalog
     public bool Maintain(DateTimeOffset? now = null, Action<string, string>? log = null)
     {
         var currentTime = now ?? DateTimeOffset.UtcNow;
+        var swept = AttachmentStore.SweepOlderThan(AttachmentStore.Retention, now: currentTime, log: log);
+        if (swept > 0)
+            log?.Invoke("INFO", $"[附件] 清除过期暂存 {swept} 个（保留 {AttachmentStore.Retention.TotalDays:0} 天）");
         var changed = CheckAgyQueuedPrompts(currentTime, log);
         changed = CheckSilentOffline(currentTime) || changed;
         changed = CheckSubagentSilence(currentTime) || changed;

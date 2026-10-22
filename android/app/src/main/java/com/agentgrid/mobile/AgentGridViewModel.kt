@@ -7,6 +7,14 @@ import androidx.core.content.ContextCompat
 import androidx.core.content.edit
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import android.net.Uri
+import com.agentgrid.mobile.attachments.AttachmentLimits
+import com.agentgrid.mobile.attachments.AttachmentState
+import com.agentgrid.mobile.attachments.AttachmentUploader
+import com.agentgrid.mobile.attachments.ImageCompressor
+import com.agentgrid.mobile.attachments.PromptAssembler
+import com.agentgrid.mobile.attachments.PromptAttachment
+import com.agentgrid.mobile.attachments.PromptTokens
 import com.agentgrid.mobile.domain.ControlAction
 import com.agentgrid.mobile.domain.ControlResult
 import com.agentgrid.mobile.domain.PendingRequest
@@ -81,6 +89,177 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
         if (text.isEmpty()) promptDrafts.remove(taskId) else promptDrafts[taskId] = text
     }
 
+    /**
+     * 附图：按 taskID 保存选中列表，发送成功才清空。附件走独立上传通道（multipart 直传
+     * Bridge 暂存区），prompt 文本发送时在 App 端把 READY 附件拼成文末清单——控制通道
+     * 的签名/重放协议零改动。
+     */
+    val promptAttachments = mutableStateMapOf<String, List<PromptAttachment>>()
+    private var attachmentSeq = 0
+    /** 每张图一条上传协程：删图时取消，免得传完在 PC 上留下没人引用的文件。 */
+    private val attachmentJobs = mutableMapOf<String, Job>()
+
+    private val attachmentUploader: AttachmentUploader by lazy {
+        // 密钥与候选地址与 WS 共用同一套（含 wss 隧道兜底），见 DefaultPhoneSession.uploadEndpoints。
+        // 单例：OkHttpClient 自带连接池，一批 5~10 张图复用同一条连接。
+        AttachmentUploader(endpoints = { phoneSession.uploadEndpoints() })
+    }
+
+    /** 选图入口：压缩→后台上传→READY。失败保留 FAILED 卡片可重试，不阻塞打字。 */
+    fun addAttachments(taskId: String, uris: List<Uri>) {
+        val current = promptAttachments[taskId].orEmpty()
+        val room = AttachmentLimits.MAX_PER_PROMPT - current.size
+        if (room <= 0) {
+            // API < 33 的相册回退不保证遵守 maxItems，超出的必须明说，不能悄悄丢。
+            setFeedback(
+                taskId,
+                ControlFeedback(
+                    ControlAction.PROMPT,
+                    ControlFeedbackKind.FAILED,
+                    "最多 ${AttachmentLimits.MAX_PER_PROMPT} 张，先删一张再加",
+                ),
+            )
+            return
+        }
+        val accepted = uris.take(room)
+        if (accepted.isEmpty()) return
+        if (accepted.size < uris.size) {
+            setFeedback(
+                taskId,
+                ControlFeedback(
+                    ControlAction.PROMPT,
+                    ControlFeedbackKind.FAILED,
+                    "最多 ${AttachmentLimits.MAX_PER_PROMPT} 张，本次忽略了 ${uris.size - accepted.size} 张",
+                ),
+            )
+        }
+        val seeded = accepted.map { uri ->
+            attachmentSeq += 1
+            PromptAttachment("att-$attachmentSeq", "shot-$attachmentSeq.jpg", sourceUri = uri)
+        }
+        promptAttachments[taskId] = current + seeded
+        seeded.forEachIndexed { index, attachment ->
+            val uri = accepted[index]
+            val job = viewModelScope.launch {
+                updateAttachment(taskId, attachment.clientId) { it.copy(state = AttachmentState.COMPRESSING) }
+                val image = runCatching { ImageCompressor.compress(getApplication(), uri) }
+                    .getOrElse { error ->
+                        updateAttachment(taskId, attachment.clientId) {
+                            it.copy(state = AttachmentState.FAILED, error = error.message ?: "压缩失败")
+                        }
+                        return@launch
+                    }
+                updateAttachment(taskId, attachment.clientId) {
+                    it.copy(
+                        jpegBytes = image.bytes,
+                        meta = image.meta,
+                        thumb = image.thumb,
+                        state = AttachmentState.UPLOADING,
+                    )
+                }
+                runCatching { attachmentUploader.upload(image.bytes, attachment.fileName, image.meta) }
+                    .onSuccess { response ->
+                        updateAttachment(taskId, attachment.clientId) {
+                            // 大图字节释放，缩略图留着给卡片显示。
+                            it.copy(jpegBytes = null, state = AttachmentState.READY, localPath = response.localPath, error = null)
+                        }
+                    }
+                    .onFailure { error ->
+                        updateAttachment(taskId, attachment.clientId) {
+                            it.copy(state = AttachmentState.FAILED, error = error.message ?: "上传失败")
+                        }
+                    }
+            }
+            trackAttachmentJob(taskId, attachment.clientId, job)
+        }
+    }
+
+    /** 删图即重排：占位符跟着删，后面编号整体减一，保证卡号与 [图N] 永远对得上。 */
+    fun removeAttachment(taskId: String, clientId: String) {
+        val current = promptAttachments[taskId].orEmpty()
+        val index = current.indexOfFirst { it.clientId == clientId }
+        if (index < 0) return
+        cancelAttachmentJob(taskId, clientId)
+        promptAttachments[taskId] = current.filterNot { it.clientId == clientId }
+        val draft = promptDrafts[taskId].orEmpty()
+        if (draft.isNotEmpty()) {
+            val renumbered = PromptTokens.renumberAfterRemoval(draft, index + 1)
+            if (renumbered != draft) setPromptDraft(taskId, renumbered)
+        }
+    }
+
+    fun retryAttachment(taskId: String, clientId: String) {
+        val attachment = promptAttachments[taskId].orEmpty().firstOrNull { it.clientId == clientId } ?: return
+        val job = viewModelScope.launch {
+            val existingBytes = attachment.jpegBytes
+            val bytes: ByteArray
+            val meta: String?
+            var thumb = attachment.thumb
+            if (existingBytes != null) {
+                bytes = existingBytes
+                meta = attachment.meta
+            } else {
+                // 上次死在压缩/超限，手里没有字节，从相册 URI 重压一遍。
+                val uri = attachment.sourceUri ?: return@launch
+                updateAttachment(taskId, clientId) {
+                    it.copy(state = AttachmentState.COMPRESSING, error = null)
+                }
+                val image = runCatching { ImageCompressor.compress(getApplication(), uri) }
+                    .getOrElse { error ->
+                        updateAttachment(taskId, clientId) {
+                            it.copy(state = AttachmentState.FAILED, error = error.message ?: "压缩失败")
+                        }
+                        return@launch
+                    }
+                bytes = image.bytes
+                meta = image.meta
+                thumb = image.thumb
+            }
+            updateAttachment(taskId, clientId) {
+                it.copy(jpegBytes = bytes, meta = meta, thumb = thumb, state = AttachmentState.UPLOADING, error = null)
+            }
+            runCatching { attachmentUploader.upload(bytes, attachment.fileName, meta) }
+                .onSuccess { response ->
+                    updateAttachment(taskId, clientId) {
+                        it.copy(jpegBytes = null, state = AttachmentState.READY, localPath = response.localPath, error = null)
+                    }
+                }
+                .onFailure { error ->
+                    updateAttachment(taskId, clientId) {
+                        it.copy(state = AttachmentState.FAILED, error = error.message ?: "上传失败")
+                    }
+                }
+        }
+        trackAttachmentJob(taskId, clientId, job)
+    }
+
+    private fun trackAttachmentJob(taskId: String, clientId: String, job: Job) {
+        val key = "$taskId|$clientId"
+        attachmentJobs[key] = job
+        job.invokeOnCompletion {
+            if (attachmentJobs[key] === job) attachmentJobs.remove(key)
+        }
+    }
+
+    private fun cancelAttachmentJob(taskId: String, clientId: String) {
+        attachmentJobs.remove("$taskId|$clientId")?.cancel()
+    }
+
+    private fun updateAttachment(taskId: String, clientId: String, transform: (PromptAttachment) -> PromptAttachment) {
+        // key 已被删掉时不再写回：否则 map 会被重新插入一个空 list。
+        val current = promptAttachments[taskId] ?: return
+        promptAttachments[taskId] = current.map { item ->
+            if (item.clientId == clientId) transform(item) else item
+        }
+    }
+
+    private fun clearAttachments(taskId: String) {
+        promptAttachments.remove(taskId)
+    }
+
+    /** 与桥端 TaskCatalog.Normalize 对齐：连续空白折成一个空格并去首尾。 */
+    private fun normalizePromptText(text: String): String = text.replace(Regex("\\s+"), " ").trim()
+
     private val phoneSession = PhoneSessionFactory.shared(application)
     private var keepAliveRequested = false
     private var latestSnapshot = StateSnapshotPayload(emptyList())
@@ -91,6 +270,8 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
         val taskID: String,
         val action: ControlAction,
         val sentValue: String?,
+        /** PROMPT 带附件时 sentValue 是组装后的终态，rawValue 才是输入框原文（用于草稿比对）。 */
+        val rawValue: String? = null,
     )
 
     private val pendingControls = mutableMapOf<String, PendingControl>()
@@ -230,12 +411,29 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
             viewModelScope.launch { phoneSession.control(taskID, action, value, values) }
             return
         }
-        if (action == ControlAction.PROMPT && value.isNullOrBlank()) return
+        // Prompt 发送：App 端把 READY 附件拼成文末清单，控制通道原文透传。
+        // 非 READY（压缩/上传中、失败）一律拦下：否则清单序号会与图片条错位，
+        // 失败那张还会在发送成功后被静默清掉。
+        if (action == ControlAction.PROMPT &&
+            promptAttachments[taskID].orEmpty().any { it.state != AttachmentState.READY }
+        ) {
+            setFeedback(
+                taskID,
+                ControlFeedback(action, ControlFeedbackKind.FAILED, "还有图片未就绪，稍后再发"),
+            )
+            return
+        }
+        val effectiveValue = if (action == ControlAction.PROMPT) {
+            PromptAssembler.assemble(value.orEmpty(), promptAttachments[taskID].orEmpty())
+        } else {
+            value
+        }
+        if (action == ControlAction.PROMPT && effectiveValue.isNullOrBlank()) return
         // 同一个任务同一个动作还没有结果时不再发第二遍（按钮虽已禁用，这里兜住其它入口）
         if (pendingControls.values.any { it.taskID == taskID && it.action == action }) return
         setFeedback(taskID, ControlFeedback(action, ControlFeedbackKind.SENDING))
         viewModelScope.launch {
-            val submission = runCatching { phoneSession.control(taskID, action, value, values) }
+            val submission = runCatching { phoneSession.control(taskID, action, effectiveValue, values) }
                 .getOrElse { ControlSubmission.Rejected(PhoneSessionProblem.TransportFailure) }
             when (submission) {
                 is ControlSubmission.Rejected -> setFeedback(
@@ -243,7 +441,7 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
                     ControlFeedback(action, ControlFeedbackKind.FAILED, submission.problem.label()),
                 )
                 is ControlSubmission.Queued -> {
-                    pendingControls[submission.requestID] = PendingControl(taskID, action, value)
+                    pendingControls[submission.requestID] = PendingControl(taskID, action, effectiveValue, value)
                     // 回执可能比 control() 返回还快，立刻对一次当前状态，避免漏判
                     resolveControls(phoneSession.state.value)
                 }
@@ -285,7 +483,11 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
 
             val reflected = when (control.action) {
                 ControlAction.PROMPT ->
-                    control.sentValue != null && tasks[control.taskID]?.userPrompt == control.sentValue
+                    // 桥端会把换行/连续空白折成单个空格再回显，比对前必须做同样的归一，
+                    // 否则带附图的 prompt 永远等不到这条兜底回执。
+                    control.sentValue != null &&
+                        tasks[control.taskID]?.userPrompt?.let(::normalizePromptText) ==
+                        normalizePromptText(control.sentValue)
                 ControlAction.ANSWER, ControlAction.APPROVE, ControlAction.DENY ->
                     control.taskID !in waitingTaskIDs
                 else -> false
@@ -300,12 +502,18 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
 
     private fun succeed(control: PendingControl) {
         setFeedback(control.taskID, ControlFeedback(control.action, ControlFeedbackKind.SENT))
-        // 发送期间用户没有继续改，才清掉这条草稿；新版内容保留
-        if (control.action == ControlAction.PROMPT &&
-            control.sentValue != null &&
-            promptDrafts[control.taskID] == control.sentValue
-        ) {
+        // 发送期间用户没有继续改，才清掉这条草稿；新版内容保留。
+        // 带附件时比对输入框原文（rawValue），组装后的终态（含文末清单）必然≠草稿。
+        val draftMatches = if (control.action == ControlAction.PROMPT && control.rawValue != null) {
+            promptDrafts[control.taskID] == control.rawValue
+        } else {
+            control.action == ControlAction.PROMPT &&
+                control.sentValue != null &&
+                promptDrafts[control.taskID] == control.sentValue
+        }
+        if (draftMatches) {
             promptDrafts.remove(control.taskID)
+            clearAttachments(control.taskID)
         }
         feedbackJobs.remove(control.taskID)?.cancel()
         feedbackJobs[control.taskID] = viewModelScope.launch {

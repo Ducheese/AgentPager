@@ -73,14 +73,17 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.RectangleShape
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -158,6 +161,10 @@ fun AgentGridScreen(
     inMultiWindow: Boolean,
     promptDrafts: Map<String, String>,
     onPromptDraftChange: (String, String) -> Unit,
+    promptAttachments: Map<String, List<com.agentgrid.mobile.attachments.PromptAttachment>> = emptyMap(),
+    onAddAttachments: (String, List<android.net.Uri>) -> Unit = { _, _ -> },
+    onRemoveAttachment: (String, String) -> Unit = { _, _ -> },
+    onRetryAttachment: (String, String) -> Unit = { _, _ -> },
 ) {
     AgentGridTheme {
         AnimatedContent(
@@ -196,6 +203,10 @@ fun AgentGridScreen(
                     onToggleReplySpeech = onToggleReplySpeech,
                     promptDrafts = promptDrafts,
                     onPromptDraftChange = onPromptDraftChange,
+                    promptAttachments = promptAttachments,
+                    onAddAttachments = onAddAttachments,
+                    onRemoveAttachment = onRemoveAttachment,
+                    onRetryAttachment = onRetryAttachment,
                 )
             }
         }
@@ -420,6 +431,10 @@ private fun TaskTerminal(
     onToggleReplySpeech: (String) -> Unit,
     promptDrafts: Map<String, String>,
     onPromptDraftChange: (String, String) -> Unit,
+    promptAttachments: Map<String, List<com.agentgrid.mobile.attachments.PromptAttachment>> = emptyMap(),
+    onAddAttachments: (String, List<android.net.Uri>) -> Unit = { _, _ -> },
+    onRemoveAttachment: (String, String) -> Unit = { _, _ -> },
+    onRetryAttachment: (String, String) -> Unit = { _, _ -> },
 ) {
     val projection = state.taskProjection
     val tasks = projection.orderedTasks
@@ -429,6 +444,19 @@ private fun TaskTerminal(
     }
     var expandedTaskID by remember { mutableStateOf<String?>(null) }
     var settingsVisible by remember { mutableStateOf(false) }
+    // 相册 launcher 必须挂在无条件处：写进「展开 + 无待批请求」分支里时，
+    // 选图期间状态一抖（心跳重组、待批请求弹出）launcher 就被注销，
+    // 返回的 URI 投给已释放的回调——选完无反应的根因（2026-10-22 真机实测）。
+    var pickerTaskID by remember { mutableStateOf<String?>(null) }
+    val photoPicker = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.PickMultipleVisualMedia(
+            com.agentgrid.mobile.attachments.AttachmentLimits.MAX_PER_PROMPT,
+        ),
+    ) { uris ->
+        val target = pickerTaskID
+        if (target != null && uris.isNotEmpty()) onAddAttachments(target, uris)
+        pickerTaskID = null
+    }
     val visibleTasks = projection.visibleTasks
     val enteringVisibleTaskIDs = projection.enteringVisibleTaskIDs
     val taskListAnchorHeightPx = with(LocalDensity.current) {
@@ -572,26 +600,26 @@ private fun TaskTerminal(
                         val pending = state.pendingRequests.firstOrNull {
                             it.taskID == task.id
                         }
-                        TaskRow(
-                            modifier = Modifier
-                                // 自动置顶的任务在换位期间保持前景层，避免从原首行下方穿过。
-                                .zIndex(
-                                    if (task.id == automaticallyExpandedTask?.id) 1f else 0f,
-                                )
-                                .animateItem(
-                                    fadeInSpec = tween(
-                                        durationMillis = 180,
-                                        easing = EaseOutQuart,
-                                    ),
-                                    placementSpec = spring(
-                                        // 临界阻尼让远距离换位自然多用一点时间，同时避免回弹。
-                                        dampingRatio = 1f,
-                                        stiffness = 520f,
-                                    ),
-                                    fadeOutSpec = tween(120),
-                                )
-                                .newVisibleTaskEntrance(entersFromTop),
-                            task = task,
+                    TaskRow(
+                        modifier = Modifier
+                            // 自动置顶的任务在换位期间保持前景层，避免从原首行下方穿过。
+                            .zIndex(
+                                if (task.id == automaticallyExpandedTask?.id) 1f else 0f,
+                            )
+                            .animateItem(
+                                fadeInSpec = tween(
+                                    durationMillis = 180,
+                                    easing = EaseOutQuart,
+                                ),
+                                placementSpec = spring(
+                                    // 临界阻尼让远距离换位自然多用一点时间，同时避免回弹。
+                                    dampingRatio = 1f,
+                                    stiffness = 520f,
+                                ),
+                                fadeOutSpec = tween(120),
+                            )
+                            .newVisibleTaskEntrance(entersFromTop),
+                        task = task,
                             pending = pending,
                             expanded = expandedTaskID == task.id,
                             autoVisible = task.id == projection.automaticallyExpandedTaskID,
@@ -603,6 +631,23 @@ private fun TaskTerminal(
                             onToggleReplySpeech = onToggleReplySpeech,
                                 promptDraft = promptDrafts[task.id].orEmpty(),
                                 onPromptDraftChange = onPromptDraftChange,
+                                promptAttachments = promptAttachments[task.id].orEmpty(),
+                                onAddAttachments = onAddAttachments,
+                                onRemoveAttachment = onRemoveAttachment,
+                                onRetryAttachment = onRetryAttachment,
+                                onPhotoPickerLaunch = { taskID ->
+                                    pickerTaskID = taskID
+                                    photoPicker.launch(
+                                        androidx.activity.result.PickVisualMediaRequest.Builder()
+                                            .setMediaType(
+                                                androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia.ImageOnly,
+                                            )
+                                            .setMaxItems(
+                                                com.agentgrid.mobile.attachments.AttachmentLimits.MAX_PER_PROMPT,
+                                            )
+                                            .build(),
+                                    )
+                                },
                                 feedback = state.controlFeedback[task.id],
                                 speechFailure = state.speechFailure,
                             onClick = {
@@ -776,6 +821,11 @@ private fun UsagePill(window: UsageWindow) {
 @Composable
 private fun TaskRow(
     modifier: Modifier = Modifier,
+    onAddAttachments: (String, List<android.net.Uri>) -> Unit = { _, _ -> },
+    onRemoveAttachment: (String, String) -> Unit = { _, _ -> },
+    onRetryAttachment: (String, String) -> Unit = { _, _ -> },
+    onPhotoPickerLaunch: (String) -> Unit = {},
+    promptAttachments: List<com.agentgrid.mobile.attachments.PromptAttachment> = emptyList(),
     task: TaskSnapshot,
     pending: PendingRequest?,
     expanded: Boolean,
@@ -896,6 +946,11 @@ private fun TaskRow(
                 onControl = onControl,
                 onToggleReplySpeech = onToggleReplySpeech,
                 onPromptDraftChange = onPromptDraftChange,
+                promptAttachments = promptAttachments,
+                onAddAttachments = onAddAttachments,
+                onRemoveAttachment = onRemoveAttachment,
+                onRetryAttachment = onRetryAttachment,
+                onPhotoPickerLaunch = onPhotoPickerLaunch,
                 feedback = feedback,
                 speechFailure = speechFailure,
             )
@@ -1059,6 +1114,11 @@ private fun TaskDetails(
     onControl: (String, ControlAction, String?, List<String>?) -> Unit,
     onToggleReplySpeech: (String) -> Unit,
     onPromptDraftChange: (String, String) -> Unit,
+    promptAttachments: List<com.agentgrid.mobile.attachments.PromptAttachment> = emptyList(),
+    onAddAttachments: (String, List<android.net.Uri>) -> Unit = { _, _ -> },
+    onRemoveAttachment: (String, String) -> Unit = { _, _ -> },
+    onRetryAttachment: (String, String) -> Unit = { _, _ -> },
+    onPhotoPickerLaunch: (String) -> Unit = {},
     feedback: ControlFeedback? = null,
     speechFailure: ReplySpeech.SpeechFailure? = null,
 ) {
@@ -1242,6 +1302,41 @@ private fun TaskDetails(
         if (showToken && pending == null && TaskCapability.PROMPT in task.capabilities) {
             val bringIntoViewRequester = remember { BringIntoViewRequester() }
             val scope = rememberCoroutineScope()
+            // 输入框持有 TextFieldValue（带光标）：[图N] 要按整块删除，必须知道这次删了哪一段。
+            // 文本仍由 ViewModel 的 promptDraft 托管，删图重排后靠 LaunchedEffect 回灌。
+            var draftField by remember(task.id) { mutableStateOf(TextFieldValue(promptDraft)) }
+            LaunchedEffect(promptDraft) {
+                if (promptDraft != draftField.text) {
+                    val cursor = draftField.selection.end.coerceIn(0, promptDraft.length)
+                    draftField = TextFieldValue(promptDraft, TextRange(cursor))
+                }
+            }
+            // 图片条：输入框上方横排，图N角标 + [+]插符 + [x]删除 + 状态遮罩。
+            if (promptAttachments.isNotEmpty()) {
+                androidx.compose.foundation.lazy.LazyRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    itemsIndexed(promptAttachments, key = { _, item -> item.clientId }) { index, item ->
+                        AttachmentCard(
+                            index = index,
+                            attachment = item,
+                            enabled = !promptBusy,
+                            onInsert = {
+                                // 插在光标处（有选区则替换选区），而不是永远追加到末尾。
+                                val token = "[图${index + 1}]"
+                                val start = draftField.selection.min
+                                val end = draftField.selection.max
+                                val next = draftField.text.replaceRange(start, end, token)
+                                draftField = TextFieldValue(next, TextRange(start + token.length))
+                                onPromptDraftChange(task.id, next)
+                            },
+                            onRemove = { onRemoveAttachment(task.id, item.clientId) },
+                            onRetry = { onRetryAttachment(task.id, item.clientId) },
+                        )
+                    }
+                }
+            }
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1249,9 +1344,32 @@ private fun TaskDetails(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
+                // 相册入口：输入框左侧，+ 号方框。launcher 在 TaskTerminal 无条件处，这里只登记任务。
+                Box(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .border(1.dp, AgentGridColors.Divider)
+                        .clickable(enabled = !promptBusy) { onPhotoPickerLaunch(task.id) },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text("＋", color = AgentGridColors.Cyan, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                }
                 OutlinedTextField(
-                    value = promptDraft,
-                    onValueChange = { onPromptDraftChange(task.id, it) },
+                    value = draftField,
+                    onValueChange = { value ->
+                        // 退格/选区删除落在 [图N] 里时，扩成整块删除，不留半截占位符。
+                        val atomic = com.agentgrid.mobile.attachments.PromptTokens.expandAtomicDeletion(
+                            draftField.text,
+                            value.text,
+                        )
+                        val next = if (atomic != null) {
+                            TextFieldValue(atomic.text, TextRange(atomic.cursor))
+                        } else {
+                            value
+                        }
+                        draftField = next
+                        onPromptDraftChange(task.id, next.text)
+                    },
                     modifier = Modifier
                         .weight(1f)
                         .onFocusChanged { focusState ->
@@ -1269,14 +1387,18 @@ private fun TaskDetails(
                     },
                     maxLines = 3,
                 )
+                // 全部 READY 才放行：序号 = 卡片序号 = 清单序号，不给"失败图占号又被静默清掉"留缝。
+                val blocking = promptAttachments.any {
+                    it.state != com.agentgrid.mobile.attachments.AttachmentState.READY
+                }
                 PixelButton(
                     if (task.lifecycle == AgentLifecycle.RUNNING) "排队" else "发送",
                     AgentGridColors.Cyan,
-                    enabled = !promptBusy && promptDraft.isNotBlank(),
+                    enabled = !promptBusy && !blocking && draftField.text.isNotBlank(),
                 ) {
-                    if (promptDraft.isNotBlank()) {
+                    if (draftField.text.isNotBlank()) {
                         // 草稿由 ViewModel 在「已确认送达」后清空；失败/超时保留原文
-                        onControl(task.id, ControlAction.PROMPT, promptDraft.trim(), null)
+                        onControl(task.id, ControlAction.PROMPT, draftField.text.trim(), null)
                     }
                 }
             }
@@ -1475,6 +1597,113 @@ private fun PixelButton(
         contentPadding = ButtonDefaults.TextButtonContentPadding,
     ) {
         Text(label, fontSize = 10.sp)
+    }
+}
+
+/**
+ * 附图卡片：64dp 方块，左上「图N」角标、右上 [x] 删除、底部 [+] 插入占位符。
+ * 上传中盖半透明遮罩+文字进度，失败标红点按重试，READY 显示正常。
+ */
+@Composable
+private fun AttachmentCard(
+    index: Int,
+    attachment: com.agentgrid.mobile.attachments.PromptAttachment,
+    enabled: Boolean,
+    onInsert: () -> Unit,
+    onRemove: () -> Unit,
+    onRetry: () -> Unit,
+) {
+    val label = "图${index + 1}"
+    Box(
+        modifier = Modifier
+            .size(64.dp)
+            .background(AgentGridColors.SurfaceRaised)
+            .border(
+                1.dp,
+                when (attachment.state) {
+                    com.agentgrid.mobile.attachments.AttachmentState.READY -> AgentGridColors.Cyan
+                    com.agentgrid.mobile.attachments.AttachmentState.FAILED -> AgentGridColors.Red
+                    else -> AgentGridColors.Divider
+                },
+            )
+            .clickable(
+                enabled = enabled &&
+                    attachment.state != com.agentgrid.mobile.attachments.AttachmentState.COMPRESSING &&
+                    attachment.state != com.agentgrid.mobile.attachments.AttachmentState.UPLOADING,
+            ) {
+                if (attachment.state == com.agentgrid.mobile.attachments.AttachmentState.FAILED) onRetry()
+                else onInsert()
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        // 真缩略图：压缩时顺手生成 192px JPEG，READY 后大图字节释放、缩略图留着。
+        val thumbBitmap = androidx.compose.runtime.remember(attachment.clientId, attachment.thumb) {
+            attachment.thumb?.let { bytes ->
+                android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            }
+        }
+        if (thumbBitmap != null) {
+            androidx.compose.foundation.Image(
+                bitmap = thumbBitmap.asImageBitmap(),
+                contentDescription = label,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+            )
+            // 压一层淡黑，保证角标和状态字在亮图上可读。
+            Box(
+                Modifier
+                    .fillMaxSize()
+                    .background(androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.25f)),
+            )
+        } else {
+            Text(
+                label,
+                color = AgentGridColors.Text,
+                fontSize = 13.sp,
+                fontWeight = FontWeight.Bold,
+            )
+        }
+        // 左上序号角标
+        Text(
+            label,
+            color = AgentGridColors.Background,
+            fontSize = 8.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier
+                .align(Alignment.TopStart)
+                .background(AgentGridColors.Cyan)
+                .padding(horizontal = 4.dp, vertical = 1.dp),
+        )
+        // 右上删除
+        Text(
+            "×",
+            color = AgentGridColors.Red,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .clickable(enabled = enabled) { onRemove() }
+                .padding(horizontal = 5.dp, vertical = 1.dp),
+        )
+        // 底部插入符 / 状态
+        val bottomText = when (attachment.state) {
+            com.agentgrid.mobile.attachments.AttachmentState.COMPRESSING -> "压缩中…"
+            com.agentgrid.mobile.attachments.AttachmentState.UPLOADING -> "上传中…"
+            com.agentgrid.mobile.attachments.AttachmentState.FAILED -> "失败点重试"
+            com.agentgrid.mobile.attachments.AttachmentState.READY -> "[+]插入"
+        }
+        Text(
+            bottomText,
+            color = when (attachment.state) {
+                com.agentgrid.mobile.attachments.AttachmentState.FAILED -> AgentGridColors.Red
+                com.agentgrid.mobile.attachments.AttachmentState.READY -> AgentGridColors.Green
+                else -> AgentGridColors.Muted
+            },
+            fontSize = 8.sp,
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 3.dp),
+        )
     }
 }
 

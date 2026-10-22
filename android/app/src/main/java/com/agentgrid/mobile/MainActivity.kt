@@ -74,6 +74,10 @@ class MainActivity : ComponentActivity() {
                 inMultiWindow = multiWindowState.value,
                 promptDrafts = viewModel.promptDrafts,
                 onPromptDraftChange = viewModel::setPromptDraft,
+                promptAttachments = viewModel.promptAttachments,
+                onAddAttachments = viewModel::addAttachments,
+                onRemoveAttachment = viewModel::removeAttachment,
+                onRetryAttachment = viewModel::retryAttachment,
             )
         }
     }

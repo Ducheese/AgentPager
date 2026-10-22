@@ -9,6 +9,10 @@ void Check(bool condition, string name)
     else { failures.Add(name); Console.WriteLine($"FAIL  {name}"); }
 }
 
+// Maintain 会跑附件 TTL 清扫：把根目录指到临时目录，别动真实用户的暂存文件。
+var sweepRoot = Path.Combine(Path.GetTempPath(), "ap-sweep-" + Guid.NewGuid().ToString("N"));
+AttachmentStore.SweepRootOverride = sweepRoot;
+
 static OpenCodeHookPayload H(string evt, object props) =>
     new(evt, JsonSerializer.SerializeToElement(props, WireJson.Options));
 
@@ -4287,6 +4291,52 @@ static System.Diagnostics.Process SpawnVictim()
         listener.Stop();
     }
 }
+
+// 7 附件暂存区（手机远程 prompt 附图）：落盘 + 上限 + TTL（2026-10-22）
+{
+    var root = Path.Combine(Path.GetTempPath(), "ap-attachments-" + Guid.NewGuid().ToString("N"));
+    var now = DateTimeOffset.UtcNow;
+
+    var bytes = new byte[16];
+    new Random(7).NextBytes(bytes);
+    var saved = AttachmentStore.Save(bytes, "shot.PNG", root, now);
+    Check(File.Exists(saved.LocalPath), "attachments: saved file exists on disk");
+    Check(saved.LocalPath.StartsWith(root, StringComparison.Ordinal), "attachments: saved under the attachments root");
+    Check(saved.FileName.EndsWith(".png", StringComparison.Ordinal), "attachments: extension normalized to lowercase");
+    Check(Path.GetFileName(Path.GetDirectoryName(saved.LocalPath)) == now.ToString("yyyyMMdd"),
+        "attachments: bucketed by date directory");
+
+    var unknown = AttachmentStore.Save(bytes, "noext", root, now);
+    Check(unknown.FileName.EndsWith(".jpg", StringComparison.Ordinal), "attachments: unknown extension falls back to jpg");
+
+    var withMeta = AttachmentStore.Save(bytes, "shot.jpg", root, now, "q60_1440x810");
+    Check(withMeta.FileName.Contains("_q60_1440x810.jpg", StringComparison.Ordinal),
+        "attachments: compression meta lands in the file name");
+    var dirtyMeta = AttachmentStore.Save(bytes, "shot.jpg", root, now, "../..\\evil?q60");
+    Check(!dirtyMeta.FileName.Contains("..") && !dirtyMeta.FileName.Contains('/') && !dirtyMeta.FileName.Contains('\\'),
+        "attachments: meta is whitelisted, never a path");
+
+    var tooBig = new byte[(int)AttachmentStore.MaxFileBytes + 1];
+    var rejected = false;
+    try { AttachmentStore.Save(tooBig, "big.jpg", root, now); }
+    catch (InvalidDataException) { rejected = true; }
+    Check(rejected, "attachments: over-limit save is rejected");
+
+    var oldFile = Path.Combine(root, "20200101", "att_old.jpg");
+    Directory.CreateDirectory(Path.GetDirectoryName(oldFile)!);
+    File.WriteAllBytes(oldFile, bytes);
+    File.SetLastWriteTimeUtc(oldFile, now.AddDays(-8).UtcDateTime);
+    var freshStillThere = saved.LocalPath;
+    var swept = AttachmentStore.SweepOlderThan(AttachmentStore.Retention, root, now);
+    Check(swept >= 1 && !File.Exists(oldFile), "attachments: TTL sweep removes files older than retention");
+    Check(File.Exists(freshStillThere), "attachments: TTL sweep keeps fresh files");
+    Check(AttachmentStore.SweepOlderThan(AttachmentStore.Retention, Path.Combine(root, "missing"), now) == 0,
+        "attachments: sweep on missing root returns zero");
+
+    try { Directory.Delete(root, true); } catch { }
+}
+
+try { Directory.Delete(sweepRoot, true); } catch { }
 
 Console.WriteLine(failures.Count == 0 ? "ALL CHECKS PASSED" : $"FAILURES: {string.Join(", ", failures)}");
 return failures.Count == 0 ? 0 : 1;

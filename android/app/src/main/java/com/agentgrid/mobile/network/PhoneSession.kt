@@ -102,6 +102,12 @@ interface PhoneSession : AutoCloseable {
      * 已连接或没有配对时什么都不做（幂等，可在回前台/网络恢复/亮屏时随手调用）。
      */
     fun nudge()
+
+    /**
+     * 附件上传用的候选地址（含配对密钥）：与 WS 连接走同一套局域网优先+隧道兜底。
+     * 未配对时返回空列表。
+     */
+    suspend fun uploadEndpoints(): List<PhoneEndpoint>
 }
 
 internal interface PhoneCredentialStore {
@@ -114,7 +120,7 @@ internal interface PhoneCredentialStore {
     suspend fun reserveNextSequence(): ULong
 }
 
-internal data class PhoneEndpoint(
+data class PhoneEndpoint(
     val host: String,
     val port: Int,
     /** 走 wss 而不是 ws —— 隧道那头是 443/TLS。 */
@@ -344,6 +350,11 @@ internal class DefaultPhoneSession(
         transport.disconnect()
         transport.close()
         scope.cancel()
+    }
+
+    override suspend fun uploadEndpoints(): List<PhoneEndpoint> = mutex.withLock {
+        val current = pairing ?: return emptyList()
+        endpointsFor(current)
     }
 
     private suspend fun acceptTransportEvent(event: TransportEvent) {

@@ -454,6 +454,47 @@ class PhoneSessionTest {
         return Fixture(session, credentials, transport, operationLog)
     }
 
+    @Test
+    fun `上传候选地址与连接候选一致且携带密钥`() = runTest {
+        val fixture = fixture(pairing = pairing())
+        fixture.session.start()
+        runCurrent()
+
+        val endpoints = fixture.session.uploadEndpoints()
+
+        assertEquals(1, endpoints.size)
+        assertEquals("127.0.0.1", endpoints[0].host)
+        assertEquals(8765, endpoints[0].port)
+        assertEquals(secretText(), endpoints[0].secret)
+        fixture.close()
+    }
+
+    @Test
+    fun `带隧道时上传候选含局域网与隧道两条`() = runTest {
+        val fixture = fixture(pairing = pairing("example.ngrok-free.dev"))
+        fixture.session.start()
+        runCurrent()
+
+        val endpoints = fixture.session.uploadEndpoints()
+
+        assertEquals(2, endpoints.size)
+        assertEquals("127.0.0.1", endpoints[0].host)
+        assertEquals("example.ngrok-free.dev", endpoints[1].host)
+        assertTrue(endpoints[1].secure)
+        assertEquals(secretText(), endpoints[1].secret)
+        fixture.close()
+    }
+
+    @Test
+    fun `未配对时上传候选为空`() = runTest {
+        val fixture = fixture(pairing = null)
+        fixture.session.start()
+        runCurrent()
+
+        assertTrue(fixture.session.uploadEndpoints().isEmpty())
+        fixture.close()
+    }
+
     private fun pairing(tunnelHost: String? = null) = PairingPayload(
         version = 1,
         serviceID = "bridge",
