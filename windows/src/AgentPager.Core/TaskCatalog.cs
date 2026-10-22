@@ -4103,6 +4103,7 @@ public static class ToolStepSanitizer
 /// <summary>
 /// TOOL 行用的工具输出清洗：去 ANSI 颜色、统一换行、限长。保留换行（这是它与第三行
 /// 单行预览的根本区别），只做显示层最小处理；空文本返回 null 让手机侧整行隐藏。
+/// 超限时截断并追加省略尾巴（...(+N字符省略)，N 为截掉的字符数），手机侧直接可见砍了多少。
 /// </summary>
 public static class ToolOutputText
 {
@@ -4110,7 +4111,7 @@ public static class ToolOutputText
         @"\x1B\[[0-9;?]*[ -/]*[@-~]",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
-    public const int Limit = 4000;
+    public const int Limit = 2048;
 
     public static string? Clean(string? value, int limit = Limit)
     {
@@ -4120,6 +4121,7 @@ public static class ToolOutputText
             .Replace('\r', '\n')
             .Trim();
         if (text.Length == 0) return null;
-        return text.Length > limit ? text[..limit] : text;
+        if (text.Length <= limit) return text;
+        return $"{text[..limit]}\n...(+{text.Length - limit}字符省略)";
     }
 }

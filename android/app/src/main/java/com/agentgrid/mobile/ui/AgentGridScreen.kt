@@ -1219,7 +1219,14 @@ private fun TaskDetails(
             },
             label = "待处理请求切换",
         ) { targetPending ->
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            // question 回答框的 bringIntoView：跟 prompt 输入框同一套，
+            // 内容长高后自动跟随，不用点第二次。
+            val answerBringIntoViewRequester = remember { BringIntoViewRequester() }
+            val answerScope = rememberCoroutineScope()
+            Column(
+                modifier = Modifier.bringIntoViewRequester(answerBringIntoViewRequester),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
                 targetPending?.summary?.let { summary ->
                     DetailLine(
                         if (targetPending.kind == PendingRequestKind.APPROVAL) {
@@ -1269,12 +1276,14 @@ private fun TaskDetails(
                                 picked = if (on) picked - option else picked + option
                             }
                         }
-                        OutlinedTextField(
-                            value = answer,
-                            onValueChange = { answer = it },
-                            modifier = Modifier.fillMaxWidth(),
+                        PromptInputField(
+                            draftField = TextFieldValue(answer, TextRange(answer.length)),
+                            onDraftChange = { answer = it.text },
+                            placeholder = "输入回答...",
                             minLines = 3,
                             maxLines = if (compact) 8 else 5,
+                            modifier = Modifier.fillMaxWidth(),
+                            onFollowScroll = { answerScope.launch { answerBringIntoViewRequester.bringIntoView() } },
                         )
                         PixelButton(
                             "发送回答",
@@ -1296,12 +1305,14 @@ private fun TaskDetails(
                                 onControl(task.id, ControlAction.ANSWER, option, null)
                             }
                         }
-                        OutlinedTextField(
-                            value = answer,
-                            onValueChange = { answer = it },
-                            modifier = Modifier.fillMaxWidth(),
+                        PromptInputField(
+                            draftField = TextFieldValue(answer, TextRange(answer.length)),
+                            onDraftChange = { answer = it.text },
+                            placeholder = "输入回答...",
                             minLines = 3,
                             maxLines = if (compact) 8 else 5,
+                            modifier = Modifier.fillMaxWidth(),
+                            onFollowScroll = { answerScope.launch { answerBringIntoViewRequester.bringIntoView() } },
                         )
                         PixelButton(
                             "发送回答",
@@ -1377,6 +1388,7 @@ private fun TaskDetails(
                         maxLines = 8,
                         modifier = Modifier.fillMaxWidth(),
                         onFocused = { scope.launch { bringIntoViewRequester.bringIntoView() } },
+                        onFollowScroll = { scope.launch { bringIntoViewRequester.bringIntoView() } },
                     )
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -1438,6 +1450,7 @@ private fun TaskDetails(
                         maxLines = 5,
                         modifier = Modifier.weight(1f),
                         onFocused = { scope.launch { bringIntoViewRequester.bringIntoView() } },
+                        onFollowScroll = { scope.launch { bringIntoViewRequester.bringIntoView() } },
                     )
                     // 全部 READY 才放行：序号 = 卡片序号 = 清单序号，不给"失败图占号又被静默清掉"留缝。
                     val blocking = promptAttachments.any {
@@ -1463,6 +1476,10 @@ private fun TaskDetails(
 /**
  * Prompt / question 共用的多行输入框。[图N] 原子删除、键盘弹起滚到可见区都在这里。
  * 高度由 minLines/maxLines 决定：maxLines 之后 TextField 内部滚动，不再顶布局。
+ *
+ * 内容变化也会触发跟随滚动：输入框长高一截后等 150ms（等布局定下来），
+ * 如果这期间又敲字就重新计时——停稳了才滚一次，不断字。
+ * onFollowScroll 传空 = 不跟随（调用方不需要时）。
  */
 @Composable
 private fun PromptInputField(
@@ -1472,8 +1489,16 @@ private fun PromptInputField(
     minLines: Int,
     maxLines: Int,
     modifier: Modifier = Modifier,
-    onFocused: () -> Unit,
+    onFocused: () -> Unit = {},
+    onFollowScroll: () -> Unit = {},
 ) {
+    // 防抖：内容每变一次就把计时归零，停稳 150ms 才滚。
+    var followNonce by remember { mutableStateOf(0L) }
+    LaunchedEffect(followNonce) {
+        if (followNonce == 0L) return@LaunchedEffect
+        delay(150)
+        onFollowScroll()
+    }
     OutlinedTextField(
         value = draftField,
         onValueChange = { value ->
@@ -1488,6 +1513,7 @@ private fun PromptInputField(
                 value
             }
             onDraftChange(next)
+            followNonce = System.nanoTime()
         },
         modifier = modifier
             .onFocusChanged { focusState ->
