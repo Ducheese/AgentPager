@@ -457,6 +457,9 @@ private fun TaskTerminal(
     }
     var expandedTaskID by remember { mutableStateOf<String?>(null) }
     var settingsVisible by remember { mutableStateOf(false) }
+    // 像素预览是第三个内容态（任务列表 / 额度面板 / 像素预览三选一），不是浮窗——
+    // 按额度面板竞态做互斥：开预览时回任务态，开额度/开设置时关预览。
+    var pixelPreviewVisible by remember { mutableStateOf(false) }
     // 相册 launcher 必须挂在无条件处：写进「展开 + 无待批请求」分支里时，
     // 选图期间状态一抖（心跳重组、待批请求弹出）launcher 就被注销，
     // 返回的 URI 投给已释放的回调——选完无反应的根因（2026-10-22 真机实测）。
@@ -494,10 +497,11 @@ private fun TaskTerminal(
         soundTracker.nextCue(tasks, soundEnabled)?.let(sound::play)
     }
 
-    // 层级返回：设置小窗 → 先关小窗；额度面板 → 回任务面板；都没开才交给系统（退桌面）。
-    // 和点右上角图标是同一动作（onToggleDashboard / 关小窗），返回键只是另一只手。
-    BackHandler(enabled = settingsVisible || showDashboard) {
-        if (settingsVisible) settingsVisible = false
+    // 层级返回：预览 → 设置小窗 → 额度面板 → 回任务面板；都没开才交给系统（退桌面）。
+    // 预览是内容态（跟额度面板同一槽），返回键关预览回到任务列表。
+    BackHandler(enabled = pixelPreviewVisible || settingsVisible || showDashboard) {
+        if (pixelPreviewVisible) pixelPreviewVisible = false
+        else if (settingsVisible) settingsVisible = false
         else if (showDashboard) onToggleDashboard()
     }
 
@@ -541,18 +545,38 @@ private fun TaskTerminal(
             },
             settingsVisible = settingsVisible,
             dashboardVisible = showDashboard,
+            previewVisible = pixelPreviewVisible,
             onToggleDashboard = {
                 onToggleDashboard()
+                // 三个内容态互斥：切额度时把预览和设置都收掉。
+                settingsVisible = false
+                pixelPreviewVisible = false
+            },
+            onTogglePreview = {
+                // 开预览先回任务态（额度面板是内容槽，占着坑就先让出来），再开预览；关预览回任务列表。
+                if (!pixelPreviewVisible && showDashboard) onToggleDashboard()
+                pixelPreviewVisible = !pixelPreviewVisible
                 settingsVisible = false
             },
-            onToggleSettings = { settingsVisible = !settingsVisible },
+            onToggleSettings = {
+                settingsVisible = !settingsVisible
+                // 设置是右上浮层：打开时收掉预览（浮层盖在内容态上会叠），额度面板不管（浮层本来就盖它）。
+                if (settingsVisible) pixelPreviewVisible = false
+            },
             modifier = Modifier
                 .align(Alignment.TopEnd)
                 .zIndex(2f),
         )
 
+        // 内容三态：任务列表 / 额度面板 / 像素预览，三选一进同一个内容槽（仿额度面板的竞态，
+        // 不是浮窗）。预览开时 dashboard 已经被互斥逻辑关掉，这里只管显示。
+        val contentMode = when {
+            pixelPreviewVisible -> 2
+            showDashboard -> 1
+            else -> 0
+        }
         AnimatedContent(
-            targetState = showDashboard,
+            targetState = contentMode,
             transitionSpec = {
                 (
                     (
@@ -581,14 +605,15 @@ private fun TaskTerminal(
             // 顶部 46dp 只留给右上角按钮；内容从下方开始铺满，不做横屏居中
             //（状态栏自己占一截之后，居中反而显得上下不靠）。
             label = "任务态与状态态切换",
-        ) { isDashboardVisible ->
-            if (isDashboardVisible) {
-                UsageDashboard(
+        ) { mode ->
+            when (mode) {
+                2 -> PixelPreviewPanel()
+                1 -> UsageDashboard(
                     usage = state.usage,
                     usages = state.usages,
                     connected = state.linkState == LinkState.CONNECTED,
                 )
-            } else {
+                else -> {
                 LazyColumn(
                     state = taskListState,
                     modifier = Modifier
@@ -682,6 +707,7 @@ private fun TaskTerminal(
                 }
             }
         }
+        }
 
         AnimatedVisibility(
             visible = settingsVisible,
@@ -728,12 +754,98 @@ private fun TaskTerminal(
     }
 }
 
+/**
+ * 像素图预览页：内容三态之一（跟额度面板同一槽，不是浮窗）。
+ *
+ * 7 个非 RUNNING 生命周期各一格 + RUNNING × 8 活动各一格 = 15 格。
+ * 自适应列（BoxWithConstraints 按宽度算列数，窄屏 3 列、宽屏 5 列）；
+ * 15 格同时常播（完成态播完停终帧是原设计）；点任意一格 replayNonce++，
+ * 15 格的 key 全带这个 nonce——全体一起从头重播。关闭走顶栏按钮/返回键，这里不放关闭。
+ */
+@Composable
+private fun PixelPreviewPanel() {
+    // 7 个非 RUNNING 生命周期 + RUNNING × 8 活动 = 15 格，中文名复用 statusText/activityText。
+    val nonRunning = AgentLifecycle.entries.filter { it != AgentLifecycle.RUNNING }
+    val cases: List<Triple<AgentLifecycle, AgentActivity?, String>> = buildList {
+        nonRunning.forEach { lifecycle ->
+            add(Triple(lifecycle, null, statusText(lifecycle)))
+        }
+        AgentActivity.entries.forEach { activity ->
+            add(Triple(AgentLifecycle.RUNNING, activity, "运行 · ${activityText(activity)}"))
+        }
+    }
+    var replayNonce by remember { mutableStateOf(0L) }
+
+    BoxWithConstraints(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp),
+    ) {
+        // 格子最小 100dp（含名字），能排几列排几列，至少 2 列、至多 5 列。
+        val columns = ((maxWidth / 108.dp).toInt()).coerceIn(2, 5)
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            cases.chunked(columns).forEach { row ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    row.forEach { (lifecycle, activity, label) ->
+                        key(lifecycle, activity, replayNonce) {
+                            Column(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clickable { replayNonce++ }
+                                    .semantics { contentDescription = "重播 $label" },
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
+                                AndroidView(
+                                    factory = { PixelCoreSurfaceView(it) },
+                                    update = {
+                                        it.updateState(
+                                            PixelRenderState(
+                                                lifecycle = lifecycle,
+                                                activity = activity,
+                                                revision = replayNonce,
+                                            ),
+                                        )
+                                    },
+                                    modifier = Modifier.size(64.dp),
+                                )
+                                Text(
+                                    text = label,
+                                    color = AgentGridColors.Muted,
+                                    fontSize = 9.sp,
+                                    textAlign = TextAlign.Center,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+                    }
+                    // 最后一行不满列数时用空位补齐，避免格子被拉宽。
+                    repeat(columns - row.size) {
+                        Spacer(modifier = Modifier.weight(1f))
+                    }
+                }
+            }
+        }
+    }
+}
+
 @Composable
 private fun TopControls(
     windows: List<UsageWindow>,
     settingsVisible: Boolean,
     dashboardVisible: Boolean,
+    previewVisible: Boolean,
     onToggleDashboard: () -> Unit,
+    onTogglePreview: () -> Unit,
     onToggleSettings: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -744,6 +856,18 @@ private fun TopControls(
     ) {
         windows.take(2).forEach { window ->
             UsagePill(window)
+        }
+        // 像素图预览入口：额度切换按钮的左边，手画九宫格图标（跟 ViewSwitchIcon 同风格）。
+        Box(
+            modifier = Modifier
+                .size(28.dp)
+                .clickable(onClick = onTogglePreview)
+                .semantics {
+                    contentDescription = if (previewVisible) "关闭像素预览" else "打开像素预览"
+                },
+            contentAlignment = Alignment.Center,
+        ) {
+            PixelPreviewIcon(active = previewVisible)
         }
         Box(
             modifier = Modifier
@@ -775,6 +899,38 @@ private fun TopControls(
                 fontSize = 13.sp,
                 fontWeight = FontWeight.Bold,
             )
+        }
+    }
+}
+
+@Composable
+private fun PixelPreviewIcon(active: Boolean) {
+    Canvas(modifier = Modifier.size(12.dp)) {
+        val unit = size.minDimension / 16f
+
+        fun pixelRect(x: Float, y: Float, width: Float, height: Float) {
+            drawRect(
+                color = AgentGridColors.Muted,
+                topLeft = Offset(x * unit, y * unit),
+                size = Size(width * unit, height * unit),
+            )
+        }
+
+        // 关态：四角 3×3 + 中心 4×4，呼应任务行的 3×3 像素核心。
+        // 开态：只亮上下左右四个 3×3（四角和中心灭掉），跟关态完全区分。
+        if (active) {
+            pixelRect(x = 6.5f, y = 0f, width = 3f, height = 3f)
+            pixelRect(x = 6.5f, y = 13f, width = 3f, height = 3f)
+            pixelRect(x = 0f, y = 6.5f, width = 3f, height = 3f)
+            pixelRect(x = 13f, y = 6.5f, width = 3f, height = 3f)
+        } else {
+            listOf(
+                Triple(0f, 0f, 3f),
+                Triple(13f, 0f, 3f),
+                Triple(0f, 13f, 3f),
+                Triple(13f, 13f, 3f),
+            ).forEach { (x, y, s) -> pixelRect(x = x, y = y, width = s, height = s) }
+            pixelRect(x = 6f, y = 6f, width = 4f, height = 4f)
         }
     }
 }
