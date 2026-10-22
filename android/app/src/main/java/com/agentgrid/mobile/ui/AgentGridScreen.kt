@@ -30,6 +30,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -258,26 +259,35 @@ private fun PairingScreen(
                         letterSpacing = 2.sp,
                     )
                     Spacer(Modifier.height(14.dp))
+                    // 竖屏取景框：3:4 竖框，宽高联合约束。相机是 16:9 横帧 + FILL_CENTER，
+                    // 正方形框按宽撑满会把上下裁掉（取景框顶出屏幕外）；竖框裁的是左右，
+                    // 上下完整，第一眼就是完整的框，不会误以为没对准。
                     ScannerArea(
                         inMultiWindow = inMultiWindow,
                         onResult = onPair,
                         modifier = Modifier
-                            .size(minOf(availableWidth * 0.68f, 280.dp)),
+                            .widthIn(max = minOf(availableWidth * 0.78f, 300.dp))
+                            .fillMaxWidth(fraction = 0.78f)
+                            .aspectRatio(3f / 4f)
+                            .heightIn(max = availableHeight * 0.38f),
                     )
-                    Spacer(Modifier.height(14.dp))
+                    Spacer(Modifier.height(10.dp))
                     Text("扫描 Bridge 上的二维码", color = AgentGridColors.Cyan, fontSize = 14.sp)
+                    // 说明行 + 输入框收紧：之前 Spacer(14.dp) + 输入框 minLines=2，
+                    // 内容总高顶出首屏，说明行下半截被输入框压住（见 2026-10-22 真机图）。
+                    Spacer(Modifier.height(4.dp))
                     Text(
                         "在电脑上打开 AgentPager Bridge → 扫描二维码",
                         color = AgentGridColors.Muted,
                         fontSize = 11.sp,
                         textAlign = TextAlign.Center,
                     )
-                    Spacer(Modifier.height(14.dp))
+                    Spacer(Modifier.height(10.dp))
                     OutlinedTextField(
                         value = manualText,
                         onValueChange = { manualText = it },
                         label = { Text("无法扫码？粘贴配对文本") },
-                        minLines = 2,
+                        minLines = 1,
                         maxLines = 4,
                         modifier = Modifier.fillMaxWidth(),
                     )
@@ -380,6 +390,10 @@ private fun PairingScreen(
 /**
  * 扫码取景区。分屏/小窗模式下相机不可用（系统对非焦点多窗口封锁相机），
  * 此时不渲染相机，原位给提示；手动粘贴配对文本始终可用。
+ *
+ * 注意：这里刻意不画 border 取景框。相机是 16:9 横帧 + FILL_CENTER 按窄边撑满裁掉多余，
+ * 解码走的是完整帧——Box 边缘的描边跟扫码区域没有任何对应关系，只会骗人：
+ * 竖屏框上下被裁出屏幕、横屏框左右边压在画面正中看着像把画面切开。干净铺满就是取景区。
  */
 @Composable
 private fun ScannerArea(
@@ -389,7 +403,6 @@ private fun ScannerArea(
 ) {
     Box(
         modifier = modifier
-            .border(1.dp, AgentGridColors.Divider)
             .background(AgentGridColors.Surface),
         contentAlignment = Alignment.Center,
     ) {
@@ -559,7 +572,12 @@ private fun TaskTerminal(
             },
             modifier = Modifier
                 .fillMaxSize()
-                .padding(top = 46.dp, bottom = 12.dp),
+                // 离线时底部给离线条预留独占 34dp（之前 overlay 直接压在列表上）；
+                // 连上后还给 12dp，空间还给 task 列表。
+                .padding(
+                    top = 46.dp,
+                    bottom = if (state.linkState == LinkState.CONNECTED) 12.dp else 34.dp,
+                ),
             // 顶部 46dp 只留给右上角按钮；内容从下方开始铺满，不做横屏居中
             //（状态栏自己占一截之后，居中反而显得上下不靠）。
             label = "任务态与状态态切换",
@@ -1140,11 +1158,11 @@ private fun TaskDetails(
     // 清空也跟随 REPLY（新回合开始时由桥端把两者一起置空）。
     val showToolOutput = showToken && !task.latestToolOutput.isNullOrBlank()
 
+    // 展开高度不封顶：内容多高就多高，滚动交给外层 LazyColumn；
+    // 之前 heightIn(max) + 内层 verticalScroll 会把长 REPLY/TOOL 截断成框内滚动。
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .heightIn(max = if (showResponseBody) (if (compact) 480.dp else 380.dp) else (if (compact) 320.dp else 250.dp))
-            .verticalScroll(rememberScrollState())
             .padding(start = if (compact) 68.dp else 82.dp, end = if (compact) 8.dp else 18.dp, bottom = 8.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
@@ -1167,7 +1185,7 @@ private fun TaskDetails(
                 )
             }
             if (showToolOutput) {
-                ToolSection(task.latestToolOutput!!, compact)
+                ToolSection(task.latestToolOutput!!)
             }
             if (showResponseBody) {
                 ResponseSection(
@@ -1255,7 +1273,8 @@ private fun TaskDetails(
                             value = answer,
                             onValueChange = { answer = it },
                             modifier = Modifier.fillMaxWidth(),
-                            maxLines = 3,
+                            minLines = 3,
+                            maxLines = if (compact) 8 else 5,
                         )
                         PixelButton(
                             "发送回答",
@@ -1281,7 +1300,8 @@ private fun TaskDetails(
                             value = answer,
                             onValueChange = { answer = it },
                             modifier = Modifier.fillMaxWidth(),
-                            maxLines = 3,
+                            minLines = 3,
+                            maxLines = if (compact) 8 else 5,
                         )
                         PixelButton(
                             "发送回答",
@@ -1337,74 +1357,155 @@ private fun TaskDetails(
                     }
                 }
             }
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .bringIntoViewRequester(bringIntoViewRequester),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                // 相册入口：输入框左侧，+ 号方框。launcher 在 TaskTerminal 无条件处，这里只登记任务。
-                Box(
+            if (compact) {
+                // 竖屏：输入框独占一行全宽（3~8 行），[+]/发送键另起一行——
+                // 横排三件套在窄屏下把输入框挤成一条缝，多行内容滚出可视区。
+                Column(
                     modifier = Modifier
-                        .size(40.dp)
-                        .border(1.dp, AgentGridColors.Divider)
-                        .clickable(enabled = !promptBusy) { onPhotoPickerLaunch(task.id) },
-                    contentAlignment = Alignment.Center,
+                        .fillMaxWidth()
+                        .bringIntoViewRequester(bringIntoViewRequester),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    Text("＋", color = AgentGridColors.Cyan, fontSize = 18.sp, fontWeight = FontWeight.Bold)
-                }
-                OutlinedTextField(
-                    value = draftField,
-                    onValueChange = { value ->
-                        // 退格/选区删除落在 [图N] 里时，扩成整块删除，不留半截占位符。
-                        val atomic = com.agentgrid.mobile.attachments.PromptTokens.expandAtomicDeletion(
-                            draftField.text,
-                            value.text,
-                        )
-                        val next = if (atomic != null) {
-                            TextFieldValue(atomic.text, TextRange(atomic.cursor))
-                        } else {
-                            value
-                        }
-                        draftField = next
-                        onPromptDraftChange(task.id, next.text)
-                    },
-                    modifier = Modifier
-                        .weight(1f)
-                        .onFocusChanged { focusState ->
-                            // 键盘弹起后把输入框滚到可见区（嵌套滚动也会向上传递，列表跟着让位）
-                            if (focusState.isFocused) {
-                                scope.launch { bringIntoViewRequester.bringIntoView() }
-                            }
+                    PromptInputField(
+                        draftField = draftField,
+                        onDraftChange = { next ->
+                            draftField = next
+                            onPromptDraftChange(task.id, next.text)
                         },
-                    placeholder = {
-                        Text(
-                            if (task.lifecycle == AgentLifecycle.RUNNING) "追加 Prompt (排队)..." else "输入 Prompt 发起任务...",
-                            color = AgentGridColors.Muted,
-                            fontSize = 12.sp,
-                        )
-                    },
-                    maxLines = 3,
-                )
-                // 全部 READY 才放行：序号 = 卡片序号 = 清单序号，不给"失败图占号又被静默清掉"留缝。
-                val blocking = promptAttachments.any {
-                    it.state != com.agentgrid.mobile.attachments.AttachmentState.READY
+                        placeholder = if (task.lifecycle == AgentLifecycle.RUNNING) "追加 Prompt (排队)..." else "输入 Prompt 发起任务...",
+                        minLines = 3,
+                        maxLines = 8,
+                        modifier = Modifier.fillMaxWidth(),
+                        onFocused = { scope.launch { bringIntoViewRequester.bringIntoView() } },
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        // 相册入口：+ 号方框。launcher 在 TaskTerminal 无条件处，这里只登记任务。
+                        Box(
+                            modifier = Modifier
+                                .size(40.dp)
+                                .border(1.dp, AgentGridColors.Divider)
+                                .clickable(enabled = !promptBusy) { onPhotoPickerLaunch(task.id) },
+                            contentAlignment = Alignment.Center,
+                        ) {
+                            Text("＋", color = AgentGridColors.Cyan, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                        }
+                        // 全部 READY 才放行：序号 = 卡片序号 = 清单序号，不给"失败图占号又被静默清掉"留缝。
+                        val blocking = promptAttachments.any {
+                            it.state != com.agentgrid.mobile.attachments.AttachmentState.READY
+                        }
+                        PixelButton(
+                            if (task.lifecycle == AgentLifecycle.RUNNING) "排队" else "发送",
+                            AgentGridColors.Cyan,
+                            enabled = !promptBusy && !blocking && draftField.text.isNotBlank(),
+                        ) {
+                            if (draftField.text.isNotBlank()) {
+                                // 草稿由 ViewModel 在「已确认送达」后清空；失败/超时保留原文
+                                onControl(task.id, ControlAction.PROMPT, draftField.text.trim(), null)
+                            }
+                        }
+                    }
                 }
-                PixelButton(
-                    if (task.lifecycle == AgentLifecycle.RUNNING) "排队" else "发送",
-                    AgentGridColors.Cyan,
-                    enabled = !promptBusy && !blocking && draftField.text.isNotBlank(),
+            } else {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .bringIntoViewRequester(bringIntoViewRequester),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    if (draftField.text.isNotBlank()) {
-                        // 草稿由 ViewModel 在「已确认送达」后清空；失败/超时保留原文
-                        onControl(task.id, ControlAction.PROMPT, draftField.text.trim(), null)
+                    // 相册入口：输入框左侧，+ 号方框。launcher 在 TaskTerminal 无条件处，这里只登记任务。
+                    Box(
+                        modifier = Modifier
+                            .size(40.dp)
+                            .border(1.dp, AgentGridColors.Divider)
+                            .clickable(enabled = !promptBusy) { onPhotoPickerLaunch(task.id) },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text("＋", color = AgentGridColors.Cyan, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    }
+                    PromptInputField(
+                        draftField = draftField,
+                        onDraftChange = { next ->
+                            draftField = next
+                            onPromptDraftChange(task.id, next.text)
+                        },
+                        placeholder = if (task.lifecycle == AgentLifecycle.RUNNING) "追加 Prompt (排队)..." else "输入 Prompt 发起任务...",
+                        minLines = 1,
+                        maxLines = 5,
+                        modifier = Modifier.weight(1f),
+                        onFocused = { scope.launch { bringIntoViewRequester.bringIntoView() } },
+                    )
+                    // 全部 READY 才放行：序号 = 卡片序号 = 清单序号，不给"失败图占号又被静默清掉"留缝。
+                    val blocking = promptAttachments.any {
+                        it.state != com.agentgrid.mobile.attachments.AttachmentState.READY
+                    }
+                    PixelButton(
+                        if (task.lifecycle == AgentLifecycle.RUNNING) "排队" else "发送",
+                        AgentGridColors.Cyan,
+                        enabled = !promptBusy && !blocking && draftField.text.isNotBlank(),
+                    ) {
+                        if (draftField.text.isNotBlank()) {
+                            // 草稿由 ViewModel 在「已确认送达」后清空；失败/超时保留原文
+                            onControl(task.id, ControlAction.PROMPT, draftField.text.trim(), null)
+                        }
                     }
                 }
             }
             ControlFeedbackLine(feedback, promptFeedbackActions)
         }
     }
+}
+
+/**
+ * Prompt / question 共用的多行输入框。[图N] 原子删除、键盘弹起滚到可见区都在这里。
+ * 高度由 minLines/maxLines 决定：maxLines 之后 TextField 内部滚动，不再顶布局。
+ */
+@Composable
+private fun PromptInputField(
+    draftField: TextFieldValue,
+    onDraftChange: (TextFieldValue) -> Unit,
+    placeholder: String,
+    minLines: Int,
+    maxLines: Int,
+    modifier: Modifier = Modifier,
+    onFocused: () -> Unit,
+) {
+    OutlinedTextField(
+        value = draftField,
+        onValueChange = { value ->
+            // 退格/选区删除落在 [图N] 里时，扩成整块删除，不留半截占位符。
+            val atomic = com.agentgrid.mobile.attachments.PromptTokens.expandAtomicDeletion(
+                draftField.text,
+                value.text,
+            )
+            val next = if (atomic != null) {
+                TextFieldValue(atomic.text, TextRange(atomic.cursor))
+            } else {
+                value
+            }
+            onDraftChange(next)
+        },
+        modifier = modifier
+            .onFocusChanged { focusState ->
+                // 键盘弹起后把输入框滚到可见区（嵌套滚动也会向上传递，列表跟着让位）
+                if (focusState.isFocused) {
+                    onFocused()
+                }
+            },
+        placeholder = {
+            Text(
+                placeholder,
+                color = AgentGridColors.Muted,
+                fontSize = 12.sp,
+            )
+        },
+        minLines = minLines,
+        maxLines = maxLines,
+    )
 }
 
 @Composable
@@ -1498,7 +1599,7 @@ private fun DetailLine(label: String, value: String, color: Color) {
 }
 
 @Composable
-private fun ToolSection(output: String, compact: Boolean) {
+private fun ToolSection(output: String) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -1517,11 +1618,8 @@ private fun ToolSection(output: String, compact: Boolean) {
                 .background(AgentGridColors.SurfaceRaised.copy(alpha = 0.6f))
                 .padding(8.dp),
         ) {
-            Column(
-                modifier = Modifier
-                    .heightIn(max = if (compact) 200.dp else 150.dp)
-                    .verticalScroll(rememberScrollState()),
-            ) {
+            // 高度不封顶：跟随 TaskDetails 自适应展开，滚动交给外层 LazyColumn。
+            Column {
                 Text(
                     output,
                     color = AgentGridColors.Text.copy(alpha = 0.9f),
