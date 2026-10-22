@@ -2,6 +2,7 @@ package com.agentgrid.mobile.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -13,9 +14,15 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.DisableSelection
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawBehind
@@ -33,6 +40,7 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.launch
 
 sealed interface MarkdownBlock {
     data class Heading(val level: Int, val text: String) : MarkdownBlock
@@ -538,27 +546,96 @@ fun MarkdownView(
 ) {
     val blocks = remember(markdown) { MarkdownParser.parse(markdown) }
 
-    Column(
+    // 文字块走渲染后选择复制（SelectionContainer）；代码/表格/mermaid 用 DisableSelection
+    // 退出选区——它们右上角有 [复制] 拷整块源码，选区进去只会拷出碎文本。
+    SelectionContainer(
         modifier = modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        blocks.forEach { block ->
-            when (block) {
-                is MarkdownBlock.Heading -> HeadingBlockView(block)
-                is MarkdownBlock.Paragraph -> ParagraphBlockView(block)
-                is MarkdownBlock.CodeBlock -> {
-                    if (block.language.equals("mermaid", ignoreCase = true)) {
-                        MermaidBlockView(source = block.content)
-                    } else {
-                        CodeBlockView(block)
+        Column(
+            modifier = Modifier.fillMaxWidth(),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            blocks.forEach { block ->
+                when (block) {
+                    is MarkdownBlock.Heading -> HeadingBlockView(block)
+                    is MarkdownBlock.Paragraph -> ParagraphBlockView(block)
+                    is MarkdownBlock.CodeBlock -> {
+                        DisableSelection {
+                            if (block.language.equals("mermaid", ignoreCase = true)) {
+                                MermaidBlockView(source = block.content)
+                            } else {
+                                CodeBlockView(block)
+                            }
+                        }
                     }
+                    is MarkdownBlock.Table -> DisableSelection { TableBlockView(block) }
+                    is MarkdownBlock.BulletList -> BulletListView(block)
+                    is MarkdownBlock.OrderedList -> OrderedListView(block)
+                    is MarkdownBlock.Blockquote -> BlockquoteView(block)
+                    is MarkdownBlock.HorizontalRule -> HorizontalRuleView()
                 }
-                is MarkdownBlock.Table -> TableBlockView(block)
-                is MarkdownBlock.BulletList -> BulletListView(block)
-                is MarkdownBlock.OrderedList -> OrderedListView(block)
-                is MarkdownBlock.Blockquote -> BlockquoteView(block)
-                is MarkdownBlock.HorizontalRule -> HorizontalRuleView()
             }
+        }
+    }
+}
+
+/**
+ * 三块（代码/表格/mermaid）的整块源码还原 + 右上角 [复制]。
+ * 点一下把整块 markdown 源码拷进剪贴板，按钮变"已复制" 1.2 秒回弹。
+ */
+@Composable
+internal fun MarkdownCopyButton(source: String) {
+    val clipboard = androidx.compose.ui.platform.LocalClipboard.current
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    var copied by remember(source) { mutableStateOf(false) }
+    if (copied) {
+        LaunchedEffect(source) {
+            kotlinx.coroutines.delay(1200)
+            copied = false
+        }
+    }
+    Text(
+        text = if (copied) "已复制" else "[ 复制 ]",
+        color = if (copied) AgentGridColors.Green else AgentGridColors.Cyan,
+        fontSize = 9.sp,
+        fontWeight = FontWeight.Bold,
+        modifier = Modifier.clickable {
+            scope.launch {
+                val data = android.content.ClipData.newPlainText("markdown", source)
+                clipboard.setClipEntry(androidx.compose.ui.platform.ClipEntry(data))
+                copied = true
+            }
+        },
+    )
+}
+
+/** 代码块还原成 ```lang\n...\n``` 全文。 */
+internal fun MarkdownBlock.CodeBlock.toSource(): String {
+    val lang = language.ifBlank { "" }
+    return "```$lang\n$content\n```"
+}
+
+/** 表格还原成 | h | 头 + |---| 分隔 + 数据行全文，对齐按原 alignments 写回。 */
+internal fun MarkdownBlock.Table.toSource(): String {
+    val columnCount = maxOf(headers.size, rows.maxOfOrNull { it.size } ?: 0)
+    if (columnCount == 0) return ""
+    fun rowToSource(cells: List<String>): String =
+        (0 until columnCount).joinToString(" | ", prefix = "| ", postfix = " | ") { cells.getOrNull(it)?.trim() ?: "" }
+    fun separatorToSource(): String =
+        (0 until columnCount).joinToString(" | ", prefix = "| ", postfix = " | ") { i ->
+            when (alignments.getOrNull(i) ?: TableAlignment.LEFT) {
+                TableAlignment.LEFT -> "---"
+                TableAlignment.CENTER -> ":---:"
+                TableAlignment.RIGHT -> "---:"
+            }
+        }
+    return buildString {
+        append(rowToSource(headers))
+        append('\n')
+        append(separatorToSource())
+        rows.forEach { row ->
+            append('\n')
+            append(rowToSource(row))
         }
     }
 }
@@ -591,7 +668,10 @@ private fun ParagraphBlockView(block: MarkdownBlock.Paragraph) {
 }
 
 @Composable
-internal fun CodeBlockView(block: MarkdownBlock.CodeBlock) {
+internal fun CodeBlockView(
+    block: MarkdownBlock.CodeBlock,
+    showCopyButton: Boolean = true,
+) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -599,14 +679,22 @@ internal fun CodeBlockView(block: MarkdownBlock.CodeBlock) {
             .background(AgentGridColors.Background)
             .padding(8.dp),
     ) {
-        if (block.language.isNotBlank()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 4.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
             Text(
-                text = block.language.uppercase(),
+                text = block.language.uppercase().ifBlank { "CODE" },
                 color = AgentGridColors.Muted,
                 fontSize = 8.sp,
                 fontWeight = FontWeight.Bold,
-                modifier = Modifier.padding(bottom = 4.dp),
             )
+            if (showCopyButton) {
+                MarkdownCopyButton(source = block.toSource())
+            }
         }
         Box(
             modifier = Modifier
@@ -642,6 +730,23 @@ private fun TableBlockView(block: MarkdownBlock.Table) {
     }
 
     val totalWidth = colWidths.fold(0.dp) { sum, width -> sum + width }
+
+    // 表格上方一条小 header：左 TABLE 标签，右 [复制] 拷整张表源码（跟代码块语言行对齐）。
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 4.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = "TABLE",
+            color = AgentGridColors.Muted,
+            fontSize = 8.sp,
+            fontWeight = FontWeight.Bold,
+        )
+        MarkdownCopyButton(source = block.toSource())
+    }
 
     // 边框和宽度都必须落在 Column 自己身上，不能挂在外层滚动容器上。
     // `horizontalScroll` 会把内容测得的宽度约束设成**无穷大**，而无穷大约束下 `fillMaxWidth()`

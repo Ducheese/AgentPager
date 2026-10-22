@@ -118,13 +118,19 @@ fun MermaidBlockView(
                     fontSize = 8.sp,
                     fontWeight = FontWeight.Bold,
                 )
-                Text(
-                    text = "[ 全屏 ]",
-                    color = AgentGridColors.Cyan,
-                    fontSize = 9.sp,
-                    fontWeight = FontWeight.Bold,
-                    modifier = Modifier.clickable { fullscreen = true },
-                )
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    MarkdownCopyButton(source = "```mermaid\n$source\n```")
+                    Text(
+                        text = "[ 全屏 ]",
+                        color = AgentGridColors.Cyan,
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.clickable { fullscreen = true },
+                    )
+                }
             }
 
             BoxWithConstraints(
