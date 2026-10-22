@@ -3865,12 +3865,13 @@ public static class OpenCodeEventReducer
 
     private static string SubagentName(string? agent, string? title)
     {
-        if (agent is not null) return char.ToUpperInvariant(agent[0]) + agent[1..];
+        // 有标题显示标题（子会话标题去 " (@type subagent)" 尾），没有才回落 subagent type。
         if (title is not null)
         {
             var index = title.IndexOf(" (@", StringComparison.Ordinal);
             return Clamp(index > 0 ? title[..index] : title, 40);
         }
+        if (agent is not null) return char.ToUpperInvariant(agent[0]) + agent[1..];
         return "opencode 子代理";
     }
 

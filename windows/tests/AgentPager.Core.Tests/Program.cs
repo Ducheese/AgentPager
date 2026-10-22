@@ -338,7 +338,7 @@ Check(!Task().PromptQueued, "normal prompt not queued");
 // 12d. 子代理映射（subagent 事件）
 catalog.Accept(H("subagent", new { sessionID = "ses_1", id = "ses_sub", phase = "started", agent = "explore", title = "列出 docs 目录文件 (@explore subagent)" }));
 var subagent = Task().Subagents.FirstOrDefault(s => s.Id == "ses_sub");
-Check(subagent is not null && subagent.DisplayName == "Explore" && subagent.Path == "/explore" && subagent.Lifecycle == AgentLifecycle.Running, $"subagent started (got '{subagent?.DisplayName}')");
+Check(subagent is not null && subagent.DisplayName == "列出 docs 目录文件" && subagent.Path == "/explore" && subagent.Lifecycle == AgentLifecycle.Running, $"subagent started (got '{subagent?.DisplayName}')");
 Check(Task().Activity == AgentActivity.Delegating, "parent delegating while subagent runs");
 catalog.Accept(H("subagent", new { sessionID = "ses_1", id = "ses_sub", phase = "tool", tool = "read", step = "read src/app.ts" }));
 Check(Task().Subagents.First(s => s.Id == "ses_sub").Activity == AgentActivity.Reading, "subagent tool activity");
