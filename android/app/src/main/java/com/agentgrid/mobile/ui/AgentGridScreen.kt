@@ -1725,8 +1725,10 @@ private fun PixelButton(
 }
 
 /**
- * 附图卡片：64dp 方块，左上「图N」角标、右上 [x] 删除、底部 [+] 插入占位符。
- * 上传中盖半透明遮罩+文字进度，失败标红点按重试，READY 显示正常。
+ * 附图卡片：64dp 缩略图 + 底部一排小按钮（状态归状态、动作归动作，不共用一个坑）。
+ * - 缩略图只展示；左上「图N」角标；删除只走底部操作条，右上不放 ×（和角标挤、和底部重复）。
+ * - READY：[插入]（往输入框塞占位符）[删除]；上传中：状态文字不可点；失败：[重试] [删除]。
+ * - 输入框左边那个 [+] 负责选图，卡片里不再出现 [+] 字样，两处打架。
  */
 @Composable
 private fun AttachmentCard(
@@ -1738,96 +1740,124 @@ private fun AttachmentCard(
     onRetry: () -> Unit,
 ) {
     val label = "图${index + 1}"
-    Box(
-        modifier = Modifier
-            .size(64.dp)
-            .background(AgentGridColors.SurfaceRaised)
-            .border(
-                1.dp,
-                when (attachment.state) {
-                    com.agentgrid.mobile.attachments.AttachmentState.READY -> AgentGridColors.Cyan
-                    com.agentgrid.mobile.attachments.AttachmentState.FAILED -> AgentGridColors.Red
-                    else -> AgentGridColors.Divider
-                },
-            )
-            .clickable(
-                enabled = enabled &&
-                    attachment.state != com.agentgrid.mobile.attachments.AttachmentState.COMPRESSING &&
-                    attachment.state != com.agentgrid.mobile.attachments.AttachmentState.UPLOADING,
-            ) {
-                if (attachment.state == com.agentgrid.mobile.attachments.AttachmentState.FAILED) onRetry()
-                else onInsert()
-            },
-        contentAlignment = Alignment.Center,
+    val uploading = attachment.state == com.agentgrid.mobile.attachments.AttachmentState.COMPRESSING ||
+        attachment.state == com.agentgrid.mobile.attachments.AttachmentState.UPLOADING
+    Column(
+        modifier = Modifier.width(64.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(2.dp),
     ) {
-        // 真缩略图：压缩时顺手生成 192px JPEG，READY 后大图字节释放、缩略图留着。
-        val thumbBitmap = androidx.compose.runtime.remember(attachment.clientId, attachment.thumb) {
-            attachment.thumb?.let { bytes ->
-                android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        Box(
+            modifier = Modifier
+                .size(64.dp)
+                .background(AgentGridColors.SurfaceRaised)
+                .border(
+                    1.dp,
+                    when (attachment.state) {
+                        com.agentgrid.mobile.attachments.AttachmentState.READY -> AgentGridColors.Cyan
+                        com.agentgrid.mobile.attachments.AttachmentState.FAILED -> AgentGridColors.Red
+                        else -> AgentGridColors.Divider
+                    },
+                ),
+            contentAlignment = Alignment.Center,
+        ) {
+            // 真缩略图：压缩时顺手生成 192px JPEG，READY 后大图字节释放、缩略图留着。
+            val thumbBitmap = androidx.compose.runtime.remember(attachment.clientId, attachment.thumb) {
+                attachment.thumb?.let { bytes ->
+                    android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                }
             }
-        }
-        if (thumbBitmap != null) {
-            androidx.compose.foundation.Image(
-                bitmap = thumbBitmap.asImageBitmap(),
-                contentDescription = label,
-                modifier = Modifier.fillMaxSize(),
-                contentScale = androidx.compose.ui.layout.ContentScale.Crop,
-            )
-            // 压一层淡黑，保证角标和状态字在亮图上可读。
-            Box(
-                Modifier
-                    .fillMaxSize()
-                    .background(androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.25f)),
-            )
-        } else {
+            if (thumbBitmap != null) {
+                androidx.compose.foundation.Image(
+                    bitmap = thumbBitmap.asImageBitmap(),
+                    contentDescription = label,
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                )
+                // 压一层淡黑，保证角标和状态字在亮图上可读。
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .background(androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.25f)),
+                )
+            } else {
+                Text(
+                    label,
+                    color = AgentGridColors.Text,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+            // 左上序号角标（删除只走底部操作条，右上不再放 ×）。
             Text(
                 label,
-                color = AgentGridColors.Text,
-                fontSize = 13.sp,
+                color = AgentGridColors.Background,
+                fontSize = 8.sp,
                 fontWeight = FontWeight.Bold,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .background(AgentGridColors.Cyan)
+                    .padding(horizontal = 4.dp, vertical = 1.dp),
             )
         }
-        // 左上序号角标
-        Text(
-            label,
-            color = AgentGridColors.Background,
-            fontSize = 8.sp,
-            fontWeight = FontWeight.Bold,
-            modifier = Modifier
-                .align(Alignment.TopStart)
-                .background(AgentGridColors.Cyan)
-                .padding(horizontal = 4.dp, vertical = 1.dp),
-        )
-        // 右上删除
-        Text(
-            "×",
-            color = AgentGridColors.Red,
-            fontSize = 13.sp,
-            fontWeight = FontWeight.Bold,
-            modifier = Modifier
-                .align(Alignment.TopEnd)
-                .clickable(enabled = enabled) { onRemove() }
-                .padding(horizontal = 5.dp, vertical = 1.dp),
-        )
-        // 底部插入符 / 状态
-        val bottomText = when (attachment.state) {
-            com.agentgrid.mobile.attachments.AttachmentState.COMPRESSING -> "压缩中…"
-            com.agentgrid.mobile.attachments.AttachmentState.UPLOADING -> "上传中…"
-            com.agentgrid.mobile.attachments.AttachmentState.FAILED -> "失败点重试"
-            com.agentgrid.mobile.attachments.AttachmentState.READY -> "[+]插入"
+        if (uploading) {
+            val statusText = if (attachment.state == com.agentgrid.mobile.attachments.AttachmentState.COMPRESSING) {
+                "压缩中…"
+            } else {
+                "上传中…"
+            }
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(statusText, color = AgentGridColors.Muted, fontSize = 8.sp)
+                // 上传中唯一的删除入口（右上 × 已删）：点取消。
+                Text(
+                    "取消",
+                    color = if (enabled) AgentGridColors.Muted else AgentGridColors.Divider,
+                    fontSize = 8.sp,
+                    modifier = Modifier
+                        .clickable(enabled = enabled) { onRemove() }
+                        .padding(horizontal = 4.dp, vertical = 2.dp),
+                )
+            }
+        } else {
+            // 一排小按钮：状态文字不再兼任动作入口。
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                if (attachment.state == com.agentgrid.mobile.attachments.AttachmentState.FAILED) {
+                    Text(
+                        "重试",
+                        color = if (enabled) AgentGridColors.Green else AgentGridColors.Muted,
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier
+                            .clickable(enabled = enabled) { onRetry() }
+                            .padding(horizontal = 4.dp, vertical = 2.dp),
+                    )
+                } else {
+                    Text(
+                        "插入",
+                        color = if (enabled) AgentGridColors.Green else AgentGridColors.Muted,
+                        fontSize = 9.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier
+                            .clickable(enabled = enabled) { onInsert() }
+                            .padding(horizontal = 4.dp, vertical = 2.dp),
+                    )
+                }
+                Text(
+                    "删除",
+                    color = if (enabled) AgentGridColors.Muted else AgentGridColors.Divider,
+                    fontSize = 9.sp,
+                    modifier = Modifier
+                        .clickable(enabled = enabled) { onRemove() }
+                        .padding(horizontal = 4.dp, vertical = 2.dp),
+                )
+            }
         }
-        Text(
-            bottomText,
-            color = when (attachment.state) {
-                com.agentgrid.mobile.attachments.AttachmentState.FAILED -> AgentGridColors.Red
-                com.agentgrid.mobile.attachments.AttachmentState.READY -> AgentGridColors.Green
-                else -> AgentGridColors.Muted
-            },
-            fontSize = 8.sp,
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(bottom = 3.dp),
-        )
     }
 }
 
