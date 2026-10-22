@@ -1141,6 +1141,16 @@ private fun TaskDetails(
     speechFailure: ReplySpeech.SpeechFailure? = null,
 ) {
     var answer by remember(task.id, pending?.summary) { mutableStateOf("") }
+    // question 光标本地持有（跟 prompt 的 draftField 同款）：直接把 answer 拼成
+    // TextFieldValue(answer, TextRange(answer.length)) 传进去，每次重组都把光标拽回末尾，
+    // 中间点选改字下一帧就跳回末尾。文本仍由 answer 托管，外部变化（目前只有初始化 ""）才回灌。
+    var answerField by remember(task.id, pending?.summary) { mutableStateOf(TextFieldValue("")) }
+    LaunchedEffect(answer) {
+        if (answer != answerField.text) {
+            val cursor = answerField.selection.end.coerceIn(0, answer.length)
+            answerField = TextFieldValue(answer, TextRange(cursor))
+        }
+    }
     val answerFeedbackActions = remember {
         setOf(ControlAction.APPROVE, ControlAction.DENY, ControlAction.ANSWER)
     }
@@ -1277,12 +1287,16 @@ private fun TaskDetails(
                             }
                         }
                         PromptInputField(
-                            draftField = TextFieldValue(answer, TextRange(answer.length)),
-                            onDraftChange = { answer = it.text },
+                            draftField = answerField,
+                            onDraftChange = {
+                                answerField = it
+                                answer = it.text
+                            },
                             placeholder = "输入回答...",
                             minLines = 3,
                             maxLines = if (compact) 8 else 5,
                             modifier = Modifier.fillMaxWidth(),
+                            onFocused = { answerScope.launch { answerBringIntoViewRequester.bringIntoView() } },
                             onFollowScroll = { answerScope.launch { answerBringIntoViewRequester.bringIntoView() } },
                         )
                         PixelButton(
@@ -1306,12 +1320,16 @@ private fun TaskDetails(
                             }
                         }
                         PromptInputField(
-                            draftField = TextFieldValue(answer, TextRange(answer.length)),
-                            onDraftChange = { answer = it.text },
+                            draftField = answerField,
+                            onDraftChange = {
+                                answerField = it
+                                answer = it.text
+                            },
                             placeholder = "输入回答...",
                             minLines = 3,
                             maxLines = if (compact) 8 else 5,
                             modifier = Modifier.fillMaxWidth(),
+                            onFocused = { answerScope.launch { answerBringIntoViewRequester.bringIntoView() } },
                             onFollowScroll = { answerScope.launch { answerBringIntoViewRequester.bringIntoView() } },
                         )
                         PixelButton(
