@@ -212,7 +212,8 @@ public sealed class CommandCodeUsageLoader
     }
 
     private static DateTimeOffset? ResetAt(JsonElement window) =>
-        window.TryGetProperty("resetAt", out var r) && r.ValueKind == JsonValueKind.Number
+        // resetAt=0 是 API 对"无重置时间"的表示（没用过的新号），不是 1970 年。
+        window.TryGetProperty("resetAt", out var r) && r.ValueKind == JsonValueKind.Number && r.GetInt64() > 0
             ? DateTimeOffset.FromUnixTimeMilliseconds(r.GetInt64())
             : null;
 

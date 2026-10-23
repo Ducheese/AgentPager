@@ -53,6 +53,7 @@ public sealed class BridgeRuntime : IAsyncDisposable
     private readonly CodexUsageLoader _usageLoader = new();
     private readonly AgyUsageLoader _agyUsageLoader = new();
     private readonly CommandCodeUsageLoader _commandCodeUsageLoader = new();
+    private readonly CmdcAccountsLoader _cmdcAccountsLoader = new();
     private readonly CodexHookConfiguration _hookConfiguration = new();
     private readonly ClaudeHookConfiguration _claudeHookConfiguration = new();
     private readonly OpenCodePluginConfiguration _openCodePluginConfiguration = new();
@@ -88,6 +89,7 @@ public sealed class BridgeRuntime : IAsyncDisposable
         // 两家额度拉取都可能静默返回 null——没有日志就只能靠猜（实测踩过）。
         _agyUsageLoader.Log = _log.Write;
         _commandCodeUsageLoader.Log = _log.Write;
+        _cmdcAccountsLoader.Log = _log.Write;
         _pairingSecret = _secretStore.LoadOrCreate();
         _catalog = new(_persistence.Load());
         _ngrokService = new(
@@ -593,16 +595,21 @@ public sealed class BridgeRuntime : IAsyncDisposable
                 var codexTask = Task.Run(() => _usageLoader.Load(), cancellationToken);
                 var agyTask = Task.Run(() => _agyUsageLoader.Load(), cancellationToken);
                 var commandCodeTask = Task.Run(() => _commandCodeUsageLoader.Load(), cancellationToken);
+                var cmdcAccountsTask = Task.Run(() => _cmdcAccountsLoader.Load(null, cancellationToken), cancellationToken);
 
-                await Task.WhenAll(codexTask, agyTask, commandCodeTask);
+                await Task.WhenAll(codexTask, agyTask, commandCodeTask, cmdcAccountsTask);
 
                 var codex = await codexTask;
                 var agy = await agyTask;
                 var commandCode = await commandCodeTask;
+                var cmdcAccounts = await cmdcAccountsTask;
 
                 var list = new List<UsageSnapshot>();
                 if (agy is not null) list.Add(agy);
                 if (commandCode is not null) list.Add(commandCode);
+                // 多号：每个号一个快照（PlanType 照旧 "Command Code"，LimitID 是邮箱），
+                // App 侧 CMDC 全部面板下按号排。
+                list.AddRange(cmdcAccounts);
                 if (codex is not null) list.Add(codex);
 
                 var primary = agy ?? commandCode ?? codex;

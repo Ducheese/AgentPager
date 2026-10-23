@@ -42,8 +42,11 @@ import androidx.compose.ui.graphics.RectangleShape
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -68,7 +71,14 @@ internal fun UsageDashboard(
 ) {
     val availableUsages = remember(usage, usages) {
         val list = usages.ifEmpty { listOfNotNull(usage) }
-        list.distinctBy { providerKey(it) }
+        list
+            // 桌面号只活在"全部"列表里，不进提供商切换：它们的 LimitID 是邮箱（含 @），
+            // 不是套餐名。放进来会冒充主号（distinctBy 按 planType 压成一个 CMDC 代表）。
+            .filterNot {
+                providerName(it) == "Command Code" &&
+                    it.limitID?.contains('@') == true
+            }
+            .distinctBy { providerKey(it) }
     }
     // 选择按提供商身份记住，而不是按列表实例：额度每 10 分钟刷新会重建 list，
     // 旧写法 remember(availableUsages) 会把用户踢回第一个提供商。
@@ -79,6 +89,21 @@ internal fun UsageDashboard(
     val activeUsage = availableUsages.getOrNull(selectedProviderIndex) ?: usage
     var selectedRange by remember { mutableStateOf(UsageRange.SEVEN_DAYS) }
     val allPoints = activeUsage?.dailyUsage.orEmpty()
+    // 分组选择上提到这里：compact/wide 是两个 QuotaPanel 实例，旋转跨阈值会重建，
+    // 状态放里面就丢（竖屏切"全部"再转横屏被踢回"当前"）。放外面，旋转不丢。
+    var selectedGroup by remember { mutableStateOf(0) } // AGY: 0 = Gemini, 1 = 3P
+    var selectedCmdcView by remember { mutableStateOf(0) } // CMDC: 0 = 当前，1 = 全部
+    // 多账号列表只在 CMDC 激活时有值：过滤出子账号（LimitID 是邮箱，含 @），
+    // 提升到外层避免两处 QuotaPanel 重复计算。
+    val cmdcAccounts = remember(activeUsage, usages) {
+        if (providerName(activeUsage) == "Command Code") {
+            usages
+                .filter { providerName(it) == "Command Code" && it.limitID?.contains('@') == true }
+                .distinctBy { it.limitID.orEmpty() }
+        } else {
+            emptyList()
+        }
+    }
 
     BoxWithConstraints(
         modifier = modifier.fillMaxWidth(),
@@ -106,6 +131,11 @@ internal fun UsageDashboard(
                     onSelectUsageIndex = { index ->
                         availableUsages.getOrNull(index)?.let { selectedProviderKey = providerKey(it) }
                     },
+                    selectedGroup = selectedGroup,
+                    onSelectGroup = { selectedGroup = it },
+                    selectedCmdcView = selectedCmdcView,
+                    onSelectCmdcView = { selectedCmdcView = it },
+                    cmdcAccounts = cmdcAccounts,
                     connected = connected,
                     modifier = Modifier.fillMaxWidth(),
                     compact = true,
@@ -145,6 +175,11 @@ internal fun UsageDashboard(
                     onSelectUsageIndex = { index ->
                         availableUsages.getOrNull(index)?.let { selectedProviderKey = providerKey(it) }
                     },
+                    selectedGroup = selectedGroup,
+                    onSelectGroup = { selectedGroup = it },
+                    selectedCmdcView = selectedCmdcView,
+                    onSelectCmdcView = { selectedCmdcView = it },
+                    cmdcAccounts = cmdcAccounts,
                     connected = connected,
                     modifier = Modifier
                         .width(quotaWidth)
@@ -180,17 +215,26 @@ private fun QuotaPanel(
     availableUsages: List<UsageSnapshot>,
     selectedUsageIndex: Int,
     onSelectUsageIndex: (Int) -> Unit,
+    selectedGroup: Int,
+    onSelectGroup: (Int) -> Unit,
+    selectedCmdcView: Int,
+    onSelectCmdcView: (Int) -> Unit,
+    cmdcAccounts: List<UsageSnapshot>,
     connected: Boolean,
     modifier: Modifier = Modifier,
     compact: Boolean = false,
 ) {
     val isAgy = usage?.planType?.contains("Antigravity", ignoreCase = true) == true
+    val isCmdc = usage?.planType?.contains("Command Code", ignoreCase = true) == true
     val windows = usage?.windows.orEmpty()
     val hasThreeP = windows.any { it.key.startsWith("3p") }
-    // 分组选择同样不能被额度刷新重置；3P 消失时回到 Gemini，回来不自动跳回 3P
-    var selectedGroup by remember { mutableStateOf(0) } // 0 = Gemini, 1 = 3P
-    LaunchedEffect(hasThreeP) {
-        if (!hasThreeP) selectedGroup = 0
+    // 自动收回监听：3P 没了回 GEMINI，单/零 CMDC 号时回"当前"
+    // 注意：跨刷新的状态保持靠 remember 天然完成，这两个 effect 只管"收回"，不管"保持"。
+    LaunchedEffect(isAgy, hasThreeP) {
+        if (isAgy && !hasThreeP) onSelectGroup(0)
+    }
+    LaunchedEffect(isCmdc, cmdcAccounts.size) {
+        if (isCmdc && cmdcAccounts.isEmpty()) onSelectCmdcView(0)
     }
 
     // 画条的两个窗口：先按 key 取（agy 的 primary/secondary），取不到就退到"前两个要画条的窗口"——
@@ -295,25 +339,50 @@ private fun QuotaPanel(
                     )
                     if (hasThreeP) {
                         GroupSwitcher(
+                            tabs = listOf("GEMINI", "3P 模型"),
                             selectedGroup = selectedGroup,
-                            onSelectGroup = { selectedGroup = it },
+                            onSelectGroup = onSelectGroup,
+                        )
+                    }
+                    if (isCmdc && cmdcAccounts.isNotEmpty()) {
+                        GroupSwitcher(
+                            tabs = listOf("当前", "全部"),
+                            selectedGroup = selectedCmdcView,
+                            onSelectGroup = onSelectCmdcView,
                         )
                     }
                 }
             }
         }
 
-        PrimaryQuota(window = primary)
+        val showCmdcAll = isCmdc && selectedCmdcView == 1 && cmdcAccounts.isNotEmpty()
+        if (!showCmdcAll) {
+            PrimaryQuota(window = primary)
 
-        SecondaryQuota(window = secondary)
+            SecondaryQuota(window = secondary)
 
-        noteWindow?.detail?.let { detail ->
-            Text(
-                "${noteWindow.label} · $detail",
-                color = AgentGridColors.Muted,
-                fontSize = 10.sp,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
+            noteWindow?.detail?.let { detail ->
+                Text(
+                    "${noteWindow.label} · $detail",
+                    color = AgentGridColors.Muted,
+                    fontSize = 10.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        } else {
+            // 全部：多号从上到下，一行一号（邮箱 + 周% · MM-dd · 余额月重置），纯文字不画条。
+            // 横屏定高 310dp 下 5 行放不下，内滚；竖屏外层已有滚动，不套。
+            CmdcAccountsPanel(
+                accounts = cmdcAccounts,
+                modifier = if (!compact) {
+                    Modifier
+                        .padding(top = 10.dp, bottom = 6.dp)
+                        .weight(1f, fill = false)
+                        .verticalScroll(rememberScrollState())
+                } else {
+                    Modifier
+                },
             )
         }
 
@@ -341,6 +410,106 @@ private fun providerLabel(usage: UsageSnapshot?): String = when (providerName(us
     "Antigravity" -> "AGY"
     "Command Code" -> "CMDC"
     else -> "CODEX"
+}
+
+/**
+ * CMDC 全部面板：多号卡片式双行展示（方案 A）：
+ * 第 1 行：账号前缀（高亮加粗）+ 域名（次要小字） | 周用量剩余（状态色加粗）
+ * 第 2 行：周重置日期 | 月度余额及重置日
+ * 紧凑微型卡片，彻底根除横屏单行文本截断问题。
+ */
+@Composable
+private fun CmdcAccountsPanel(
+    accounts: List<UsageSnapshot>,
+    modifier: Modifier = Modifier,
+) {
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        accounts.forEach { account ->
+            val weekly = account.windows.firstOrNull { it.key == "cc-weekly" }
+            val monthly = account.windows.firstOrNull { it.key == "cc-monthly" }
+            val remaining = weekly?.remainingPercentage?.roundToInt()?.coerceIn(0, 100)
+            val badgeColor = quotaColor(remaining)
+
+            val email = account.limitID.orEmpty()
+            val user = email.substringBefore("@")
+            val domain = if (email.contains("@")) "@" + email.substringAfter("@") else ""
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(AgentGridColors.SurfaceRaised)
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                verticalArrangement = Arrangement.spacedBy(3.dp),
+            ) {
+                // 第 1 行：账号名（左）+ 周用量剩余（右）
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = buildAnnotatedString {
+                            withStyle(
+                                SpanStyle(
+                                    color = AgentGridColors.Text,
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 11.sp,
+                                ),
+                            ) {
+                                append(user)
+                            }
+                            if (domain.isNotEmpty()) {
+                                withStyle(
+                                    SpanStyle(
+                                        color = AgentGridColors.Dimmed,
+                                        fontSize = 9.sp,
+                                    ),
+                                ) {
+                                    append(domain)
+                                }
+                            }
+                        },
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false),
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = remaining?.let { "$it%" } ?: "--%",
+                        color = badgeColor,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                    )
+                }
+
+                // 第 2 行：周重置（左）+ 月度余额/重置（右）
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = "周重置 ${UsagePresentation.shortDate(weekly?.resetsAt)}",
+                        color = AgentGridColors.Dimmed,
+                        fontSize = 9.sp,
+                        maxLines = 1,
+                    )
+                    if (monthly?.detail != null) {
+                        Text(
+                            text = monthly.detail,
+                            color = AgentGridColors.Muted,
+                            fontSize = 9.sp,
+                            maxLines = 1,
+                        )
+                    }
+                }
+            }
+        }
+    }
 }
 
 @Composable
@@ -379,6 +548,7 @@ private fun ProviderSwitcher(
 
 @Composable
 private fun GroupSwitcher(
+    tabs: List<String>,
     selectedGroup: Int,
     onSelectGroup: (Int) -> Unit,
 ) {
@@ -389,8 +559,9 @@ private fun GroupSwitcher(
             .padding(1.dp),
         horizontalArrangement = Arrangement.spacedBy(2.dp),
     ) {
-        GroupTab("GEMINI", selectedGroup == 0) { onSelectGroup(0) }
-        GroupTab("3P 模型", selectedGroup == 1) { onSelectGroup(1) }
+        tabs.forEachIndexed { index, label ->
+            GroupTab(label, selectedGroup == index) { onSelectGroup(index) }
+        }
     }
 }
 

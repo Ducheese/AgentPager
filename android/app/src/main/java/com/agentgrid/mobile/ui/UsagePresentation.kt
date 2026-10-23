@@ -87,6 +87,17 @@ internal object UsagePresentation {
         ) + " 重置"
     }
 
+    /**
+     * 短日期：MM-dd，如 "11-10"。周重置日用这个（不要 HH:mm）。
+     */
+    fun shortDate(resetsAt: Long?): String {
+        resetsAt ?: return "--"
+        val formatter = DateTimeFormatter.ofPattern("MM-dd")
+        return formatter.format(
+            Instant.ofEpochMilli(resetsAt).atZone(ZoneId.systemDefault()),
+        )
+    }
+
     fun freshnessText(
         capturedAt: Long?,
         now: Long = System.currentTimeMillis(),

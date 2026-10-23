@@ -3157,6 +3157,51 @@ Check(CommandCodeUsageLoader.ParseWindows("{}", null, DateTimeOffset.Now).Count 
 Check(CommandCodeUsageLoader.ParseDaily(null, DateTimeOffset.Now).Count == 0, "cmdc: missing summary yields no daily points");
 Check(CommandCodeUsageLoader.SubscriptionPeriodEnd("not json") is null, "cmdc: malformed subscription json is tolerated");
 
+// 多 cmdc 号：ccgo.txt 解析 + 逐号快照（stub HTTP，不碰真 API）。
+CmdcAccountsLoader.AccountsFileProviderOverride = () => """
+alordzero@hotmail.com
+
+{
+  "apiKey": "user_TESTKEY1",
+  "userId": "u1",
+  "userName": "Ducheese",
+  "keyName": "cli-1",
+  "authenticatedAt": "2026-10-10T05:55:44.569Z"
+}
+
+ducheese251@hotmail.com
+
+{
+  "apiKey": "user_TESTKEY2",
+  "userId": "u2",
+  "userName": "ducheese251-hotmail",
+  "keyName": "cli-2",
+  "authenticatedAt": "2026-10-14T19:24:35.863Z"
+}
+""";
+CmdcAccountsLoader.HttpGetOverride = (apiKey, url) =>
+    url.EndsWith("/alpha/billing/credits") ? cmdcCredits
+    : url.EndsWith("/alpha/billing/subscriptions") ? cmdcSubscriptions
+    : url.EndsWith("/alpha/usage/summary") ? cmdcSummary : null;
+var multiAccounts = CmdcAccountsLoader.ReadAccounts();
+Check(multiAccounts.Count == 2, $"cmdc-multi: two accounts parsed (got {multiAccounts.Count})");
+Check(multiAccounts[0].Email == "alordzero@hotmail.com" && multiAccounts[0].ApiKey == "user_TESTKEY1",
+    $"cmdc-multi: first account email/key (got '{multiAccounts[0].Email}')");
+Check(multiAccounts[1].Email == "ducheese251@hotmail.com", $"cmdc-multi: second account email (got '{multiAccounts[1].Email}')");
+var multiLoader = new CmdcAccountsLoader();
+var multiSnapshots = multiLoader.Load();
+Check(multiSnapshots.Count == 2, $"cmdc-multi: two snapshots (got {multiSnapshots.Count})");
+Check(multiSnapshots.All(s => s.PlanType == "Command Code"), "cmdc-multi: PlanType stays Command Code for provider grouping");
+Check(multiSnapshots[0].LimitID == "alordzero@hotmail.com" && multiSnapshots[1].LimitID == "ducheese251@hotmail.com",
+    "cmdc-multi: LimitID is the account email");
+Check(multiSnapshots.All(s => s.Windows.Count == 3), "cmdc-multi: each account has 3 windows");
+// 缓存：5 分钟内第二次 Load 不碰网络（HttpGet 全断仍返回上次好的）。
+CmdcAccountsLoader.HttpGetOverride = (apiKey, url) => null;
+var multiCached = multiLoader.Load();
+Check(multiCached.Count == 2, $"cmdc-multi-cache: stale served without network (got {multiCached.Count})");
+CmdcAccountsLoader.AccountsFileProviderOverride = null;
+CmdcAccountsLoader.HttpGetOverride = null;
+
 // ---------------------------------------------------------------------------
 // 远程 Prompt 全链路单测（OpenCode / ClaudeCode / Antigravity）
 // ---------------------------------------------------------------------------
