@@ -28,14 +28,27 @@ class SoundEngine(context: Context) {
         preferences.edit().putBoolean(SOUND_ENABLED_KEY, enabled).apply()
     }
 
+    // 震动单独开关（跟提示音解绑）：开会/静音场景只留震动，或全关。
+    val isVibrationEnabled: Boolean
+        get() = preferences.getBoolean(VIBRATION_ENABLED_KEY, true)
+
+    fun setVibrationEnabled(enabled: Boolean) {
+        preferences.edit().putBoolean(VIBRATION_ENABLED_KEY, enabled).apply()
+    }
+
     fun play(cue: ArcadeSoundCue) {
         if (!isEnabled) return
         executor.execute {
             runCatching { playCue(cue) }
                 .onFailure { Log.e(LOG_TAG, "提示音播放失败：$cue", it) }
         }
-        if (cue == ArcadeSoundCue.INPUT_REQUIRED) {
-            vibrator?.vibrate(VibrationEffect.createOneShot(70, 110))
+        // 任务完成 + 等输入（question/审批）都震；ACK（每次 running 响一声）不震，太吵。
+        if (isVibrationEnabled && (cue == ArcadeSoundCue.INPUT_REQUIRED || cue == ArcadeSoundCue.TASK_COMPLETE)) {
+            runCatching {
+                vibrator?.vibrate(VibrationEffect.createOneShot(70, 110))
+            }.onFailure {
+                Log.e(LOG_TAG, "震动失败：$cue", it)
+            }
         }
     }
 
@@ -99,6 +112,7 @@ class SoundEngine(context: Context) {
         private const val LOG_TAG = "AgentPagerSound"
         private const val PREFERENCES_NAME = "agentgrid_sound"
         private const val SOUND_ENABLED_KEY = "enabled"
+        private const val VIBRATION_ENABLED_KEY = "vibration_enabled"
 
         private val audioAttributes = AudioAttributes.Builder()
             // 终端是常亮前台界面，走媒体通道，避免被手机的通知静音模式吞掉。

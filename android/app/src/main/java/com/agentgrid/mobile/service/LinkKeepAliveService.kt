@@ -17,7 +17,9 @@ import com.agentgrid.mobile.MainActivity
 import com.agentgrid.mobile.R
 import com.agentgrid.mobile.ReplySpeech
 import com.agentgrid.mobile.ReplySpeechText
+import com.agentgrid.mobile.SoundEngine
 import com.agentgrid.mobile.TaskCompletionTracker
+import com.agentgrid.mobile.TaskSoundTracker
 import com.agentgrid.mobile.domain.AgentLifecycle
 import com.agentgrid.mobile.domain.TaskSnapshot
 import com.agentgrid.mobile.network.PhoneSession
@@ -42,7 +44,9 @@ class LinkKeepAliveService : Service() {
     private var screenReceiver: BroadcastReceiver? = null
     private var foregroundStarted = false
     private val completionTracker = TaskCompletionTracker()
+    private val soundTracker = TaskSoundTracker()
     private var lastAlertAt = 0L
+    private var sound: SoundEngine? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -55,11 +59,14 @@ class LinkKeepAliveService : Service() {
                 if (foregroundStarted) refreshNotification()
             }
         }
-        // 完成态提醒：服务全天候收快照，app 开着关着都能报
+        // 完成态提醒 + 提示音/震动：服务全天候收快照，app 开着关着都能报/响。
+        // cue 触发原来在 Compose 的 LaunchedEffect 里，切后台界面停掉就不响了——搬到这里跟通知同一帧。
         scope.launch {
             session.state.collect { state ->
                 completionTracker.collect(state.snapshot.tasks)
                     .forEach(::postCompletionNotification)
+                val engine = sound ?: SoundEngine(applicationContext).also { sound = it }
+                soundTracker.nextCue(state.snapshot.tasks, engine.isEnabled)?.let(engine::play)
             }
         }
     }

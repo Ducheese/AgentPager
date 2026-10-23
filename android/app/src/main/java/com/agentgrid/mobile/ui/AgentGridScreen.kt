@@ -97,7 +97,6 @@ import com.agentgrid.mobile.ControlFeedback
 import com.agentgrid.mobile.ControlFeedbackKind
 import com.agentgrid.mobile.ReplySpeech
 import com.agentgrid.mobile.SoundEngine
-import com.agentgrid.mobile.TaskSoundTracker
 import com.agentgrid.mobile.domain.AgentActivity
 import com.agentgrid.mobile.domain.AgentLifecycle
 import com.agentgrid.mobile.domain.AgentSource
@@ -486,16 +485,15 @@ private fun TaskTerminal(
     )
     val context = LocalContext.current
     val sound = remember(context) { SoundEngine(context.applicationContext) }
-    val soundTracker = remember { TaskSoundTracker() }
     var soundEnabled by remember(sound) { mutableStateOf(sound.isEnabled) }
+    var vibrationEnabled by remember(sound) { mutableStateOf(sound.isVibrationEnabled) }
 
     DisposableEffect(sound) {
         onDispose(sound::close)
     }
 
-    LaunchedEffect(tasks.map { Triple(it.id, it.lifecycle, it.isMuted) }) {
-        soundTracker.nextCue(tasks, soundEnabled)?.let(sound::play)
-    }
+    // 提示音/震动触发已搬到 LinkKeepAliveService（跟完成通知同一帧收快照），
+    // 后台也响。这里只留 sound 给设置面板的开关用，不再触发播放——否则前台响两遍。
 
     // 层级返回：预览 → 设置小窗 → 额度面板 → 回任务面板；都没开才交给系统（退桌面）。
     // 预览是内容态（跟额度面板同一槽），返回键关预览回到任务列表。
@@ -709,6 +707,21 @@ private fun TaskTerminal(
         }
         }
 
+        // 设置小窗开着时：点面板以外的区域自动收掉。无涟漪全屏遮罩吃掉点击，
+        // zIndex 压在面板（1f）和顶栏（2f）之下——点齿轮照常开关，不会被遮罩吞。
+        if (settingsVisible) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .zIndex(0.5f)
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = { settingsVisible = false },
+                    ),
+            )
+        }
+
         AnimatedVisibility(
             visible = settingsVisible,
             enter = fadeIn(tween(140)),
@@ -724,6 +737,11 @@ private fun TaskTerminal(
                 onSoundEnabledChange = { enabled ->
                     sound.setEnabled(enabled)
                     soundEnabled = enabled
+                },
+                vibrationEnabled = vibrationEnabled,
+                onVibrationEnabledChange = { enabled ->
+                    sound.setVibrationEnabled(enabled)
+                    vibrationEnabled = enabled
                 },
                 onSpeechRateChange = onSpeechRateChange,
                 onUnpair = onUnpair,
@@ -2060,6 +2078,8 @@ private fun SettingsPanel(
     state: AgentGridUiState,
     soundEnabled: Boolean,
     onSoundEnabledChange: (Boolean) -> Unit,
+    vibrationEnabled: Boolean,
+    onVibrationEnabledChange: (Boolean) -> Unit,
     onSpeechRateChange: (Float) -> Unit,
     onUnpair: () -> Unit,
     onToggleTerminalMode: () -> Unit,
@@ -2087,6 +2107,12 @@ private fun SettingsPanel(
             if (soundEnabled) AgentGridColors.Green else AgentGridColors.Muted,
         ) {
             onSoundEnabledChange(!soundEnabled)
+        }
+        PixelButton(
+            if (vibrationEnabled) "震动：开" else "震动：关",
+            if (vibrationEnabled) AgentGridColors.Green else AgentGridColors.Muted,
+        ) {
+            onVibrationEnabledChange(!vibrationEnabled)
         }
         PixelButton(
             "朗读语速：${formatSpeechRate(state.speechRate)}",
