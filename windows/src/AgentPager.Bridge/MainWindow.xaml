@@ -239,22 +239,23 @@
                                       SelectedValuePath="Address" SelectionChanged="NetworkCombo_SelectionChanged"/>
                             <Button Content="刷新" Margin="8,0,0,0" Click="RefreshNetworks_Click"/>
                         </DockPanel>
-                        <TextBlock Text="外网隧道 (ngrok 穿透)" Margin="0,16,0,6"/>
-                        <DockPanel Margin="0,0,0,6">
-                            <CheckBox x:Name="EnableNgrokCheckBox" Content="启用 ngrok 自动穿透"
-                                      VerticalAlignment="Center"
-                                      Checked="EnableNgrokCheckBox_Changed"
-                                      Unchecked="EnableNgrokCheckBox_Changed"/>
-                            <TextBlock x:Name="TunnelStatusText" Margin="12,0,0,0"
-                                       Foreground="{StaticResource Cyan}" VerticalAlignment="Center"/>
-                        </DockPanel>
+                        <TextBlock Text="外网隧道" Margin="0,16,0,6"/>
+                        <StackPanel Margin="0,0,0,6">
+                            <ComboBox x:Name="TunnelProviderCombo" MinWidth="220"
+                                      HorizontalAlignment="Left"
+                                      DisplayMemberPath="Label"
+                                      SelectedValuePath="Value"
+                                      SelectionChanged="TunnelProviderCombo_Changed"/>
+                            <TextBlock x:Name="TunnelStatusText" Margin="0,6,0,0"
+                                       Foreground="{StaticResource Cyan}" TextWrapping="Wrap"/>
+                        </StackPanel>
                         <TextBox x:Name="TunnelHostBox" MinWidth="285" Padding="6,4"
                                  Background="#090D12" Foreground="#C6D6E5"
                                  BorderBrush="{StaticResource Border}"
                                  TextChanged="TunnelHostBox_TextChanged"
                                  LostFocus="TunnelHostBox_Changed" KeyDown="TunnelHostBox_KeyDown"/>
                         <TextBlock Margin="0,6,0,0" Foreground="{StaticResource Muted}" TextWrapping="Wrap"
-                                   Text="启用 ngrok 时自动获取并填入域名；也可留空或手动填入其他隧道域名。手机在外网时会自动改用它。"/>
+                                   Text="内置隧道在线时显示自动获取的域名；选择“关闭”后，这里可手动填写其他隧道域名。手机在外网时会自动改用它。"/>
                         <TextBlock Text="配对文本" Margin="0,16,0,6"/>
                         <TextBox x:Name="PairingTextBox" Height="72" Padding="8"
                                  Background="#090D12" Foreground="#C6D6E5"

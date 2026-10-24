@@ -4106,6 +4106,22 @@ Check(JsonSerializer.Deserialize<PairingPayload>(PairingJson("xxx-yyy.ngrok-free
 Check(!PairingJson(null).Contains("tunnelHost"), "pairing: absent tunnel host is omitted from the payload");
 Check(JsonSerializer.Deserialize<PairingPayload>(PairingJson(null), WireJson.Options)?.TunnelHost is null, "pairing: payload without tunnel host still parses");
 
+// Cloudflared Quick Tunnel：域名只出现在 stderr 日志里（没有 ngrok 的 4040 API），
+// 解析规则必须钉住——抓错一行就会把 region*.v2.argotunnel.com 当成手机入口。
+Check(CloudflaredLog.TryParseQuickTunnelHost("2026-10-24T16:10:43Z INF |  https://nest-capture-dried-noted.trycloudflare.com  |") == "nest-capture-dried-noted.trycloudflare.com", "cloudflared: quick tunnel url extracted from log line");
+Check(CloudflaredLog.TryParseQuickTunnelHost("Your quick Tunnel has been created! Visit it at (it may take some time to be reachable): https://abc-def.trycloudflare.com") == "abc-def.trycloudflare.com", "cloudflared: url extracted from banner line");
+Check(CloudflaredLog.TryParseQuickTunnelHost("https://ABC-DEF.trycloudflare.com") == "abc-def.trycloudflare.com", "cloudflared: host is lowercased");
+Check(CloudflaredLog.TryParseQuickTunnelHost("INF Registered tunnel connection connIndex=0 location=lax13 protocol=http2") is null, "cloudflared: connection line has no host");
+Check(CloudflaredLog.TryParseQuickTunnelHost("precheck target=region1.v2.argotunnel.com status=pass") is null, "cloudflared: argotunnel target is not a public host");
+Check(CloudflaredLog.TryParseQuickTunnelHost("https://example.com") is null, "cloudflared: non-trycloudflare url is ignored");
+Check(CloudflaredLog.TryParseQuickTunnelHost(null) is null, "cloudflared: null line is ignored");
+
+// 老设置迁移：没有 TunnelProvider 字段时按 EnableNgrokTunnel 推断，不能把隧道偷偷换掉。
+Check(TunnelProviders.Resolve(null, true) == TunnelProvider.Ngrok, "tunnel settings: legacy ngrok on maps to Ngrok");
+Check(TunnelProviders.Resolve(null, false) == TunnelProvider.None, "tunnel settings: legacy ngrok off maps to None");
+Check(TunnelProviders.Resolve(TunnelProvider.Cloudflared, true) == TunnelProvider.Cloudflared, "tunnel settings: explicit provider wins over legacy flag");
+Check(TunnelProviders.Resolve(TunnelProvider.None, true) == TunnelProvider.None, "tunnel settings: explicit None wins over legacy flag");
+
 // 握手密钥比对。这是唯一挡在公网和全部快照之间的东西 —— 端口经隧道暴露后，
 // 任何拿到域名的人都能连上收走任务标题/正文/额度，所以比对规则必须有断言钉住。
 var pairingKey = new byte[] { 1, 2, 3, 4, 5, 6, 7, 8 };

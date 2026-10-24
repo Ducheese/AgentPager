@@ -8,6 +8,13 @@ using QRCoder;
 
 namespace AgentPager.Bridge;
 
+/// <summary>
+/// 外网隧道下拉项。本窗口的 ComboBox 自定义模板绑定的是 <c>Content.Label</c> /
+/// <c>SelectedItem.Label</c>（见 MainWindow.xaml 的样式的 DataTemplate），
+/// 所以必须喂对象；直接用 ComboBoxItem + 字符串 Content 会渲染成空白。
+/// </summary>
+public sealed record TunnelProviderOption(string Label, TunnelProvider Value);
+
 public partial class MainWindow : Window
 {
     private readonly BridgeRuntime _runtime;
@@ -36,6 +43,12 @@ public partial class MainWindow : Window
     {
         _runtime = runtime;
         InitializeComponent();
+        TunnelProviderCombo.ItemsSource = new[]
+        {
+            new TunnelProviderOption("关闭", TunnelProvider.None),
+            new TunnelProviderOption("ngrok", TunnelProvider.Ngrok),
+            new TunnelProviderOption("Cloudflare Quick Tunnel", TunnelProvider.Cloudflared),
+        };
         _tunnelCommitTimer.Tick += (_, _) =>
         {
             _tunnelCommitTimer.Stop();
@@ -88,22 +101,22 @@ public partial class MainWindow : Window
         NetworkCombo.ItemsSource = state.Networks;
         NetworkCombo.SelectedValue = state.SelectedAddress;
         StartupCheckBox.IsChecked = _runtime.Settings.LaunchAtLogin;
-        EnableNgrokCheckBox.IsChecked = _runtime.Settings.EnableNgrokTunnel;
+        var provider = _runtime.Settings.EffectiveTunnelProvider;
+        TunnelProviderCombo.SelectedValue = provider;
         TunnelStatusText.Text = state.TunnelStatusText;
-        TunnelStatusText.Foreground = state.TunnelStatus switch
+        TunnelStatusText.Foreground = state.TunnelState switch
         {
-            NgrokTunnelStatus.Running => TunnelBrushRunning,
-            NgrokTunnelStatus.Starting => TunnelBrushStarting,
-            NgrokTunnelStatus.Failed or NgrokTunnelStatus.NotFound => System.Windows.Media.Brushes.OrangeRed,
+            TunnelStatus.Running => TunnelBrushRunning,
+            TunnelStatus.Starting => TunnelBrushStarting,
+            TunnelStatus.Failed or TunnelStatus.NotFound => System.Windows.Media.Brushes.OrangeRed,
             _ => TunnelBrushDefault,
         };
         if (!TunnelHostBox.IsKeyboardFocusWithin)
         {
-            var hostText = _runtime.Settings.TunnelHost;
-            if (string.IsNullOrEmpty(hostText) && _runtime.Settings.EnableNgrokTunnel)
-            {
-                hostText = state.ActiveTunnelHost;
-            }
+            // 显示优先级必须和 EffectiveTunnelHost 一致：内置隧道在线时，配对文本用的是
+            // 它自动拿到的域名；此时若还显示手填的旧域名，用户会以为隧道没生效。
+            var hostText = state.ActiveTunnelHost;
+            if (string.IsNullOrEmpty(hostText)) hostText = _runtime.Settings.TunnelHost;
             TunnelHostBox.Text = hostText ?? "";
         }
         DiagnosticText.Text = state.LastError is null
@@ -142,9 +155,13 @@ public partial class MainWindow : Window
         if (!_refreshing) _runtime.SetLaunchAtLogin(StartupCheckBox.IsChecked == true);
     }
 
-    private void EnableNgrokCheckBox_Changed(object sender, RoutedEventArgs e)
+    private void TunnelProviderCombo_Changed(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
     {
-        if (!_refreshing) _runtime.SetEnableNgrokTunnel(EnableNgrokCheckBox.IsChecked == true);
+        if (_refreshing) return;
+        if (TunnelProviderCombo.SelectedValue is TunnelProvider provider)
+        {
+            _runtime.SetTunnelProvider(provider);
+        }
     }
 
     /// <summary>

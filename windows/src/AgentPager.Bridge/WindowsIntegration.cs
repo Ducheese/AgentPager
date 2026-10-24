@@ -4,6 +4,7 @@ using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Microsoft.Win32;
 using AgentPager.Core;
 
@@ -47,9 +48,21 @@ public sealed class BridgeSettings
     public string? TunnelHost { get; set; }
 
     /// <summary>
-    /// 是否开启内置 ngrok 隧道守护。默认 true（开箱即用，随桥自动静默启动与回收）。
+    /// 隧道提供方（2026-10-25）。null = 老设置文件没有这个字段，按 EnableNgrokTunnel 推断。
+    /// 用 JsonStringEnumConverter 存成 "None" / "Ngrok" / "Cloudflared"，别写成数字——
+    /// 枚举顺序以后变了，数字会让旧设置指向另一个提供方。
+    /// </summary>
+    [JsonConverter(typeof(JsonStringEnumConverter))]
+    public TunnelProvider? TunnelProvider { get; set; }
+
+    /// <summary>
+    /// 老字段，保留用于迁移与回退；新代码一律读写 <see cref="TunnelProvider"/>。
     /// </summary>
     public bool EnableNgrokTunnel { get; set; } = true;
+
+    [JsonIgnore]
+    public TunnelProvider EffectiveTunnelProvider =>
+        TunnelProviders.Resolve(TunnelProvider, EnableNgrokTunnel);
 
     public bool LaunchAtLogin { get; set; } = true;
     public bool HasCompletedFirstRun { get; set; }

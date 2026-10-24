@@ -5,26 +5,17 @@ using AgentPager.Core;
 
 namespace AgentPager.Bridge;
 
-public enum NgrokTunnelStatus
-{
-    Stopped,
-    Starting,
-    Running,
-    Failed,
-    NotFound,
-}
-
-public sealed class NgrokTunnelService : IAsyncDisposable
+public sealed class NgrokTunnelService : ITunnelService
 {
     private readonly DailyFileLog _log;
     private readonly Action<string?> _onHostAssigned;
-    private readonly Action<NgrokTunnelStatus, string?> _onStatusChanged;
+    private readonly Action<TunnelStatus, string?> _onStatusChanged;
     private readonly object _gate = new();
 
     private Process? _process;
     private CancellationTokenSource? _cts;
     private string? _activeHost;
-    private NgrokTunnelStatus _status = NgrokTunnelStatus.Stopped;
+    private TunnelStatus _status = TunnelStatus.Stopped;
     private ChildProcessJob? _job;
 
     /// <summary>我们自己起的子进程名（收尸时的保险丝，见 <see cref="ChildProcessLease"/>）。</summary>
@@ -33,13 +24,13 @@ public sealed class NgrokTunnelService : IAsyncDisposable
     /// <summary>上一次起的 ngrok PID 落在这里：强杀桥会留孤儿，下次启动先按它收尸。</summary>
     private static string ChildPidFilePath => Path.Combine(AgentPagerPaths.DataRoot, "ngrok.pid");
 
-    public NgrokTunnelStatus Status => _status;
+    public TunnelStatus Status => _status;
     public string? ActiveHost => _activeHost;
 
     public NgrokTunnelService(
         DailyFileLog log,
         Action<string?> onHostAssigned,
-        Action<NgrokTunnelStatus, string?> onStatusChanged)
+        Action<TunnelStatus, string?> onStatusChanged)
     {
         _log = log;
         _onHostAssigned = onHostAssigned;
@@ -70,21 +61,21 @@ public sealed class NgrokTunnelService : IAsyncDisposable
     {
         lock (_gate)
         {
-            if (_status is NgrokTunnelStatus.Running or NgrokTunnelStatus.Starting)
+            if (_status is TunnelStatus.Running or TunnelStatus.Starting)
                 return Task.CompletedTask;
 
-            _status = NgrokTunnelStatus.Starting;
+            _status = TunnelStatus.Starting;
         }
-        _onStatusChanged(NgrokTunnelStatus.Starting, "正在检测与启动 ngrok...");
+        _onStatusChanged(TunnelStatus.Starting, "正在检测与启动 ngrok...");
 
         var ngrokExe = FindNgrokExecutable();
         if (ngrokExe is null)
         {
             lock (_gate)
             {
-                _status = NgrokTunnelStatus.NotFound;
+                _status = TunnelStatus.NotFound;
             }
-            _onStatusChanged(NgrokTunnelStatus.NotFound, "未找到 ngrok.exe（请安装并加入 PATH 或用户目录 bin）");
+            _onStatusChanged(TunnelStatus.NotFound, "未找到 ngrok.exe（请安装并加入 PATH 或用户目录 bin）");
             return Task.CompletedTask;
         }
 
@@ -123,7 +114,7 @@ public sealed class NgrokTunnelService : IAsyncDisposable
 
             process.Exited += (_, _) =>
             {
-                NgrokTunnelStatus newStatus = NgrokTunnelStatus.Stopped;
+                TunnelStatus newStatus = TunnelStatus.Stopped;
                 int exitCode = 0;
                 bool isCurrent = false;
                 string? logMessage = null;
@@ -133,7 +124,7 @@ public sealed class NgrokTunnelService : IAsyncDisposable
                     {
                         isCurrent = true;
                         exitCode = process.ExitCode;
-                        _status = exitCode == 0 ? NgrokTunnelStatus.Stopped : NgrokTunnelStatus.Failed;
+                        _status = exitCode == 0 ? TunnelStatus.Stopped : TunnelStatus.Failed;
                         _activeHost = null;
                         newStatus = _status;
                         logMessage = $"ngrok 进程已退出，退出码：{exitCode}";
@@ -150,9 +141,9 @@ public sealed class NgrokTunnelService : IAsyncDisposable
             {
                 lock (_gate)
                 {
-                    _status = NgrokTunnelStatus.Failed;
+                    _status = TunnelStatus.Failed;
                 }
-                _onStatusChanged(NgrokTunnelStatus.Failed, "启动 ngrok 进程失败");
+                _onStatusChanged(TunnelStatus.Failed, "启动 ngrok 进程失败");
                 return Task.CompletedTask;
             }
 
@@ -174,9 +165,9 @@ public sealed class NgrokTunnelService : IAsyncDisposable
         {
             lock (_gate)
             {
-                _status = NgrokTunnelStatus.Failed;
+                _status = TunnelStatus.Failed;
             }
-            _onStatusChanged(NgrokTunnelStatus.Failed, $"启动失败：{ex.Message}");
+            _onStatusChanged(TunnelStatus.Failed, $"启动失败：{ex.Message}");
             _log.Write("ERROR", $"启动 ngrok 异常：{ex}");
         }
 
@@ -228,7 +219,7 @@ public sealed class NgrokTunnelService : IAsyncDisposable
             {
                 lock (_gate)
                 {
-                    if (_status == NgrokTunnelStatus.Running) break;
+                    if (_status == TunnelStatus.Running) break;
                 }
                 await Task.Delay(500, token);
                 try
@@ -283,9 +274,9 @@ public sealed class NgrokTunnelService : IAsyncDisposable
         bool changed = false;
         lock (_gate)
         {
-            if (_status != NgrokTunnelStatus.Running || _activeHost != host)
+            if (_status != TunnelStatus.Running || _activeHost != host)
             {
-                _status = NgrokTunnelStatus.Running;
+                _status = TunnelStatus.Running;
                 _activeHost = host;
                 changed = true;
                 _log.Write("INFO", $"ngrok 隧道就绪，公网域名：{host}");
@@ -294,7 +285,7 @@ public sealed class NgrokTunnelService : IAsyncDisposable
         if (changed)
         {
             _onHostAssigned(host);
-            _onStatusChanged(NgrokTunnelStatus.Running, $"在线：{host}");
+            _onStatusChanged(TunnelStatus.Running, $"在线：{host}");
         }
     }
 
@@ -309,12 +300,12 @@ public sealed class NgrokTunnelService : IAsyncDisposable
             procToKill = _process;
             _process = null;
             _activeHost = null;
-            _status = NgrokTunnelStatus.Stopped;
+            _status = TunnelStatus.Stopped;
         }
 
         cts?.Cancel();
         cts?.Dispose();
-        _onStatusChanged(NgrokTunnelStatus.Stopped, "已停止");
+        _onStatusChanged(TunnelStatus.Stopped, "已停止");
 
         if (procToKill is not null)
         {

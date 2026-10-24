@@ -21,7 +21,7 @@ public sealed record BridgeViewState(
     string AgyHookText = "未安装",
     AntigravityPluginStatus AgyHookState = AntigravityPluginStatus.NotInstalled,
     string TunnelStatusText = "未启动",
-    NgrokTunnelStatus TunnelStatus = NgrokTunnelStatus.Stopped,
+    TunnelStatus TunnelState = TunnelStatus.Stopped,
     string? ActiveTunnelHost = null);
 
 public sealed class BridgeRuntime : IAsyncDisposable
@@ -63,6 +63,9 @@ public sealed class BridgeRuntime : IAsyncDisposable
     private byte[] _pairingSecret;
     private readonly TaskCatalog _catalog;
     private readonly NgrokTunnelService _ngrokService;
+    private readonly CloudflaredTunnelService _cloudflaredService;
+    /// <summary>切换隧道提供方时串行化启停，避免快速连点造成两个服务互相覆盖状态。</summary>
+    private readonly SemaphoreSlim _tunnelSwitch = new(1, 1);
     private string _tunnelStatusText = "未启动";
     private HookTcpServer? _hookServer;
     private LanBridgeServer? _lanServer;
@@ -82,6 +85,13 @@ public sealed class BridgeRuntime : IAsyncDisposable
     public BridgeRuntime()
     {
         Settings = BridgeSettings.Load();
+        // 升级到新的 dist 目录后，Run 键仍指向旧 exe，重启电脑会拉起旧版。
+        // 登录自启开着就在启动时校正到当前进程（幂等，无副作用）。
+        if (Settings.LaunchAtLogin)
+        {
+            try { StartupRegistration.Enable(); }
+            catch (Exception error) { _log.Write("WARN", $"校正登录自启路径失败：{error.Message}"); }
+        }
         _networks = NetworkAddresses.Available();
         _selectedAddress = _networks.FirstOrDefault(value => value.Address == Settings.SelectedNetworkAddress)?.Address
             ?? _networks.FirstOrDefault()?.Address ?? "127.0.0.1";
@@ -94,16 +104,12 @@ public sealed class BridgeRuntime : IAsyncDisposable
         _catalog = new(_persistence.Load());
         _ngrokService = new(
             _log,
-            host =>
-            {
-                _log.Write("INFO", $"已获取 ngrok 公网域名：{host}");
-                PublishState();
-            },
-            (status, msg) =>
-            {
-                _tunnelStatusText = msg ?? status.ToString();
-                PublishState();
-            });
+            host => OnTunnelHost(TunnelProvider.Ngrok, host),
+            (status, msg) => OnTunnelStatus(TunnelProvider.Ngrok, status, msg));
+        _cloudflaredService = new(
+            _log,
+            host => OnTunnelHost(TunnelProvider.Cloudflared, host),
+            (status, msg) => OnTunnelStatus(TunnelProvider.Cloudflared, status, msg));
         // 桥端排队文本是纯内存，重启会丢——随任务一起持久化，这里恢复
         // （超 TTL 的在导入时直接丢弃；徽章由 Maintain 的自愈补回）。
         // Antigravity 无队列可恢复：投递已改成到达即注入（2026-10-19）。
@@ -143,9 +149,10 @@ public sealed class BridgeRuntime : IAsyncDisposable
                 _log,
                 RotatePairingSecretAndGetPairingText);
             await _lanServer.StartAsync(token);
-            if (Settings.EnableNgrokTunnel)
+            var initialTunnel = ActiveTunnelService();
+            if (initialTunnel is not null)
             {
-                _ = _ngrokService.StartAsync();
+                _ = initialTunnel.StartAsync();
             }
             _serviceStatus = "局域网服务运行中";
             _log.Write("INFO", "Bridge 服务已启动。");
@@ -323,15 +330,63 @@ public sealed class BridgeRuntime : IAsyncDisposable
     }
 
     /// <summary>
-    /// 启停内置 ngrok 隧道托管。
+    /// 选择内置隧道提供方。None = 关掉自动穿透，只保留手动填写的 TunnelHost。
     /// </summary>
-    public void SetEnableNgrokTunnel(bool enabled)
+    public void SetTunnelProvider(TunnelProvider provider)
     {
-        if (Settings.EnableNgrokTunnel == enabled) return;
-        Settings.EnableNgrokTunnel = enabled;
+        if (Settings.EffectiveTunnelProvider == provider) return;
+        Settings.TunnelProvider = provider;
+        // 老字段同步写：旧版本看到 false 就不会擅自拉起 ngrok。
+        Settings.EnableNgrokTunnel = provider == TunnelProvider.Ngrok;
         Settings.Save();
-        if (enabled) _ = _ngrokService.StartAsync();
-        else _ = _ngrokService.StopAsync();
+        _tunnelStatusText = provider == TunnelProvider.None ? "未启动" : "正在检测与启动...";
+        PublishState();
+        _ = SwitchTunnelAsync(provider);
+    }
+
+    /// <summary>
+    /// 串行化切换：先把两个服务都停掉，再按**当前**设置启动。快速连点时，后一次设置会
+    /// 覆盖前一次，前一次的任务在拿到锁后发现 provider 已变，就不再启动。
+    /// </summary>
+    private async Task SwitchTunnelAsync(TunnelProvider provider)
+    {
+        await _tunnelSwitch.WaitAsync();
+        try
+        {
+            if (_ngrokService.Status != TunnelStatus.Stopped) await _ngrokService.StopAsync();
+            if (_cloudflaredService.Status != TunnelStatus.Stopped) await _cloudflaredService.StopAsync();
+            if (Settings.EffectiveTunnelProvider != provider) return;
+            var service = ServiceFor(provider);
+            if (service is not null) await service.StartAsync();
+        }
+        finally
+        {
+            _tunnelSwitch.Release();
+        }
+    }
+
+    private ITunnelService? ServiceFor(TunnelProvider provider) => provider switch
+    {
+        TunnelProvider.Ngrok => _ngrokService,
+        TunnelProvider.Cloudflared => _cloudflaredService,
+        _ => null,
+    };
+
+    private ITunnelService? ActiveTunnelService() => ServiceFor(Settings.EffectiveTunnelProvider);
+
+    private void OnTunnelHost(TunnelProvider provider, string? host)
+    {
+        // 切换过程中旧服务的晚到回调必须丢掉，否则会把新提供方的状态盖掉。
+        if (Settings.EffectiveTunnelProvider != provider) return;
+        if (string.IsNullOrEmpty(host)) return;
+        _log.Write("INFO", $"已获取 {provider} 公网域名：{host}");
+        PublishState();
+    }
+
+    private void OnTunnelStatus(TunnelProvider provider, TunnelStatus status, string? message)
+    {
+        if (Settings.EffectiveTunnelProvider != provider) return;
+        _tunnelStatusText = message ?? status.ToString();
         PublishState();
     }
 
@@ -647,8 +702,9 @@ public sealed class BridgeRuntime : IAsyncDisposable
 
     private string? EffectiveTunnelHost()
     {
-        if (Settings.EnableNgrokTunnel && !string.IsNullOrEmpty(_ngrokService.ActiveHost))
-            return _ngrokService.ActiveHost;
+        var service = ActiveTunnelService();
+        if (service is not null && service.Status == TunnelStatus.Running && !string.IsNullOrEmpty(service.ActiveHost))
+            return service.ActiveHost;
         return Settings.TunnelHost;
     }
 
@@ -709,6 +765,7 @@ public sealed class BridgeRuntime : IAsyncDisposable
                 : $"待更新 → v{agyVersion}",
             _ => $"已写入 v{agyVersion}",
         };
+        var tunnelService = ActiveTunnelService();
         return new(
             _serviceStatus,
             _phoneCount,
@@ -726,8 +783,8 @@ public sealed class BridgeRuntime : IAsyncDisposable
             agyText,
             agyStatus,
             _tunnelStatusText,
-            _ngrokService.Status,
-            _ngrokService.ActiveHost);
+            tunnelService?.Status ?? TunnelStatus.Stopped,
+            tunnelService?.ActiveHost);
     }
 
     private void PublishState()
@@ -744,6 +801,8 @@ public sealed class BridgeRuntime : IAsyncDisposable
         if (_hookServer is not null) await _hookServer.DisposeAsync();
         if (_lanServer is not null) await _lanServer.DisposeAsync();
         await _ngrokService.DisposeAsync();
+        await _cloudflaredService.DisposeAsync();
+        _tunnelSwitch.Dispose();
         _events.Writer.TryComplete();
         if (_eventTask is not null) try { await _eventTask; } catch (OperationCanceledException) { }
         _linkedCancellation?.Dispose();
