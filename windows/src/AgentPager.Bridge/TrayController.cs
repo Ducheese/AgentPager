@@ -44,6 +44,12 @@ public sealed class TrayController : IDisposable
         Refresh();
     }
 
+    /// <summary>
+    /// 立刻把图标从通知区撤掉。退出清理要等网络/子进程收尾，用户等不了那么久；
+    /// 先隐藏既给了反馈，也让“退出”菜单不会再被点第二次。
+    /// </summary>
+    public void Hide() => _icon.Visible = false;
+
     public void Refresh()
     {
         var state = _runtime.State;

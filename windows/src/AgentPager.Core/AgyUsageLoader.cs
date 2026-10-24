@@ -49,6 +49,11 @@ public sealed class AgyUsageLoader
 
     private (DateTimeOffset CapturedAt, List<UsageWindow> Windows, string? PlanType, string? LimitID)? _quotaCache;
     private readonly Dictionary<string, CachedFileUsage> _fileCache = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>当前正在跑的 agy.exe，退出时由 <see cref="CancelActive"/> 杀掉。</summary>
+    private readonly object _activeProcessLock = new();
+    private Process? _activeProcess;
+    /// <summary>退出已经发生；用来堵住“刚好在 Process.Start 之后、登记之前”的竞态。</summary>
+    private bool _cancelled;
 
     public UsageSnapshot? Load(DateTimeOffset? now = null)
     {
@@ -185,6 +190,29 @@ public sealed class AgyUsageLoader
     /// <summary>我们自己等 agy 的上限；比 <c>--print-timeout</c> 宽 15 秒，留给它收尾和吐输出。</summary>
     private const int CommandTimeoutMs = 75_000;
 
+    /// <summary>
+    /// 桥退出时调用：杀掉正在跑的 agy.exe。<see cref="ExecuteAgyUsage"/> 里的 WaitForExit
+    /// 是同步的、最长 75 秒，不主动杀的话桥进程没了它还会继续跑，变成孤儿并继续占额度。
+    /// </summary>
+    public void CancelActive()
+    {
+        Process? process;
+        lock (_activeProcessLock)
+        {
+            _cancelled = true;
+            process = _activeProcess;
+        }
+        if (process is null) return;
+        try
+        {
+            if (!process.HasExited) process.Kill(entireProcessTree: true);
+        }
+        catch
+        {
+            // 进程可能刚好自己退出，或已经被 using 释放；退出清理不应因此失败。
+        }
+    }
+
     private string? ExecuteAgyUsage()
     {
         var binary = AgyPaths.ResolveBinary();
@@ -255,37 +283,56 @@ public sealed class AgyUsageLoader
                 return null;
             }
 
-            // 立刻关掉写端：子进程读到 EOF，不会挂在等 stdin 上。
-            try { process.StandardInput.Close(); } catch { }
-
-            var outputTask = process.StandardOutput.ReadToEndAsync();
-            var errorTask = process.StandardError.ReadToEndAsync();
-
-            if (!process.WaitForExit(CommandTimeoutMs))
+            lock (_activeProcessLock)
             {
-                try { process.Kill(entireProcessTree: true); } catch { }
-                Log?.Invoke("WARN",
-                    $"[AGY] 配额命令超时（{CommandTimeoutMs / 1000}s）被中止，耗时 {watch.ElapsedMilliseconds}ms");
-                return null;
+                _activeProcess = process;
+                // 退出发生在 Process.Start 与登记之间：这里补一刀，避免留下孤儿。
+                if (_cancelled)
+                {
+                    try { if (!process.HasExited) process.Kill(entireProcessTree: true); } catch { }
+                }
             }
-
-            var output = outputTask.GetAwaiter().GetResult();
-            var error = errorTask.GetAwaiter().GetResult();
-            watch.Stop();
-
-            if (process.ExitCode != 0)
+            try
             {
-                Log?.Invoke("WARN",
-                    $"[AGY] 配额命令非零退出码 {process.ExitCode}，耗时 {watch.ElapsedMilliseconds}ms，" +
-                    $"outLen={output.Length}，err={Brief(error)}");
-                return null;
-            }
+                // 立刻关掉写端：子进程读到 EOF，不会挂在等 stdin 上。
+                try { process.StandardInput.Close(); } catch { }
 
-            // 成功也记一行：这是唯一能区分"命令跑通但没解析出额度"与"命令没跑通"的证据。
-            Log?.Invoke("INFO",
-                $"[AGY] 配额拉取完成，耗时 {watch.ElapsedMilliseconds}ms，outLen={output.Length}，" +
-                $"{(ParseQuotaJson(output, DateTimeOffset.Now) is { } parsed ? $"解析出 {parsed.Windows.Count} 个窗口" : "未能解析出额度窗口")}");
-            return output;
+                var outputTask = process.StandardOutput.ReadToEndAsync();
+                var errorTask = process.StandardError.ReadToEndAsync();
+
+                if (!process.WaitForExit(CommandTimeoutMs))
+                {
+                    try { process.Kill(entireProcessTree: true); } catch { }
+                    Log?.Invoke("WARN",
+                        $"[AGY] 配额命令超时（{CommandTimeoutMs / 1000}s）被中止，耗时 {watch.ElapsedMilliseconds}ms");
+                    return null;
+                }
+
+                var output = outputTask.GetAwaiter().GetResult();
+                var error = errorTask.GetAwaiter().GetResult();
+                watch.Stop();
+
+                if (process.ExitCode != 0)
+                {
+                    Log?.Invoke("WARN",
+                        $"[AGY] 配额命令非零退出码 {process.ExitCode}，耗时 {watch.ElapsedMilliseconds}ms，" +
+                        $"outLen={output.Length}，err={Brief(error)}");
+                    return null;
+                }
+
+                // 成功也记一行：这是唯一能区分"命令跑通但没解析出额度"与"命令没跑通"的证据。
+                Log?.Invoke("INFO",
+                    $"[AGY] 配额拉取完成，耗时 {watch.ElapsedMilliseconds}ms，outLen={output.Length}，" +
+                    $"{(ParseQuotaJson(output, DateTimeOffset.Now) is { } parsed ? $"解析出 {parsed.Windows.Count} 个窗口" : "未能解析出额度窗口")}");
+                return output;
+            }
+            finally
+            {
+                lock (_activeProcessLock)
+                {
+                    if (ReferenceEquals(_activeProcess, process)) _activeProcess = null;
+                }
+            }
         }
         catch (Exception error)
         {

@@ -198,10 +198,17 @@ public sealed class App : System.Windows.Application
 {
     private readonly bool _firstRun;
     private readonly bool _background;
+    /// <summary>
+    /// 退出流程只允许跑一次。托盘菜单点下后还要一两秒才彻底消失，没有这道闸用户会连点，
+    /// 而并发 Dispose 会把 CTS 和监听器拆两遍（第二次直接抛 ObjectDisposedException）。
+    /// </summary>
+    private bool _exiting;
     private BridgeRuntime? _runtime;
     private TrayController? _tray;
     private MainWindow? _window;
     private CancellationTokenSource? _cancellation;
+    /// <summary>退出清理的总预算；到点直接 Shutdown，隧道子进程由 Job Object 收尸。</summary>
+    private static readonly TimeSpan ShutdownBudget = TimeSpan.FromSeconds(2);
 
     public App(bool firstRun, bool background)
     {
@@ -220,8 +227,10 @@ public sealed class App : System.Windows.Application
         if (!_background) _runtime.Settings.Save();
         _runtime.StateChanged += () => Dispatcher.Invoke(() =>
         {
-            _window.Refresh();
-            _tray.Refresh();
+            // 退出期间隧道会回调 Stopped；此时托盘可能已经撤掉，再刷新会抛 ObjectDisposedException。
+            if (_exiting) return;
+            _window?.Refresh();
+            _tray?.Refresh();
         });
         _window.HideRequested += () => _window.Hide();
         _ = SingleInstanceSignal.ListenAsync(() => Dispatcher.Invoke(ShowWindow), _cancellation.Token);
@@ -244,9 +253,24 @@ public sealed class App : System.Windows.Application
 
     private async void ExitApplication()
     {
+        if (_exiting) return;
+        _exiting = true;
+        // 第一次点击就撤掉托盘图标：用户立刻有反馈，也不会以为没点上而反复点。
+        _tray?.Hide();
+        _window?.Hide();
+        // 离开 WinForms 菜单的点击栈再 Dispose，避免在菜单自己的事件里拆 ContextMenuStrip。
+        await Task.Yield();
         _cancellation?.Cancel();
-        if (_runtime is not null) await _runtime.DisposeAsync();
+        if (_runtime is not null)
+        {
+            Task? dispose = null;
+            try { dispose = _runtime.DisposeAsync().AsTask(); }
+            catch (Exception error) { Debug.WriteLine($"退出清理启动失败：{error}"); }
+            if (dispose is not null)
+                await Task.WhenAny(dispose, Task.Delay(ShutdownBudget));
+        }
         _tray?.Dispose();
+        _tray = null;
         Shutdown();
     }
 }

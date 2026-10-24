@@ -66,6 +66,10 @@ public sealed class BridgeRuntime : IAsyncDisposable
     private readonly CloudflaredTunnelService _cloudflaredService;
     /// <summary>切换隧道提供方时串行化启停，避免快速连点造成两个服务互相覆盖状态。</summary>
     private readonly SemaphoreSlim _tunnelSwitch = new(1, 1);
+    /// <summary>退出清理只跑一次；防的是托盘退出被连点时的并发 Dispose。</summary>
+    private int _disposeState;
+    /// <summary>退出时单步等待上限。超时就继续下一步，整体由 App 的 2 秒预算兜底。</summary>
+    private static readonly TimeSpan ExitWaitBudget = TimeSpan.FromMilliseconds(300);
     private string _tunnelStatusText = "未启动";
     private HookTcpServer? _hookServer;
     private LanBridgeServer? _lanServer;
@@ -795,16 +799,31 @@ public sealed class BridgeRuntime : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref _disposeState, 1) != 0) return;
         _linkedCancellation?.Cancel();
-        if (_pollTask is not null) try { await _pollTask; } catch (OperationCanceledException) { }
-        if (_usageTask is not null) try { await _usageTask; } catch (OperationCanceledException) { }
+        // 额度是附加信息，绝不能让退出等它：agy 子进程是同步 WaitForExit，最长 75 秒。
+        // 先杀掉正在跑的 agy，避免桥退出后留下孤儿进程继续占额度。
+        _agyUsageLoader.CancelActive();
+        await WaitBriefly(_pollTask, "轮询循环");
+        await WaitBriefly(_usageTask, "额度拉取");
         if (_hookServer is not null) await _hookServer.DisposeAsync();
         if (_lanServer is not null) await _lanServer.DisposeAsync();
         await _ngrokService.DisposeAsync();
         await _cloudflaredService.DisposeAsync();
         _tunnelSwitch.Dispose();
         _events.Writer.TryComplete();
-        if (_eventTask is not null) try { await _eventTask; } catch (OperationCanceledException) { }
+        await WaitBriefly(_eventTask, "事件循环");
         _linkedCancellation?.Dispose();
+    }
+
+    private async Task WaitBriefly(Task? task, string name)
+    {
+        if (task is null) return;
+        try { await task.WaitAsync(ExitWaitBudget); }
+        catch (TimeoutException)
+        {
+            _log.Write("WARN", $"退出：{name}未在 {ExitWaitBudget.TotalMilliseconds:0}ms 内结束，继续关闭。");
+        }
+        catch (OperationCanceledException) { }
     }
 }

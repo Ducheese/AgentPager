@@ -46,8 +46,15 @@ public sealed class LanBridgeServer(
         public async ValueTask DisposeAsync()
         {
             if (Socket.State is WebSocketState.Open or WebSocketState.CloseReceived)
-                try { await Socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Bridge shutdown", CancellationToken.None); }
-                catch (WebSocketException) { }
+            {
+                // 退出时不能无限等对端回 close 帧：手机走隧道时可能一直不回。
+                using var timeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
+                try { await Socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Bridge shutdown", timeout.Token); }
+                catch (Exception error) when (error is WebSocketException or OperationCanceledException or ObjectDisposedException)
+                {
+                    try { Socket.Abort(); } catch { }
+                }
+            }
             Socket.Dispose();
             _sendLock.Dispose();
         }
@@ -284,7 +291,10 @@ public sealed class LanBridgeServer(
         foreach (var id in _clients.Keys.ToList()) await Remove(id);
         if (_application is not null)
         {
-            await _application.StopAsync();
+            // 优雅关闭也要有上限：挂着的 WebSocket 不该拖住整个进程退出。
+            using var timeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
+            try { await _application.StopAsync(timeout.Token); }
+            catch (OperationCanceledException) { }
             await _application.DisposeAsync();
         }
     }

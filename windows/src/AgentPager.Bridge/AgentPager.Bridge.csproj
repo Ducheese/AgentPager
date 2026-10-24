@@ -8,8 +8,16 @@
     <RootNamespace>AgentPager.Bridge</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-    <PublishSingleFile>true</PublishSingleFile>
-    <SelfContained>true</SelfContained>
+    <!--
+      本机发布默认走框架依赖：单文件自包含包有 223MB，每次打开设置都要先加载它，
+      冷启动和二次启动都显得笨重；框架依赖的 exe 只有 149KB、整个目录约 35MB
+      （大头是 Windows SDK 投影 DLL），要求机器已装 .NET 8 Desktop Runtime 与
+      ASP.NET Core Runtime（本机 SDK 已包含）。
+      对外安装包由 scripts\package-windows.ps1 显式传 self-contained=true 与
+      PublishSingleFile=true，仍然自带 .NET，不改变最终用户的安装体验。
+    -->
+    <PublishSingleFile>false</PublishSingleFile>
+    <SelfContained>false</SelfContained>
     <PublishTrimmed>false</PublishTrimmed>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
   </PropertyGroup>
