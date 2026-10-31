@@ -669,13 +669,20 @@ public sealed class TaskCatalog
             : hook.AgentType!.Trim();
         var subagent = existing ?? new(id, "/" + agentName, agentName, AgentLifecycle.Running,
             AgentActivity.Delegating, null, null, now, now);
+        // SubagentStart 的协议载荷没有标题，只有 agent_type；Claude 在子代理 sidecar
+        // `agent-<id>.meta.json` 里写了父代理派发时的 description，拿它当显示名，
+        // 取不到才回退 agent_type。Path 仍保留类型，别把内部路径改成标题。
+        if (subagent.DisplayName == agentName &&
+            ClaudeSubagentDescription(hook, id) is { Length: > 0 } description)
+        {
+            subagent = subagent with { DisplayName = ClampText(description, 40) };
+        }
 
         switch (hook.HookEventName)
         {
             case "SubagentStart":
                 subagent = subagent with
                 {
-                    DisplayName = agentName,
                     Path = "/" + agentName,
                     Lifecycle = AgentLifecycle.Running,
                     Activity = AgentActivity.Delegating,
@@ -735,6 +742,56 @@ public sealed class TaskCatalog
         });
         Changed();
         return true;
+    }
+
+    /// <summary>
+    /// Claude 子代理标题：SubagentStart 只带 agent_type，没有 description。
+    /// 本机 sidecar 会把父代理派发时的 description 写在
+    /// `&lt;session&gt;/subagents/agent-&lt;agent_id&gt;.meta.json`，优先用它当显示名。
+    /// 这是本机目录约定而非 Hook 合同：文件缺失/格式变化时必须静默回退 agent_type。
+    /// </summary>
+    private static string? ClaudeSubagentDescription(ClaudeHookPayload hook, string agentId)
+    {
+        foreach (var path in ClaudeSubagentMetaPaths(hook, agentId))
+        {
+            try
+            {
+                if (!File.Exists(path)) continue;
+                using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                using var document = JsonDocument.Parse(stream);
+                if (document.RootElement.ValueKind != JsonValueKind.Object) continue;
+                if (document.RootElement.TryGetProperty("description", out var value) &&
+                    value.ValueKind == JsonValueKind.String)
+                {
+                    var text = value.GetString()?.Trim();
+                    if (!string.IsNullOrEmpty(text)) return text;
+                }
+            }
+            catch
+            {
+                // sidecar 是辅助信息，读不到不能影响子代理行本身。
+            }
+        }
+        return null;
+    }
+
+    private static IEnumerable<string> ClaudeSubagentMetaPaths(ClaudeHookPayload hook, string agentId)
+    {
+        var fileName = agentId.StartsWith("agent-", StringComparison.OrdinalIgnoreCase)
+            ? $"{agentId}.meta.json"
+            : $"agent-{agentId}.meta.json";
+
+        // SubagentStop 带 agent_transcript_path；SubagentStart 通常没有，但两者都试。
+        if (!string.IsNullOrWhiteSpace(hook.AgentTranscriptPath))
+            yield return Path.ChangeExtension(hook.AgentTranscriptPath!, ".meta.json");
+
+        if (!string.IsNullOrWhiteSpace(hook.TranscriptPath))
+        {
+            var directory = Path.GetDirectoryName(hook.TranscriptPath!);
+            var session = Path.GetFileNameWithoutExtension(hook.TranscriptPath!);
+            if (!string.IsNullOrEmpty(directory) && !string.IsNullOrEmpty(session))
+                yield return Path.Combine(directory, session, "subagents", fileName);
+        }
     }
 
     /// <summary>
@@ -889,6 +946,8 @@ public sealed class TaskCatalog
             if (parentTask is not null)
             {
                 var updatedParent = ApplyAgySubagent(parentTask, hook, dbInfo, resolvedRole, now);
+                // 子代理自己也可能通过 manage_subagents kill 它的后代；同样是即时信号。
+                updatedParent = StopAgySubagentsOnKill(updatedParent, hook, now);
                 Upsert(updatedParent);
                 Changed();
                 return true;
@@ -908,6 +967,7 @@ public sealed class TaskCatalog
             _agyToolStartAt.Remove(sessionID);
         DateTimeOffset? agyToolStart = _agyToolStartAt.TryGetValue(sessionID, out var agyStarted) ? agyStarted : null;
         var updated = AgyEventReducer.Reduce(hook, existing, dbInfo, now, answerable, agyToolStart);
+        updated = StopAgySubagentsOnKill(updated, hook, now);
         Upsert(updated);
 
         // 侦测父任务调用的 invoke_subagent，记录子代理绑定关系与先验派发窗口
@@ -1142,6 +1202,89 @@ public sealed class TaskCatalog
                 return text;
         }
         return null;
+    }
+
+    /// <summary>
+    /// agy 主代理的 `manage_subagents` 是主动 kill 子代理的唯一即时信号：
+    /// `kill` 带 ConversationIds（与子会话 ID 相同），`kill_all` 不带目标。
+    /// 只在 PostToolUse 成功时收敛；工具失败时保持原状，等子代理自己的 Stop/静默兜底。
+    /// 文档行为是"连同 descendants 一起终止"，桥的子代理列表是扁平的，因此把
+    /// `_agyChildToParent` 里以目标为父的孙代理也一并收敛。
+    /// </summary>
+    private TaskSnapshot StopAgySubagentsOnKill(TaskSnapshot parent, AgyHookPayload hook, DateTimeOffset now)
+    {
+        if (hook.EffectiveEvent != "PostToolUse" ||
+            !string.Equals(hook.ToolCall?.Name, "manage_subagents", StringComparison.OrdinalIgnoreCase) ||
+            !string.IsNullOrWhiteSpace(hook.Error) ||
+            hook.ToolCall?.Args is not { ValueKind: JsonValueKind.Object } args)
+            return parent;
+
+        var action = Text(args, "Action")?.Trim().ToLowerInvariant();
+        if (action is not ("kill" or "kill_all")) return parent;
+
+        List<string> targets = action == "kill"
+            ? AgyConversationIds(args, "ConversationIds")
+            : [];
+        if (action == "kill" && targets.Count == 0)
+            targets = AgyConversationIds(args, "conversationIds");
+        if (action == "kill" && targets.Count == 0) return parent;
+
+        var targetIds = new HashSet<string>(targets, StringComparer.OrdinalIgnoreCase);
+        if (action == "kill")
+        {
+            // kill 会级联终止 descendants；桥端子代理是扁平的，做一次传递闭包。
+            var changed = true;
+            while (changed)
+            {
+                changed = false;
+                foreach (var (child, parentID) in _agyChildToParent)
+                {
+                    if (targetIds.Contains(parentID) && targetIds.Add(child)) changed = true;
+                }
+            }
+        }
+
+        var anyKilled = false;
+        var subagents = parent.Subagents.Select(subagent =>
+        {
+            if (subagent.IsTerminal ||
+                action == "kill" && !targetIds.Contains(subagent.Id))
+                return subagent;
+
+            anyKilled = true;
+            return subagent with
+            {
+                Lifecycle = AgentLifecycle.Interrupted,
+                Activity = null,
+                LatestStep = "✗ 已被停止",
+                UpdatedAt = now,
+            };
+        }).ToList();
+        if (!anyKilled) return parent;
+
+        return parent with
+        {
+            Subagents = subagents,
+            UpdatedAt = now,
+            Activity = parent.Lifecycle == AgentLifecycle.Running
+                ? subagents.Any(item => !item.IsTerminal)
+                    ? AgentActivity.Delegating
+                    : parent.Activity == AgentActivity.Delegating ? AgentActivity.Thinking : parent.Activity
+                : parent.Activity,
+        };
+    }
+
+    private static List<string> AgyConversationIds(JsonElement args, string property)
+    {
+        var result = new List<string>();
+        if (!args.TryGetProperty(property, out var value) || value.ValueKind != JsonValueKind.Array) return result;
+        foreach (var item in value.EnumerateArray())
+        {
+            if (item.ValueKind != JsonValueKind.String) continue;
+            var id = item.GetString()?.Trim();
+            if (!string.IsNullOrEmpty(id)) result.Add(id);
+        }
+        return result;
     }
 
     private static TaskSnapshot ApplyAgySubagent(TaskSnapshot parent, AgyHookPayload hook, AgyConversationSummary? dbInfo, string? customRole, DateTimeOffset now)
@@ -3820,16 +3963,21 @@ public static class OpenCodeEventReducer
                 var tool = Text(value, "tool");
                 var rawError = Text(value, "error");
                 var toolTitle = Text(value, "title");
+                var toolStatus = Text(value, "status");
                 var step = rawError is not null ? $"✗ {rawError}"
                     : toolTitle is not null ? ToolStep.Compose(tool, toolTitle)
                     : Text(value, "step");
                 if (step is not null && !EchoesPrompt(task, step)) subagent = subagent with { LatestStep = Clamp(step, 220) };
                 // 命令文本由插件单独带过来（子代理事件没有完整 state）：不带就判不出"测试"，
                 // 同一个 `npm test` 会让父任务行显蓝、子代理行显橙。
+                // 工具完成后回 Thinking（紫），与 Claude/agy 的 PostToolUse 对齐；旧插件不带
+                // status 时仍按工具活动显示，保持兼容。
                 subagent = subagent with
                 {
                     Lifecycle = AgentLifecycle.Running,
-                    Activity = ActivityFor(tool, ShellTestRun.Matches(Text(value, "command"))),
+                    Activity = toolStatus is "completed" or "error"
+                        ? AgentActivity.Thinking
+                        : ActivityFor(tool, ShellTestRun.Matches(Text(value, "command"))),
                 };
                 break;
             case "tokens":

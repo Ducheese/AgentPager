@@ -340,9 +340,14 @@ catalog.Accept(H("subagent", new { sessionID = "ses_1", id = "ses_sub", phase = 
 var subagent = Task().Subagents.FirstOrDefault(s => s.Id == "ses_sub");
 Check(subagent is not null && subagent.DisplayName == "列出 docs 目录文件" && subagent.Path == "/explore" && subagent.Lifecycle == AgentLifecycle.Running, $"subagent started (got '{subagent?.DisplayName}')");
 Check(Task().Activity == AgentActivity.Delegating, "parent delegating while subagent runs");
-catalog.Accept(H("subagent", new { sessionID = "ses_1", id = "ses_sub", phase = "tool", tool = "read", step = "read src/app.ts" }));
+catalog.Accept(H("subagent", new { sessionID = "ses_1", id = "ses_sub", phase = "tool", tool = "read", status = "running", step = "read src/app.ts" }));
 Check(Task().Subagents.First(s => s.Id == "ses_sub").Activity == AgentActivity.Reading, "subagent tool activity");
 Check(Task().Subagents.First(s => s.Id == "ses_sub").LatestStep == "read src/app.ts", "subagent tool step");
+catalog.Accept(H("subagent", new { sessionID = "ses_1", id = "ses_sub", phase = "tool", tool = "read", status = "completed", step = "read src/app.ts" }));
+Check(Task().Subagents.First(s => s.Id == "ses_sub").Activity == AgentActivity.Thinking,
+    "subagent completed tool returns to thinking (violet, like Claude/agy)");
+catalog.Accept(H("subagent", new { sessionID = "ses_1", id = "ses_sub", phase = "tool", tool = "bash", status = "running", step = "bash npm test", command = "npm test" }));
+Check(Task().Subagents.First(s => s.Id == "ses_sub").Activity == AgentActivity.Testing, "subagent running test tool stays testing (blue)");
 catalog.Accept(H("subagent", new { sessionID = "ses_1", id = "ses_sub", phase = "tool", tool = "edit", title = "src/app.ts" }));
 Check(Task().Subagents.First(s => s.Id == "ses_sub").LatestStep == "Edit src/app.ts", "subagent tool title prefixed");
 catalog.Accept(H("subagent", new { sessionID = "ses_1", id = "ses_sub", phase = "tokens", tokens = new { input = 10, output = 5, reasoning = 1, cache = new { read = 2, write = 0 }, total = 18 } }));
@@ -1286,6 +1291,41 @@ subCatalog.Accept(C("PreToolUse", new { session_id = "claude_2", agent_id = "a1"
 Check(SubTask().LatestStep == parentStep, "claude: subagent step never overwrites the parent third line");
 Check(SubTask().Subagents is [{ DisplayName: "Explore" }], "claude: subagent row named by agent_type");
 Check(SubTask().Subagents[0].LatestStep == "Grep TODO", $"claude: subagent row carries its own step (got '{SubTask().Subagents[0].LatestStep}')");
+
+// Claude 子代理标题：SubagentStart 没有 description，sidecar meta.json 里才有。
+// 取到 description 显示它，Path 仍保留 agent_type；取不到回退 agent_type。
+var subMetaRoot = Path.Combine(Path.GetTempPath(), "ap-claude-submeta-" + Guid.NewGuid().ToString("N"));
+try
+{
+    var subMetaSession = "claude_submeta";
+    var subMetaMain = Path.Combine(subMetaRoot, subMetaSession + ".jsonl");
+    var subMetaDir = Path.Combine(subMetaRoot, subMetaSession, "subagents");
+    Directory.CreateDirectory(subMetaDir);
+    File.WriteAllText(Path.Combine(subMetaDir, "agent-a_meta.meta.json"),
+        """{"agentType":"Explore","description":"Bounded doc-vs-code check"}""");
+    var subMetaCatalog = new TaskCatalog();
+    var subMetaNow = DateTimeOffset.UtcNow;
+    subMetaCatalog.Accept(C("UserPromptSubmit", new
+    {
+        session_id = subMetaSession,
+        transcript_path = subMetaMain,
+        prompt = "派个子代理",
+    }), subMetaNow);
+    subMetaCatalog.Accept(C("SubagentStart", new
+    {
+        session_id = subMetaSession,
+        transcript_path = subMetaMain,
+        agent_id = "a_meta",
+        agent_type = "Explore",
+    }), subMetaNow.AddSeconds(1));
+    var titledSub = subMetaCatalog.Projection().Tasks.First(t => t.Id == subMetaSession).Subagents.Single();
+    Check(titledSub.DisplayName == "Bounded doc-vs-code check" && titledSub.Path == "/Explore",
+        $"claude: subagent title comes from meta.json description (got '{titledSub.DisplayName}' / '{titledSub.Path}')");
+}
+finally
+{
+    try { Directory.Delete(subMetaRoot, recursive: true); } catch { }
+}
 Check(SubTask().Activity == AgentActivity.Delegating, "claude: parent delegates while subagent runs");
 
 // 项目名**跟随** payload cwd（用户裁定：Claude 的 cwd 随 Bash 的 cd 走，这一行反映"此刻在哪个
@@ -2480,6 +2520,29 @@ Check(SlowTask().Subagents is [{ Lifecycle: AgentLifecycle.Running }],
 slowCatalog.Maintain(slowT0.AddMinutes(31));
 Check(SlowTask().Subagents is [{ Lifecycle: AgentLifecycle.Interrupted }],
     $"silence: while the parent is still running, 31 minutes is enough (got {SlowTask().Subagents[0].Lifecycle})");
+
+// agy 主动 kill：manage_subagents PostToolUse 带 Action=kill + ConversationIds，
+// 必须像 Claude 的 TaskStop 一样立即收敛，不能等 30 分钟静默兜底。
+var agyKillCatalog = new TaskCatalog();
+var agyKillNow = DateTimeOffset.UtcNow;
+agyKillCatalog.Accept(A("PreInvocation", new { conversationId = "p_kill", workspacePaths = new[] { @"C:\test" } }), agyKillNow);
+agyKillCatalog.Accept(A("PreToolUse", new
+{
+    conversationId = "p_kill",
+    toolCall = new { name = "invoke_subagent", args = new { Subagents = new[] { new { Role = "researcher", TypeName = "research" } } } }
+}), agyKillNow.AddSeconds(1));
+agyKillCatalog.Accept(A("PreInvocation", new { conversationId = "c_kill", workspacePaths = new[] { @"C:\test" } }), agyKillNow.AddSeconds(2));
+TaskSnapshot AgyKillTask() => agyKillCatalog.Projection().Tasks.First(t => t.Id == "p_kill");
+Check(AgyKillTask().Subagents is [{ Lifecycle: AgentLifecycle.Running }], "agy kill: child starts running");
+agyKillCatalog.Accept(A("PostToolUse", new
+{
+    conversationId = "p_kill",
+    toolCall = new { name = "manage_subagents", args = new { Action = "kill", ConversationIds = new[] { "c_kill" } } }
+}), agyKillNow.AddSeconds(3));
+Check(AgyKillTask().Subagents is [{ Lifecycle: AgentLifecycle.Interrupted }],
+    "agy kill: manage_subagents kill finalizes the target immediately");
+Check(AgyKillTask().Activity == AgentActivity.Thinking,
+    "agy kill: parent stops delegating after the only child is stopped");
 
 // ---- agy 计时：异步子代理唤醒父任务时，生命周期照实翻 running，但计时与第三行不许动 ----
 // 实测（2026-10-11 16:50）：父回合 16:50:28 Stop → 子代理 16:50:38 回报 → 父又连续发起模型调用。

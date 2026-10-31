@@ -98,12 +98,12 @@ fun MermaidBlockView(
         // 记录已加载的 html（按引用比较）：只有源码真的变了才重载，避免每次重组都把 3.5MB 脚本重跑一遍
         val loadedHtml = remember { arrayOfNulls<String>(1) }
         val webViewRef = remember(source, securityLevel) { arrayOfNulls<WebView>(1) }
-        val dynamicHeight = with(density) {
-            if (contentHeightPx > 0f) {
-                (contentHeightPx.toDp() + 12.dp).coerceIn(80.dp, 600.dp)
-            } else {
-                160.dp
-            }
+        // 注意：WebView JS 传出的尺寸是 CSS 像素（因配置了 width=device-width，1 CSS px 在 Android 上已等价于 1 dp）。
+        // 禁止在此调用 .toDp()，否则会再次除以屏幕密度（density）导致画框高度缩水近 3 倍并截断下半部分。
+        val dynamicHeight = if (contentHeightPx > 0f) {
+            (contentHeightPx.dp + 12.dp).coerceIn(80.dp, 600.dp)
+        } else {
+            160.dp
         }
 
         Column(
@@ -149,10 +149,15 @@ fun MermaidBlockView(
                 val cached = remember(source, boxWidthPx, securityLevel) {
                     MermaidBitmapCache.get(MermaidBitmapCache.key(source, boxWidthPx, securityLevel))
                 }
-                val boxHeight = cached
-                    ?.let { with(density) { it.height.toDp() } }
-                    ?.coerceIn(80.dp, 600.dp)
-                    ?: dynamicHeight
+                val boxHeight = if (contentHeightPx > 0f) {
+                    dynamicHeight
+                } else {
+                    // 缓存的 Bitmap 尺寸是 Android 物理像素（px），转 Dp 必须除以 density
+                    cached
+                        ?.let { with(density) { it.height.toDp() } }
+                        ?.coerceIn(80.dp, 600.dp)
+                        ?: dynamicHeight
+                }
 
                 // 20 秒兜底：既没有缓存、也没有任何回调时才降级源码。
                 // 慢设备上多张图同时渲染时，10 秒会误杀还在排队的图。
@@ -189,13 +194,14 @@ fun MermaidBlockView(
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(boxHeight),
+                    contentAlignment = Alignment.Center,
                 ) {
                     if (cached != null) {
                         Image(
                             bitmap = cached.asImageBitmap(),
                             contentDescription = null,
                             modifier = Modifier.fillMaxSize(),
-                            contentScale = ContentScale.FillWidth,
+                            contentScale = ContentScale.Fit,
                         )
                     } else {
                         key(source, securityLevel) {
@@ -401,7 +407,10 @@ private fun buildMermaidHtml(
     val overflowCss = if (isInteractive) "auto" else "hidden"
     val touchActionCss = if (isInteractive) "pan-x pan-y pinch-zoom" else "none"
     val pointerEventsCss = if (isInteractive) "auto" else "none"
-    val paddingPx = if (isInteractive) "20px" else "4px"
+    val paddingPxInt = if (isInteractive) 20 else 4
+    val paddingPx = "${paddingPxInt}px"
+    val alignItemsCss = if (isInteractive) "center" else "flex-start"
+    val minHeightCss = if (isInteractive) "min-height: 100%;" else ""
 
     return """
         <!DOCTYPE html>
@@ -414,7 +423,7 @@ private fun buildMermaidHtml(
             margin: 0;
             padding: 0;
             width: 100%;
-            min-height: 100%;
+            $minHeightCss
             background-color: #05070B;
             color: #E8EDF5;
             overflow: $overflowCss;
@@ -427,20 +436,20 @@ private fun buildMermaidHtml(
           #wrapper {
             display: flex;
             justify-content: center;
-            align-items: center;
+            align-items: $alignItemsCss;
             min-width: 100%;
-            min-height: 100%;
+            $minHeightCss
             padding: $paddingPx;
           }
           #container {
             display: flex;
             justify-content: center;
-            align-items: center;
+            align-items: $alignItemsCss;
             width: 100%;
           }
           svg {
-            max-width: 100% !important;
-            height: auto !important;
+            max-width: 100%;
+            height: auto;
           }
         </style>
         <script src="file:///android_asset/mermaid/mermaid.min.js"></script>
@@ -613,11 +622,24 @@ private fun buildMermaidHtml(
             }).then(function(res) {
               document.getElementById("container").innerHTML = res.svg;
               if (window.AgentPagerBridge) {
-                // 高度不是"渲染完测一次"就完了：转屏/拖分屏后宽度变化，SVG 会重新排版、
-                // 高度跟着变。ResizeObserver + resize 每次重报，Compose 才有正确高度。
+                // 读取 SVG 渲染后的真实像素边界，监听 #container 变动保证回流后重新精确上报
                 let lastReportedHeight = -1;
                 const reportHeight = function(force) {
-                  const height = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+                  let height = 0;
+                  const container = document.getElementById("container");
+                  const svg = document.querySelector("#container svg");
+                  if (svg) {
+                    const rect = svg.getBoundingClientRect();
+                    if (rect.height > 0) {
+                      height = Math.ceil(rect.height + ($paddingPxInt * 2));
+                    }
+                  }
+                  if (height <= 0 && container) {
+                    height = Math.ceil(container.scrollHeight + ($paddingPxInt * 2));
+                  }
+                  if (height <= 0) {
+                    height = Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
+                  }
                   if (!force && Math.abs(height - lastReportedHeight) < 1) return;
                   lastReportedHeight = height;
                   window.AgentPagerBridge.onSuccess(height);
@@ -627,9 +649,14 @@ private fun buildMermaidHtml(
                   requestAnimationFrame(function() { reportHeight(true); });
                 };
                 if (window.ResizeObserver) {
-                  new ResizeObserver(scheduleReport).observe(document.body);
+                  const container = document.getElementById("container");
+                  if (container) {
+                    new ResizeObserver(scheduleReport).observe(container);
+                  }
                 }
                 window.addEventListener("resize", scheduleReport);
+                setTimeout(scheduleReport, 60);
+                setTimeout(scheduleReport, 240);
               }
             }).catch(function(err) {
               if (window.AgentPagerBridge) {

@@ -638,11 +638,14 @@ export const AgentPagerOpenCode = async (input) => {
               rememberToolSignature(part.id, signature)
               sendSubagent(part.sessionID, "tool", {
                 tool: part.tool,
+                // 完成/失败也要让桥知道：否则子代理会一直停在最后的工具色（青/橙），
+                // 而 Claude/agy 在 PostToolUse 会回到 Thinking（紫）。
+                status: state.status,
                 step: childToolStep(part, state),
                 title: cap(state.title, MAX_VALUE),
                 error: cap(state.error, MAX_VALUE),
                 // 命令文本必须带给桥：桥靠它判"这是不是测试命令"（蓝/橙之分）。
-                // 子代理事件原先不带它，桥只能传 null，于是同一个 `npm test`
+                // 子代理事件原先不带它，桥只能拿 null，于是同一个 `npm test`
                 // 父任务行是蓝（测试）、它自己的子代理行却是橙（执行）。
                 command: cap(state.input?.command, MAX_VALUE),
               })
