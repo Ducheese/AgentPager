@@ -57,7 +57,8 @@ public sealed class CommandCodeUsageLoader
         var summaryJson = Get("/alpha/usage/summary");
 
         var windows = ParseWindows(creditsJson, subscriptionJson, current);
-        if (windows.Count == 0) return null;
+        // credits 请求成功但没有任何有效窗口：字段缺失 = 未知，返回空窗口快照；
+        // 只有请求失败（creditsJson is null）才走缓存/null。
         var daily = ParseDaily(summaryJson, current);
         var limitId = PlanLabel(subscriptionJson);
 
@@ -202,9 +203,12 @@ public sealed class CommandCodeUsageLoader
         void AddWindow(JsonElement limits, string name, string key, string label, int minutes)
         {
             if (!limits.TryGetProperty(name, out var window)) return;
-            var used = window.TryGetProperty("used", out var u) && u.ValueKind == JsonValueKind.Number ? u.GetDouble() : 0;
-            var cap = window.TryGetProperty("cap", out var c) && c.ValueKind == JsonValueKind.Number ? c.GetDouble() : 0;
-            if (cap <= 0) return;
+            // 字段缺失按“未知”处理：缺 used 不能默认 0 已用（那会显示 100% 剩余）。
+            if (!window.TryGetProperty("used", out var u) || u.ValueKind != JsonValueKind.Number) return;
+            if (!window.TryGetProperty("cap", out var c) || c.ValueKind != JsonValueKind.Number) return;
+            var used = u.GetDouble();
+            var cap = c.GetDouble();
+            if (!double.IsFinite(used) || !double.IsFinite(cap) || cap <= 0) return;
 
             var usedPercent = Math.Clamp(used / cap * 100.0, 0, 100);
             windows.Add(new(key, label, usedPercent, 100 - usedPercent, minutes, ResetAt(window)));

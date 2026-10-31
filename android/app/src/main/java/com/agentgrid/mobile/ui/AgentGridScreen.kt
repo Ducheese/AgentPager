@@ -58,6 +58,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -101,6 +102,7 @@ import com.agentgrid.mobile.domain.AgentActivity
 import com.agentgrid.mobile.domain.AgentLifecycle
 import com.agentgrid.mobile.domain.AgentSource
 import com.agentgrid.mobile.domain.ControlAction
+import com.agentgrid.mobile.domain.MermaidSecurityLevel
 import com.agentgrid.mobile.domain.PendingRequest
 import com.agentgrid.mobile.domain.PendingRequestKind
 import com.agentgrid.mobile.domain.SubagentSnapshot
@@ -158,6 +160,7 @@ fun AgentGridScreen(
     onOpenTaskConsumed: (String) -> Unit,
     onSpeechRateChange: (Float) -> Unit,
     onToggleReplySpeech: (String) -> Unit,
+    onMermaidSecurityLevelChange: (String) -> Unit = {},
     inMultiWindow: Boolean,
     promptDrafts: Map<String, String>,
     onPromptDraftChange: (String, String) -> Unit,
@@ -167,47 +170,50 @@ fun AgentGridScreen(
     onRetryAttachment: (String, String) -> Unit = { _, _ -> },
 ) {
     AgentGridTheme {
-        AnimatedContent(
-            targetState = state.pairing == null,
-            transitionSpec = {
-                (
+        CompositionLocalProvider(LocalMermaidSecurityLevel provides state.mermaidSecurityLevel) {
+            AnimatedContent(
+                targetState = state.pairing == null,
+                transitionSpec = {
                     (
-                        fadeIn(tween(180)) +
-                            scaleIn(
-                                initialScale = 0.985f,
-                                animationSpec = tween(210),
-                            )
-                    ) togetherWith (
-                        fadeOut(tween(120)) +
-                            scaleOut(
-                                targetScale = 0.985f,
-                                animationSpec = tween(170),
-                            )
+                        (
+                            fadeIn(tween(180)) +
+                                scaleIn(
+                                    initialScale = 0.985f,
+                                    animationSpec = tween(210),
+                                )
+                        ) togetherWith (
+                            fadeOut(tween(120)) +
+                                scaleOut(
+                                    targetScale = 0.985f,
+                                    animationSpec = tween(170),
+                                )
+                        )
+                    ).using(SizeTransform(clip = false))
+                },
+                label = "配对与终端切换",
+            ) { isPairing ->
+                if (isPairing) {
+                    PairingScreen(state, onPair, inMultiWindow)
+                } else {
+                    TaskTerminal(
+                        state = state,
+                        onUnpair = onUnpair,
+                        onControl = onControl,
+                        onFocus = onFocus,
+                        onToggleDashboard = onToggleDashboard,
+                        onToggleTerminalMode = onToggleTerminalMode,
+                        onOpenTaskConsumed = onOpenTaskConsumed,
+                        onSpeechRateChange = onSpeechRateChange,
+                        onToggleReplySpeech = onToggleReplySpeech,
+                        onMermaidSecurityLevelChange = onMermaidSecurityLevelChange,
+                        promptDrafts = promptDrafts,
+                        onPromptDraftChange = onPromptDraftChange,
+                        promptAttachments = promptAttachments,
+                        onAddAttachments = onAddAttachments,
+                        onRemoveAttachment = onRemoveAttachment,
+                        onRetryAttachment = onRetryAttachment,
                     )
-                ).using(SizeTransform(clip = false))
-            },
-            label = "配对与终端切换",
-        ) { isPairing ->
-            if (isPairing) {
-                PairingScreen(state, onPair, inMultiWindow)
-            } else {
-                TaskTerminal(
-                    state = state,
-                    onUnpair = onUnpair,
-                    onControl = onControl,
-                    onFocus = onFocus,
-                    onToggleDashboard = onToggleDashboard,
-                    onToggleTerminalMode = onToggleTerminalMode,
-                    onOpenTaskConsumed = onOpenTaskConsumed,
-                    onSpeechRateChange = onSpeechRateChange,
-                    onToggleReplySpeech = onToggleReplySpeech,
-                    promptDrafts = promptDrafts,
-                    onPromptDraftChange = onPromptDraftChange,
-                    promptAttachments = promptAttachments,
-                    onAddAttachments = onAddAttachments,
-                    onRemoveAttachment = onRemoveAttachment,
-                    onRetryAttachment = onRetryAttachment,
-                )
+                }
             }
         }
     }
@@ -441,6 +447,7 @@ private fun TaskTerminal(
     onOpenTaskConsumed: (String) -> Unit,
     onSpeechRateChange: (Float) -> Unit,
     onToggleReplySpeech: (String) -> Unit,
+    onMermaidSecurityLevelChange: (String) -> Unit = {},
     promptDrafts: Map<String, String>,
     onPromptDraftChange: (String, String) -> Unit,
     promptAttachments: Map<String, List<com.agentgrid.mobile.attachments.PromptAttachment>> = emptyMap(),
@@ -746,6 +753,7 @@ private fun TaskTerminal(
                 onSpeechRateChange = onSpeechRateChange,
                 onUnpair = onUnpair,
                 onToggleTerminalMode = onToggleTerminalMode,
+                onMermaidSecurityLevelChange = onMermaidSecurityLevelChange,
                 onControl = onControl,
                 // 矮窗口（横屏/悬浮窗）下 6 行会顶出可视区：面板限高 + 内部滚动，键才点得到。
                 panelMaxHeight = maxHeight - 60.dp,
@@ -2083,6 +2091,7 @@ private fun SettingsPanel(
     onSpeechRateChange: (Float) -> Unit,
     onUnpair: () -> Unit,
     onToggleTerminalMode: () -> Unit,
+    onMermaidSecurityLevelChange: (String) -> Unit,
     onControl: (String, ControlAction, String?, List<String>?) -> Unit,
     panelMaxHeight: Dp,
 ) {
@@ -2119,6 +2128,17 @@ private fun SettingsPanel(
             AgentGridColors.Muted,
         ) {
             onSpeechRateChange(nextSpeechRate(state.speechRate))
+        }
+        PixelButton(
+            "图表安全：${formatSecurityLevel(state.mermaidSecurityLevel)}",
+            when (state.mermaidSecurityLevel) {
+                "strict" -> AgentGridColors.Green
+                "loose" -> AgentGridColors.Amber
+                else -> AgentGridColors.Cyan
+            },
+        ) {
+            onMermaidSecurityLevelChange(MermaidSecurityLevel.next(state.mermaidSecurityLevel))
+            clearMermaidCache()
         }
         PixelButton(
             if (state.terminalMode) "专用模式：开" else "专用模式：关",
@@ -2159,6 +2179,12 @@ private fun nextSpeechRate(current: Float): Float {
 
 private fun formatSpeechRate(rate: Float): String =
     String.format(java.util.Locale.US, "%.2f", rate).trimEnd('0').trimEnd('.') + "x"
+
+private fun formatSecurityLevel(level: String): String = when (level) {
+    "strict" -> "严格"
+    "loose" -> "宽松"
+    else -> "防脚本"
+}
 
 private fun statusText(lifecycle: AgentLifecycle): String = when (lifecycle) {
     AgentLifecycle.OFFLINE -> "离线"

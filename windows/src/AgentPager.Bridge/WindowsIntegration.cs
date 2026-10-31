@@ -205,11 +205,13 @@ public sealed class PairingSecretStore
 public sealed class DailyFileLog
 {
     private readonly object _lock = new();
+    private readonly string _logsDirectory;
 
-    public DailyFileLog()
+    public DailyFileLog(string? logsDirectory = null)
     {
-        Directory.CreateDirectory(AgentPagerPaths.LogsDirectory);
-        foreach (var path in Directory.EnumerateFiles(AgentPagerPaths.LogsDirectory, "agentpager-*.log"))
+        _logsDirectory = logsDirectory ?? AgentPagerPaths.LogsDirectory;
+        Directory.CreateDirectory(_logsDirectory);
+        foreach (var path in Directory.EnumerateFiles(_logsDirectory, "agentpager-*.log"))
             if (File.GetLastWriteTimeUtc(path) < DateTime.UtcNow.AddDays(-7))
                 try { File.Delete(path); } catch (IOException) { }
     }
@@ -217,7 +219,7 @@ public sealed class DailyFileLog
     public void Write(string level, string message)
     {
         var line = $"{DateTimeOffset.Now:O} [{level}] {message}{Environment.NewLine}";
-        var path = Path.Combine(AgentPagerPaths.LogsDirectory, $"agentpager-{DateTime.Now:yyyy-MM-dd}.log");
+        var path = Path.Combine(_logsDirectory, $"agentpager-{DateTime.Now:yyyy-MM-dd}.log");
         lock (_lock) File.AppendAllText(path, line);
     }
 }

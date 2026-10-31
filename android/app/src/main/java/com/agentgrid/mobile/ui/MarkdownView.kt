@@ -543,6 +543,7 @@ object MarkdownParser {
 fun MarkdownView(
     markdown: String,
     modifier: Modifier = Modifier,
+    mermaidSecurityLevel: String = LocalMermaidSecurityLevel.current,
 ) {
     val blocks = remember(markdown) { MarkdownParser.parse(markdown) }
 
@@ -562,7 +563,7 @@ fun MarkdownView(
                     is MarkdownBlock.CodeBlock -> {
                         DisableSelection {
                             if (block.language.equals("mermaid", ignoreCase = true)) {
-                                MermaidBlockView(source = block.content)
+                                MermaidBlockView(source = block.content, securityLevel = mermaidSecurityLevel)
                             } else {
                                 CodeBlockView(block)
                             }

@@ -107,7 +107,7 @@ public partial class MainWindow : Window
         TunnelStatusText.Foreground = state.TunnelState switch
         {
             TunnelStatus.Running => TunnelBrushRunning,
-            TunnelStatus.Starting => TunnelBrushStarting,
+            TunnelStatus.Starting or TunnelStatus.Retrying => TunnelBrushStarting,
             TunnelStatus.Failed or TunnelStatus.NotFound => System.Windows.Media.Brushes.OrangeRed,
             _ => TunnelBrushDefault,
         };

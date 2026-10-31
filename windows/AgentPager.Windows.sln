@@ -10,6 +10,8 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{6C2F6947
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AgentPager.Core.Tests", "tests\AgentPager.Core.Tests\AgentPager.Core.Tests.csproj", "{01882F1B-E399-4CE0-9F08-F9CEDDE32519}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "AgentPager.Bridge.Tests", "tests\AgentPager.Bridge.Tests\AgentPager.Bridge.Tests.csproj", "{467C4ACD-F2BF-4860-8FD0-41308A0F0B33}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -28,8 +30,13 @@ Global
 		{01882F1B-E399-4CE0-9F08-F9CEDDE32519}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{01882F1B-E399-4CE0-9F08-F9CEDDE32519}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{01882F1B-E399-4CE0-9F08-F9CEDDE32519}.Release|Any CPU.Build.0 = Release|Any CPU
+		{467C4ACD-F2BF-4860-8FD0-41308A0F0B33}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{467C4ACD-F2BF-4860-8FD0-41308A0F0B33}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{467C4ACD-F2BF-4860-8FD0-41308A0F0B33}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{467C4ACD-F2BF-4860-8FD0-41308A0F0B33}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(NestedProjects) = preSolution
 		{01882F1B-E399-4CE0-9F08-F9CEDDE32519} = {6C2F6947-F39F-4C35-81A2-4EFF640BFB52}
+		{467C4ACD-F2BF-4860-8FD0-41308A0F0B33} = {6C2F6947-F39F-4C35-81A2-4EFF640BFB52}
 	EndGlobalSection
 EndGlobal

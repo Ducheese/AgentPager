@@ -71,6 +71,7 @@ class MainActivity : ComponentActivity() {
                 onOpenTaskConsumed = viewModel::consumeOpenTask,
                 onSpeechRateChange = viewModel::setSpeechRate,
                 onToggleReplySpeech = viewModel::toggleReplySpeech,
+                onMermaidSecurityLevelChange = viewModel::setMermaidSecurityLevel,
                 inMultiWindow = multiWindowState.value,
                 promptDrafts = viewModel.promptDrafts,
                 onPromptDraftChange = viewModel::setPromptDraft,

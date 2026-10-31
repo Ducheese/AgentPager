@@ -17,6 +17,7 @@ import com.agentgrid.mobile.attachments.PromptAttachment
 import com.agentgrid.mobile.attachments.PromptTokens
 import com.agentgrid.mobile.domain.ControlAction
 import com.agentgrid.mobile.domain.ControlResult
+import com.agentgrid.mobile.domain.MermaidSecurityLevel
 import com.agentgrid.mobile.domain.PendingRequest
 import com.agentgrid.mobile.domain.StateSnapshotPayload
 import com.agentgrid.mobile.domain.TaskDashboardProjection
@@ -54,6 +55,7 @@ data class AgentGridUiState(
     val openTaskRequest: String? = null,
     val speechFailure: ReplySpeech.SpeechFailure? = null,
     val speechRate: Float = 2.0f,
+    val mermaidSecurityLevel: String = MermaidSecurityLevel.DEFAULT,
 ) {
     val focusedTask: TaskSnapshot?
         get() = taskProjection.focusedTask
@@ -74,6 +76,9 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
         AgentGridUiState(
             terminalMode = preferences.getBoolean("terminal-mode", true),
             speechRate = preferences.getFloat("speech-rate", 2.0f),
+            mermaidSecurityLevel = MermaidSecurityLevel.normalize(
+                preferences.getString("mermaid-security-level", MermaidSecurityLevel.DEFAULT),
+            ),
         ),
     )
     val state: StateFlow<AgentGridUiState> = mutableState.asStateFlow()
@@ -562,6 +567,12 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
     fun setTerminalMode(enabled: Boolean) {
         preferences.edit { putBoolean("terminal-mode", enabled) }
         mutableState.value = mutableState.value.copy(terminalMode = enabled)
+    }
+
+    fun setMermaidSecurityLevel(level: String) {
+        val normalized = MermaidSecurityLevel.normalize(level)
+        preferences.edit { putString("mermaid-security-level", normalized) }
+        mutableState.value = mutableState.value.copy(mermaidSecurityLevel = normalized)
     }
 
     /**

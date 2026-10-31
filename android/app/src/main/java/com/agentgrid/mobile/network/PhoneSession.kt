@@ -383,7 +383,7 @@ internal class DefaultPhoneSession(
         }
     }
 
-    private fun acceptMessageLocked(text: String) {
+    private suspend fun acceptMessageLocked(text: String) {
         val envelope = runCatching { json.decodeFromString<IncomingEnvelope>(text) }
             .getOrElse {
                 mutableState.value = mutableState.value.copy(
@@ -415,6 +415,7 @@ internal class DefaultPhoneSession(
                 }
                 lastSnapshotSentAt = envelope.sentAt
                 lastSnapshotMessageID = envelope.messageId
+                applyTunnelHostLocked(snapshot.activeTunnelHost)
                 mutableState.value = mutableState.value.copy(
                     snapshot = snapshot,
                     problem = null,
@@ -445,6 +446,31 @@ internal class DefaultPhoneSession(
         }
     }
 
+    /**
+     * 桥每次重试都会换 Quick Tunnel 域名。域名是运行时状态，不是配对身份的一部分：
+     * 收到新 host 时更新本地保存的配对，下一次出门重连才会拨新地址。
+     * 旧地址已经失联、手机又不在局域网时收不到这条快照，这种情况仍然只能重新配对。
+     */
+    private suspend fun applyTunnelHostLocked(reported: String?) {
+        val current = pairing ?: return
+        val host = normalizeTunnelHost(reported) ?: return
+        if (host == normalizeTunnelHost(current.tunnelHost)) return
+
+        val updated = current.copy(tunnelHost = host)
+        pairing = updated
+        refreshEndpointsLocked(updated)
+        runCatching { credentialStore.save(updated) }
+    }
+
+    private fun refreshEndpointsLocked(value: PairingPayload) {
+        val candidates = endpointsFor(value)
+        if (candidates == endpoints) return
+
+        val current = endpoints.getOrNull(endpointIndex)
+        endpoints = candidates
+        endpointIndex = current?.let { candidates.indexOf(it) }?.takeIf { it >= 0 } ?: 0
+    }
+
     private fun connectLocked(value: PairingPayload) {
         val candidates = endpointsFor(value)
         // 配对没变时保留轮换位置（重连要接着上次的候选走，不能每次都退回局域网）。
@@ -471,10 +497,13 @@ internal class DefaultPhoneSession(
      * 桥那边已经洗过一遍了，但配对文本可能是手改过的，这里再洗一次：
      * 粘整段 https://xxx.ngrok-free.dev/ 进来是常态，不洗会拼出废 URL。
      */
-    private fun tunnelHostOf(value: PairingPayload): String? {
-        val raw = value.tunnelHost?.trim()?.takeIf { it.isNotEmpty() } ?: return null
-        val host = raw.substringAfter("://").substringBefore('/').substringBefore(':').trim()
-        return host.takeIf { it.isNotEmpty() }
+    private fun tunnelHostOf(value: PairingPayload): String? =
+        normalizeTunnelHost(value.tunnelHost)
+
+    private fun normalizeTunnelHost(raw: String?): String? {
+        val value = raw?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        return value.substringAfter("://").substringBefore('/').substringBefore(':').trim()
+            .takeIf { it.isNotEmpty() }
     }
 
     private fun disconnectAndRetryLocked(advanceEndpoint: Boolean) {

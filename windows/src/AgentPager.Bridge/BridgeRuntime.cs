@@ -20,7 +20,7 @@ public sealed record BridgeViewState(
     int TaskCount,
     string AgyHookText = "未安装",
     AntigravityPluginStatus AgyHookState = AntigravityPluginStatus.NotInstalled,
-    string TunnelStatusText = "未启动",
+    string TunnelStatusText = "未启用",
     TunnelStatus TunnelState = TunnelStatus.Stopped,
     string? ActiveTunnelHost = null);
 
@@ -54,6 +54,7 @@ public sealed class BridgeRuntime : IAsyncDisposable
     private readonly AgyUsageLoader _agyUsageLoader = new();
     private readonly CommandCodeUsageLoader _commandCodeUsageLoader = new();
     private readonly CmdcAccountsLoader _cmdcAccountsLoader = new();
+    private readonly OpenCodeGoUsageLoader _openCodeGoUsageLoader = new();
     private readonly CodexHookConfiguration _hookConfiguration = new();
     private readonly ClaudeHookConfiguration _claudeHookConfiguration = new();
     private readonly OpenCodePluginConfiguration _openCodePluginConfiguration = new();
@@ -70,7 +71,7 @@ public sealed class BridgeRuntime : IAsyncDisposable
     private int _disposeState;
     /// <summary>退出时单步等待上限。超时就继续下一步，整体由 App 的 2 秒预算兜底。</summary>
     private static readonly TimeSpan ExitWaitBudget = TimeSpan.FromMilliseconds(300);
-    private string _tunnelStatusText = "未启动";
+    private string _tunnelStatusText = "未启用";
     private HookTcpServer? _hookServer;
     private LanBridgeServer? _lanServer;
     private CancellationTokenSource? _linkedCancellation;
@@ -104,6 +105,7 @@ public sealed class BridgeRuntime : IAsyncDisposable
         _agyUsageLoader.Log = _log.Write;
         _commandCodeUsageLoader.Log = _log.Write;
         _cmdcAccountsLoader.Log = _log.Write;
+        _openCodeGoUsageLoader.Log = _log.Write;
         _pairingSecret = _secretStore.LoadOrCreate();
         _catalog = new(_persistence.Load());
         _ngrokService = new(
@@ -343,7 +345,7 @@ public sealed class BridgeRuntime : IAsyncDisposable
         // 老字段同步写：旧版本看到 false 就不会擅自拉起 ngrok。
         Settings.EnableNgrokTunnel = provider == TunnelProvider.Ngrok;
         Settings.Save();
-        _tunnelStatusText = provider == TunnelProvider.None ? "未启动" : "正在检测与启动...";
+        _tunnelStatusText = provider == TunnelProvider.None ? "未启用" : "正在检测与启动...";
         PublishState();
         _ = SwitchTunnelAsync(provider);
     }
@@ -385,6 +387,8 @@ public sealed class BridgeRuntime : IAsyncDisposable
         if (string.IsNullOrEmpty(host)) return;
         _log.Write("INFO", $"已获取 {provider} 公网域名：{host}");
         PublishState();
+        // WPF 刷新不等于手机收到：手机只吃 state.snapshot，隧道域名变了要立刻推一帧。
+        if (_lanServer is not null) _ = _lanServer.BroadcastAsync(SnapshotText());
     }
 
     private void OnTunnelStatus(TunnelProvider provider, TunnelStatus status, string? message)
@@ -655,23 +659,26 @@ public sealed class BridgeRuntime : IAsyncDisposable
                 var agyTask = Task.Run(() => _agyUsageLoader.Load(), cancellationToken);
                 var commandCodeTask = Task.Run(() => _commandCodeUsageLoader.Load(), cancellationToken);
                 var cmdcAccountsTask = Task.Run(() => _cmdcAccountsLoader.Load(null, cancellationToken), cancellationToken);
+                var openCodeGoTask = Task.Run(() => _openCodeGoUsageLoader.Load(), cancellationToken);
 
-                await Task.WhenAll(codexTask, agyTask, commandCodeTask, cmdcAccountsTask);
+                await Task.WhenAll(codexTask, agyTask, commandCodeTask, cmdcAccountsTask, openCodeGoTask);
 
                 var codex = await codexTask;
                 var agy = await agyTask;
                 var commandCode = await commandCodeTask;
                 var cmdcAccounts = await cmdcAccountsTask;
+                var openCodeGo = await openCodeGoTask;
 
                 var list = new List<UsageSnapshot>();
                 if (agy is not null) list.Add(agy);
                 if (commandCode is not null) list.Add(commandCode);
+                if (openCodeGo is not null) list.Add(openCodeGo);
                 // 多号：每个号一个快照（PlanType 照旧 "Command Code"，LimitID 是邮箱），
                 // App 侧 CMDC 全部面板下按号排。
                 list.AddRange(cmdcAccounts);
                 if (codex is not null) list.Add(codex);
 
-                var primary = agy ?? commandCode ?? codex;
+                var primary = agy ?? commandCode ?? openCodeGo ?? codex;
                 await _events.Writer.WriteAsync(new UsageEvent(primary, list), cancellationToken);
             }
             catch (OperationCanceledException) { break; }
@@ -712,6 +719,18 @@ public sealed class BridgeRuntime : IAsyncDisposable
         return Settings.TunnelHost;
     }
 
+    /// <summary>
+    /// state.snapshot 里同步给手机的必须是**当前运行中的隧道**，不能把手动填写的
+    /// Settings.TunnelHost 当成 active；否则隧道重试期间手机可能被改回旧手动域名。
+    /// </summary>
+    private string? RunningTunnelHost()
+    {
+        var service = ActiveTunnelService();
+        return service is { Status: TunnelStatus.Running } && !string.IsNullOrEmpty(service.ActiveHost)
+            ? service.ActiveHost
+            : null;
+    }
+
     private string PairingText() =>
         JsonSerializer.Serialize(new PairingPayload(
             1,
@@ -730,7 +749,13 @@ public sealed class BridgeRuntime : IAsyncDisposable
             Subagents = task.Subagents.Select(subagent =>
                 subagent with { LatestStep = ToolStepSanitizer.Sanitize(subagent.LatestStep) }).ToList(),
         }).ToList();
-        var payload = new StateSnapshotPayload(tasks, _usage, projection.FocusedTaskID, projection.PendingRequests, _usages.Count > 0 ? _usages : null);
+        var payload = new StateSnapshotPayload(
+            tasks,
+            _usage,
+            projection.FocusedTaskID,
+            projection.PendingRequests,
+            _usages.Count > 0 ? _usages : null,
+            RunningTunnelHost());
         return JsonSerializer.Serialize(MessageEnvelope<StateSnapshotPayload>.Create("state.snapshot", payload), WireJson.Options);
     }
 
@@ -770,6 +795,8 @@ public sealed class BridgeRuntime : IAsyncDisposable
             _ => $"已写入 v{agyVersion}",
         };
         var tunnelService = ActiveTunnelService();
+        var tunnelState = tunnelService?.Status ?? TunnelStatus.Stopped;
+        var tunnelHost = tunnelService?.ActiveHost;
         return new(
             _serviceStatus,
             _phoneCount,
@@ -786,10 +813,24 @@ public sealed class BridgeRuntime : IAsyncDisposable
             _catalog.Projection().Tasks.Count,
             agyText,
             agyStatus,
-            _tunnelStatusText,
-            tunnelService?.Status ?? TunnelStatus.Stopped,
-            tunnelService?.ActiveHost);
+            TunnelStatusLabel(tunnelState, tunnelHost),
+            tunnelState,
+            tunnelHost);
     }
+
+    /// <summary>
+    /// 状态文字必须由**当前状态**生成，不能只信服务最后一次回调：旧实现里失败/停止后
+    /// 可能还留着上一轮的 "在线：host"，窗口上就出现"离线却显示橙色在线"的误导文案。
+    /// </summary>
+    private string TunnelStatusLabel(TunnelStatus status, string? host) => status switch
+    {
+        TunnelStatus.Running when !string.IsNullOrWhiteSpace(host) => $"在线：{host}",
+        TunnelStatus.Running => "已连接，等待公网域名",
+        TunnelStatus.Stopped => "未启用",
+        _ when _tunnelStatusText.StartsWith("在线", StringComparison.Ordinal) =>
+            status == TunnelStatus.Retrying ? "正在重试连接..." : "未连接",
+        _ => _tunnelStatusText,
+    };
 
     private void PublishState()
     {

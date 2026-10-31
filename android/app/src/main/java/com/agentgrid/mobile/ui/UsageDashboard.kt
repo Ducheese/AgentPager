@@ -226,7 +226,16 @@ private fun QuotaPanel(
 ) {
     val isAgy = usage?.planType?.contains("Antigravity", ignoreCase = true) == true
     val isCmdc = usage?.planType?.contains("Command Code", ignoreCase = true) == true
+    // OpenCode Go 三个窗口都是百分比（5 小时 / 周 / 月），所以比另外两家多画一根细条。
+    val isOpenCodeGo = usage?.planType?.contains("OpenCode Go", ignoreCase = true) == true
+    // 横屏定高 310dp：百分比/进度条区域可能放不下（OCG 三根、或字体放大时两家也会超）。
+    // 只滚这块内容，标题和 footer 固定；竖屏由外层滚动容器接管，不要套两层。
+    val quotaScroll = rememberScrollState()
     val windows = usage?.windows.orEmpty()
+    // 切提供商 / GEMINI↔3P / CMDC 当前↔全部 时回到顶部。
+    LaunchedEffect(usage?.planType, selectedGroup, selectedCmdcView) {
+        quotaScroll.scrollTo(0)
+    }
     val hasThreeP = windows.any { it.key.startsWith("3p") }
     // 自动收回监听：3P 没了回 GEMINI，单/零 CMDC 号时回"当前"
     // 注意：跨刷新的状态保持靠 remember 天然完成，这两个 effect 只管"收回"，不管"保持"。
@@ -237,23 +246,51 @@ private fun QuotaPanel(
         if (isCmdc && cmdcAccounts.isEmpty()) onSelectCmdcView(0)
     }
 
-    // 画条的两个窗口：先按 key 取（agy 的 primary/secondary），取不到就退到"前两个要画条的窗口"——
-    // 这样新增提供商不用改这里也能显示（Command Code 的 key 就不是 primary/secondary）。
+    // 画条按提供商自己的槽位取；未知就留占位（空条 + --% + 重置时间未知），
+    // 不允许拿别的窗口顶替，避免把周额度画成 5 小时或重复画月额度。
     val barWindows = windows.filter { it.detail == null }
-    val primary = if (hasThreeP && selectedGroup == 1) {
-        windows.firstOrNull { it.key == "3p-5h" }
-    } else {
-        windows.firstOrNull { it.key == "primary" } ?: barWindows.getOrNull(0)
+    val primary: UsageWindow?
+    val secondary: UsageWindow?
+    val primaryLabel: String
+    val secondaryLabel: String
+    when {
+        isOpenCodeGo -> {
+            primary = windows.firstOrNull { it.key == "oc-rolling" }
+            secondary = windows.firstOrNull { it.key == "oc-weekly" }
+            primaryLabel = "5 小时"
+            secondaryLabel = "周额度"
+        }
+        isCmdc -> {
+            primary = windows.firstOrNull { it.key == "cc-5h" }
+            secondary = windows.firstOrNull { it.key == "cc-weekly" }
+            primaryLabel = "5 小时"
+            secondaryLabel = "周额度"
+        }
+        isAgy && hasThreeP && selectedGroup == 1 -> {
+            primary = windows.firstOrNull { it.key == "3p-5h" }
+            secondary = windows.firstOrNull { it.key == "3p-weekly" }
+            primaryLabel = "Claude/GPT 5H"
+            secondaryLabel = "Claude/GPT 周额度"
+        }
+        isAgy -> {
+            primary = windows.firstOrNull { it.key == "primary" }
+            secondary = windows.firstOrNull { it.key == "secondary" }
+            primaryLabel = "Gemini 5H"
+            secondaryLabel = "Gemini 周额度"
+        }
+        else -> {
+            // Codex 仍保留原来的通用回退；它的未知态不照搬。
+            primary = windows.firstOrNull { it.key == "primary" } ?: barWindows.getOrNull(0)
+            secondary = windows.firstOrNull { it.key == "secondary" } ?: barWindows.getOrNull(1)
+            primaryLabel = "5H"
+            secondaryLabel = "7D"
+        }
     }
-
-    val secondary = if (hasThreeP && selectedGroup == 1) {
-        windows.firstOrNull { it.key == "3p-weekly" }
-    } else {
-        windows.firstOrNull { it.key == "secondary" } ?: barWindows.getOrNull(1)
-    }
+    val openCodeGoMonthly = windows.firstOrNull { it.key == "oc-monthly" }
 
     // 不带百分比的窗口（如月额度余额）只占一行文字，不画条。
     val noteWindow = windows.firstOrNull { it.detail != null }
+    val showCmdcAll = isCmdc && selectedCmdcView == 1 && cmdcAccounts.isNotEmpty()
 
     Column(
         modifier = modifier,
@@ -329,6 +366,8 @@ private fun QuotaPanel(
                             "Antigravity" -> usage?.limitID?.uppercase() ?: "GOOGLE AI PRO"
                             // Command Code 显示成 "COMMAND CODE GO 订阅"（GO 由 planId 推出）
                             "Command Code" -> usage?.limitID?.uppercase()?.let { "$it 订阅" } ?: "订阅计划"
+                            // OpenCode Go 的 usage 接口不返回套餐档位，LimitID 固定为产品名
+                            "OpenCode Go" -> usage?.limitID?.uppercase()?.let { "$it 订阅" } ?: "OPENCODE GO 订阅"
                             else -> usage?.planType?.uppercase()?.let { "$it 计划" } ?: "订阅计划"
                         },
                         color = AgentGridColors.Muted,
@@ -355,35 +394,48 @@ private fun QuotaPanel(
             }
         }
 
-        val showCmdcAll = isCmdc && selectedCmdcView == 1 && cmdcAccounts.isNotEmpty()
-        if (!showCmdcAll) {
-            PrimaryQuota(window = primary)
-
-            SecondaryQuota(window = secondary)
-
-            noteWindow?.detail?.let { detail ->
-                Text(
-                    "${noteWindow.label} · $detail",
-                    color = AgentGridColors.Muted,
-                    fontSize = 10.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
+        // 所有子面板共用同一个内容滚动区：标题和 footer 固定，只滚中间的百分比/进度条/
+        // 账号列表。CMDC「全部」不再单独套内滚，避免双层滚动。
+        Column(
+            modifier = if (compact) {
+                Modifier
+            } else {
+                Modifier
+                    .weight(1f)
+                    .verticalScroll(quotaScroll)
+            },
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            if (showCmdcAll) {
+                // 全部：多号从上到下，一行一号（邮箱 + 周% · MM-dd · 余额月重置），纯文字不画条。
+                CmdcAccountsPanel(
+                    accounts = cmdcAccounts,
+                    modifier = Modifier.padding(top = 10.dp, bottom = 6.dp),
                 )
+            } else {
+                PrimaryQuota(window = primary, fallbackLabel = primaryLabel)
+
+                SecondaryQuota(window = secondary, fallbackLabel = secondaryLabel)
+
+                if (isOpenCodeGo) {
+                    SecondaryQuota(window = openCodeGoMonthly, fallbackLabel = "月额度")
+                }
+
+                when {
+                    noteWindow?.detail != null -> Text(
+                        "${noteWindow.label} · ${noteWindow.detail}",
+                        color = AgentGridColors.Muted,
+                        fontSize = 10.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    isCmdc -> Text(
+                        "月额度 · 余额未知 · 重置时间未知",
+                        color = AgentGridColors.Muted,
+                        fontSize = 10.sp,
+                    )
+                }
             }
-        } else {
-            // 全部：多号从上到下，一行一号（邮箱 + 周% · MM-dd · 余额月重置），纯文字不画条。
-            // 横屏定高 310dp 下 5 行放不下，内滚；竖屏外层已有滚动，不套。
-            CmdcAccountsPanel(
-                accounts = cmdcAccounts,
-                modifier = if (!compact) {
-                    Modifier
-                        .padding(top = 10.dp, bottom = 6.dp)
-                        .weight(1f, fill = false)
-                        .verticalScroll(rememberScrollState())
-                } else {
-                    Modifier
-                },
-            )
         }
 
         Text(
@@ -402,6 +454,7 @@ private fun QuotaPanel(
 private fun providerName(usage: UsageSnapshot?): String = when {
     usage?.planType?.contains("Antigravity", ignoreCase = true) == true -> "Antigravity"
     usage?.planType?.contains("Command Code", ignoreCase = true) == true -> "Command Code"
+    usage?.planType?.contains("OpenCode Go", ignoreCase = true) == true -> "OpenCode Go"
     else -> "Codex"
 }
 
@@ -409,6 +462,7 @@ private fun providerName(usage: UsageSnapshot?): String = when {
 private fun providerLabel(usage: UsageSnapshot?): String = when (providerName(usage)) {
     "Antigravity" -> "AGY"
     "Command Code" -> "CMDC"
+    "OpenCode Go" -> "OCG"
     else -> "CODEX"
 }
 
@@ -588,10 +642,10 @@ private fun GroupTab(label: String, selected: Boolean, onClick: () -> Unit) {
 }
 
 @Composable
-private fun PrimaryQuota(window: UsageWindow?) {
+private fun PrimaryQuota(window: UsageWindow?, fallbackLabel: String = "5H") {
     val remaining = window?.remainingPercentage?.roundToInt()?.coerceIn(0, 100)
     val color = quotaColor(remaining)
-    val label = window?.label?.uppercase() ?: "5H"
+    val label = window?.label?.uppercase() ?: fallbackLabel.uppercase()
     val displayLabel = if (label.endsWith("剩余")) label else "$label 剩余"
 
     Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
@@ -621,7 +675,7 @@ private fun PrimaryQuota(window: UsageWindow?) {
                 .fillMaxWidth()
                 .height(5.dp)
                 .semantics {
-                    contentDescription = "主要额度剩余 ${remaining ?: 0}%"
+                    contentDescription = remaining?.let { "主要额度剩余 $it%" } ?: "主要额度未知"
                 },
             color = color,
             trackColor = AgentGridColors.Divider,
@@ -637,10 +691,10 @@ private fun PrimaryQuota(window: UsageWindow?) {
 }
 
 @Composable
-private fun SecondaryQuota(window: UsageWindow?) {
+private fun SecondaryQuota(window: UsageWindow?, fallbackLabel: String = "7D") {
     val remaining = window?.remainingPercentage?.roundToInt()?.coerceIn(0, 100)
     val color = quotaColor(remaining)
-    val label = window?.label?.uppercase() ?: "7D"
+    val label = window?.label?.uppercase() ?: fallbackLabel.uppercase()
     val displayLabel = if (label.endsWith("额度")) label else "$label 额度"
 
     Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
@@ -667,7 +721,7 @@ private fun SecondaryQuota(window: UsageWindow?) {
                 .fillMaxWidth()
                 .height(3.dp)
                 .semantics {
-                    contentDescription = "次要额度剩余 ${remaining ?: 0}%"
+                    contentDescription = remaining?.let { "次要额度剩余 $it%" } ?: "次要额度未知"
                 },
             color = color,
             trackColor = AgentGridColors.Divider,

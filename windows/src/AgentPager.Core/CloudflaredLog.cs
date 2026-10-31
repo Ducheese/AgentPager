@@ -9,8 +9,12 @@ namespace AgentPager.Core;
 /// </summary>
 public static class CloudflaredLog
 {
+    // 必须排除 api.trycloudflare.com：cloudflared 建 Quick Tunnel 时会先请求
+    // `https://api.trycloudflare.com/tunnel`，那行日志里也带 trycloudflare 域名。
+    // 旧正则把它当成公网域名报给手机，结果桥显示"在线：api.trycloudflare.com"、
+    // 配对文本也写进这个假域名——隧道实际没建好（2026-10-31 开机自启实测）。
     private static readonly Regex QuickTunnelUrl = new(
-        @"https://([a-z0-9-]+\.trycloudflare\.com)",
+        @"https://(?!api\.)([a-z0-9-]+\.trycloudflare\.com)",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
     /// <summary>

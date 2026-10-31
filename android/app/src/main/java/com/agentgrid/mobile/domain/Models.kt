@@ -231,6 +231,8 @@ data class StateSnapshotPayload(
     val focusedTaskID: String? = null,
     val pendingRequests: List<PendingRequest> = emptyList(),
     val usages: List<UsageSnapshot> = emptyList(),
+    /** 桥当前正在使用的隧道域名（运行时值，可能随重试变化）。 */
+    val activeTunnelHost: String? = null,
 )
 
 @Serializable

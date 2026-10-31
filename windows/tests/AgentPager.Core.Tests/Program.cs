@@ -3045,6 +3045,30 @@ Check(geminiWeekly?.WindowMinutes == 10080, "agy quota: secondary windowMinutes=
 var threeP5h = parsedQuota.Value.Windows.FirstOrDefault(w => w.Key == "3p-5h");
 Check(threeP5h is not null && Math.Abs(threeP5h.RemainingPercentage - 100.0) < 0.1, "agy quota: 3p-5h is 100%");
 
+const string agyMissingFraction = """
+{"command":{"data":{"groups":[
+  {"name":"Gemini Models","buckets":[
+    {"id":"gemini-5h","window":"5h"},
+    {"id":"gemini-weekly","window":"weekly","remaining_fraction":0.5,"reset_time":"2026-10-15T08:11:53Z"}
+  ]}
+]}}}
+""";
+var agyPartial = AgyUsageLoader.ParseQuotaJson(agyMissingFraction, testNow);
+Check(agyPartial?.Windows.Count == 1 && agyPartial.Value.Windows[0].Key == "secondary",
+    "agy quota: missing remaining_fraction is skipped, not treated as 100% remaining");
+
+const string agyAllMissing = """
+{"command":{"data":{"groups":[
+  {"name":"Gemini Models","buckets":[
+    {"id":"gemini-5h","window":"5h"},
+    {"id":"gemini-weekly","window":"weekly"}
+  ]}
+]}}}
+""";
+var agyAllMissingParsed = AgyUsageLoader.ParseQuotaJson(agyAllMissing, testNow);
+Check(agyAllMissingParsed is not null && agyAllMissingParsed.Value.Windows.Count == 0,
+    "agy quota: valid response with all fields missing yields an empty unknown snapshot");
+
 // AgyUsageLoader.Load 联动测试（mock brain 目录与 transcript.jsonl）
 var tempBrainDir = Path.Combine(Path.GetTempPath(), "agentpager_test_brain_" + Guid.NewGuid().ToString("N"));
 var tempSessionDir = Path.Combine(tempBrainDir, "test_session", ".system_generated", "logs");
@@ -3074,6 +3098,19 @@ try
     Check(todayPoint?.InputTokens == 3000, $"agy usage loader: input tokens = 3000 (got {todayPoint?.InputTokens})");
     Check(todayPoint?.CachedInputTokens == 1500, $"agy usage loader: cached tokens = 1500 (got {todayPoint?.CachedInputTokens})");
     Check(todayPoint?.OutputTokens == 500, $"agy usage loader: output tokens = 500 (got {todayPoint?.OutputTokens})");
+
+    // 响应成功但字段全缺：返回空窗口快照，让 UI 画未知占位。
+    AgyUsageLoader.QuotaJsonProviderOverride = () => """{"command":{"data":{"groups":[]}}}""";
+    var unknownLoader = new AgyUsageLoader();
+    var unknownSnapshot = unknownLoader.Load(testNow);
+    Check(unknownSnapshot is not null && unknownSnapshot.Windows.Count == 0,
+        "agy usage loader: successful empty quota yields an unknown panel");
+
+    // 首次拿不到 quota 就不显示面板，即使本地还有历史 token。
+    AgyUsageLoader.QuotaJsonProviderOverride = () => "";
+    var noQuotaLoader = new AgyUsageLoader();
+    Check(noQuotaLoader.Load(testNow) is null,
+        "agy usage loader: no quota means no panel even when history exists");
 }
 finally
 {
@@ -3154,8 +3191,99 @@ Check(cmdcDaily.Count == 2 && cmdcDaily[0].Date == "2026-10-04" && cmdcDaily[0].
 
 // 缺字段不能崩：credits 缺席时应当返回空列表，交给上层决定是否沿用缓存。
 Check(CommandCodeUsageLoader.ParseWindows("{}", null, DateTimeOffset.Now).Count == 0, "cmdc: empty payload yields no windows");
+
+const string cmdcMissingUsed = """
+{"credits":{"monthlyCredits":1},
+ "windowLimits":{"fiveHour":{"cap":3},"weekly":{"used":1,"cap":2}}}
+""";
+var cmdcPartial = CommandCodeUsageLoader.ParseWindows(cmdcMissingUsed, null, DateTimeOffset.Now);
+Check(cmdcPartial.All(w => w.Key != "cc-5h"),
+    "cmdc: missing used is skipped, not treated as 0% used");
+Check(cmdcPartial.Any(w => w.Key == "cc-weekly"), "cmdc: valid weekly window survives a missing sibling");
+
+CommandCodeUsageLoader.HttpGetOverride = _ => "{}";
+var emptyCmdcLoader = new CommandCodeUsageLoader();
+var emptyCmdcSnapshot = emptyCmdcLoader.Load(DateTimeOffset.Now);
+Check(emptyCmdcSnapshot is not null && emptyCmdcSnapshot.Windows.Count == 0,
+    "cmdc: successful empty response yields an unknown panel");
+CommandCodeUsageLoader.HttpGetOverride = null;
+
 Check(CommandCodeUsageLoader.ParseDaily(null, DateTimeOffset.Now).Count == 0, "cmdc: missing summary yields no daily points");
 Check(CommandCodeUsageLoader.SubscriptionPeriodEnd("not json") is null, "cmdc: malformed subscription json is tolerated");
+
+// OpenCode Go 额度：官方 GET /zen/go/v1/usage，样本是 2026-10-31 真机抓的真实响应。
+const string openCodeGoUsage = """
+{"usage":{"rolling":{"status":"ok","percent":0,"resetsAt":"2026-10-31T17:26:23.000Z"},
+          "weekly":{"status":"ok","percent":0,"resetsAt":"2026-11-02T00:00:00.000Z"},
+          "monthly":{"status":"ok","percent":0,"resetsAt":"2026-11-30T11:58:04.000Z"}}}
+""";
+var openCodeGoWindows = OpenCodeGoUsageLoader.ParseWindows(openCodeGoUsage);
+Check(openCodeGoWindows.Count == 3, $"opencode-go: three windows (got {openCodeGoWindows.Count})");
+var ocgRolling = openCodeGoWindows.FirstOrDefault(w => w.Key == "oc-rolling");
+Check(ocgRolling?.WindowMinutes == 300 && Math.Abs(ocgRolling.RemainingPercentage - 100) < 0.01,
+    $"opencode-go: rolling window parsed (got {ocgRolling?.WindowMinutes}min / {ocgRolling?.RemainingPercentage}%)");
+Check(ocgRolling?.ResetsAt == new DateTimeOffset(2026, 10, 31, 17, 26, 23, TimeSpan.Zero),
+    $"opencode-go: rolling reset parsed (got {ocgRolling?.ResetsAt})");
+var ocgWeekly = openCodeGoWindows.FirstOrDefault(w => w.Key == "oc-weekly");
+Check(ocgWeekly?.WindowMinutes == 10080, "opencode-go: weekly window is 10080 minutes");
+var ocgMonthly = openCodeGoWindows.FirstOrDefault(w => w.Key == "oc-monthly");
+Check(ocgMonthly?.WindowMinutes == 43200, "opencode-go: monthly window is 43200 minutes");
+
+const string openCodeGoPercent = """
+{"usage":{"rolling":{"status":"ok","percent":86,"resetsAt":"2026-10-31T17:26:23.000Z"},
+          "weekly":{"status":"ok","percent":34,"resetsAt":"2026-11-02T00:00:00.000Z"},
+          "monthly":{"status":"rate-limited","percent":99,"resetsAt":"2026-11-30T11:58:04.000Z"}}}
+""";
+var ocgPercent = OpenCodeGoUsageLoader.ParseWindows(openCodeGoPercent);
+Check(Math.Abs(ocgPercent.First(w => w.Key == "oc-rolling").UsedPercentage - 86) < 0.01,
+    "opencode-go: percent is a 0..100 percentage, not a 0..1 fraction");
+Check(Math.Abs(ocgPercent.First(w => w.Key == "oc-monthly").UsedPercentage - 100) < 0.01,
+    "opencode-go: rate-limited means spent even when the floored percent says 99");
+
+const string openCodeGoMissingPercent = """
+{"usage":{"rolling":{"status":"ok","resetsAt":"2026-10-31T17:26:23.000Z"},
+          "weekly":{"status":"ok","percent":34,"resetsAt":"2026-11-02T00:00:00.000Z"},
+          "monthly":{"status":"rate-limited","resetsAt":"2026-11-30T11:58:04.000Z"}}}
+""";
+var ocgMissingPercent = OpenCodeGoUsageLoader.ParseWindows(openCodeGoMissingPercent);
+Check(ocgMissingPercent.Count == 2, $"opencode-go: unknown window is skipped (got {ocgMissingPercent.Count})");
+Check(ocgMissingPercent.All(w => w.Key != "oc-rolling"), "opencode-go: missing percent is not treated as 0% used");
+Check(Math.Abs(ocgMissingPercent.First(w => w.Key == "oc-monthly").UsedPercentage - 100) < 0.01,
+    "opencode-go: rate-limited without percent is still fully spent");
+
+OpenCodeGoUsageLoader.HttpGetOverride = _ => "{}";
+var emptyOcgSnapshot = new OpenCodeGoUsageLoader().Load(DateTimeOffset.UtcNow);
+Check(emptyOcgSnapshot is not null && emptyOcgSnapshot.Windows.Count == 0,
+    "opencode-go: successful empty response yields an unknown panel");
+OpenCodeGoUsageLoader.HttpGetOverride = null;
+
+OpenCodeGoUsageLoader.AuthJsonProviderOverride = () => """{"opencode-go":{"type":"api","key":"sk_test"}}""";
+OpenCodeGoUsageLoader.HttpGetOverride = url => url.EndsWith("/zen/go/v1/usage") ? openCodeGoPercent : null;
+var openCodeGoLoader = new OpenCodeGoUsageLoader();
+var openCodeGoNow = DateTimeOffset.UtcNow;
+var openCodeGoSnapshot = openCodeGoLoader.Load(openCodeGoNow);
+Check(openCodeGoSnapshot?.PlanType == "OpenCode Go" && openCodeGoSnapshot.LimitID == "OpenCode Go",
+    $"opencode-go: snapshot identity (got {openCodeGoSnapshot?.PlanType}/{openCodeGoSnapshot?.LimitID})");
+Check(openCodeGoSnapshot?.Windows.Count == 3, "opencode-go: snapshot carries three windows");
+var failedRefreshAttempts = 0;
+OpenCodeGoUsageLoader.HttpGetOverride = _ =>
+{
+    failedRefreshAttempts++;
+    return null;
+};
+// 越过 5 分钟 TTL，必须真的走一次网络（旧测试用 +1min，命中缓存，根本没测到失败兜底）。
+var openCodeGoCached = openCodeGoLoader.Load(openCodeGoNow.AddMinutes(6));
+Check(failedRefreshAttempts == 1, $"opencode-go: expired cache actually attempts the network (got {failedRefreshAttempts} attempts)");
+Check(ReferenceEquals(openCodeGoCached, openCodeGoSnapshot),
+    "opencode-go: failed refresh keeps the exact last good snapshot");
+
+// 缺 key：不碰网络，返回 null（而不是拿空窗口建快照）。
+OpenCodeGoUsageLoader.AuthJsonProviderOverride = () => "{}";
+OpenCodeGoUsageLoader.HttpGetOverride = null;
+var noKeyLoader = new OpenCodeGoUsageLoader();
+Check(noKeyLoader.Load(openCodeGoNow) is null, "opencode-go: missing auth key yields no snapshot");
+OpenCodeGoUsageLoader.AuthJsonProviderOverride = null;
+OpenCodeGoUsageLoader.HttpGetOverride = null;
 
 // 多 cmdc 号：ccgo.txt 解析 + 逐号快照（stub HTTP，不碰真 API）。
 CmdcAccountsLoader.AccountsFileProviderOverride = () => """
@@ -4106,6 +4234,13 @@ Check(JsonSerializer.Deserialize<PairingPayload>(PairingJson("xxx-yyy.ngrok-free
 Check(!PairingJson(null).Contains("tunnelHost"), "pairing: absent tunnel host is omitted from the payload");
 Check(JsonSerializer.Deserialize<PairingPayload>(PairingJson(null), WireJson.Options)?.TunnelHost is null, "pairing: payload without tunnel host still parses");
 
+// state.snapshot 的线上契约：手机按 activeTunnelHost 更新保存的隧道域名，字段名不能漂。
+var snapshotJson = JsonSerializer.Serialize(
+    new StateSnapshotPayload(new(), null, null, new(), null, "latest.trycloudflare.com"),
+    WireJson.Options);
+Check(snapshotJson.Contains("\"activeTunnelHost\":\"latest.trycloudflare.com\""),
+    "state snapshot: active tunnel host is serialized as activeTunnelHost");
+
 // Cloudflared Quick Tunnel：域名只出现在 stderr 日志里（没有 ngrok 的 4040 API），
 // 解析规则必须钉住——抓错一行就会把 region*.v2.argotunnel.com 当成手机入口。
 Check(CloudflaredLog.TryParseQuickTunnelHost("2026-10-24T16:10:43Z INF |  https://nest-capture-dried-noted.trycloudflare.com  |") == "nest-capture-dried-noted.trycloudflare.com", "cloudflared: quick tunnel url extracted from log line");
@@ -4113,6 +4248,8 @@ Check(CloudflaredLog.TryParseQuickTunnelHost("Your quick Tunnel has been created
 Check(CloudflaredLog.TryParseQuickTunnelHost("https://ABC-DEF.trycloudflare.com") == "abc-def.trycloudflare.com", "cloudflared: host is lowercased");
 Check(CloudflaredLog.TryParseQuickTunnelHost("INF Registered tunnel connection connIndex=0 location=lax13 protocol=http2") is null, "cloudflared: connection line has no host");
 Check(CloudflaredLog.TryParseQuickTunnelHost("precheck target=region1.v2.argotunnel.com status=pass") is null, "cloudflared: argotunnel target is not a public host");
+Check(CloudflaredLog.TryParseQuickTunnelHost("INF Requesting new quick Tunnel on trycloudflare.com... url=https://api.trycloudflare.com/tunnel") is null,
+    "cloudflared: api.trycloudflare.com is the control API, not the quick tunnel host");
 Check(CloudflaredLog.TryParseQuickTunnelHost("https://example.com") is null, "cloudflared: non-trycloudflare url is ignored");
 Check(CloudflaredLog.TryParseQuickTunnelHost(null) is null, "cloudflared: null line is ignored");
 

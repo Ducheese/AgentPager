@@ -59,14 +59,13 @@ public sealed class AgyUsageLoader
     {
         var current = now ?? DateTimeOffset.Now;
         var quota = GetOrFetchQuota(current);
+        // 没有 quota 就没有面板：即使本地还有历史 token，也不拿空窗口冒充“未知额度”。
+        // AGY 的未知只允许出现在“quota 请求成功、但某个字段缺失”的情况。
+        if (quota is null) return null;
 
         var brainRoot = AgyTranscriptReader.BrainRoot;
-        if (!Directory.Exists(brainRoot) && quota is null) return null;
-
         var start = current.Date.AddDays(-(HistoryDays - 1));
         var buckets = AggregateDailyTokens(brainRoot, start);
-
-        if (quota is null && buckets.Count == 0) return null;
 
         var daily = Enumerable.Range(0, HistoryDays).Select(offset =>
         {
@@ -75,8 +74,8 @@ public sealed class AgyUsageLoader
             return new DailyUsagePoint(date, usage.Input, usage.Cached, usage.Output, 0, usage.Total);
         }).ToList();
 
-        return new(quota?.CapturedAt ?? current, quota?.PlanType ?? "Antigravity", quota?.LimitID ?? "Google AI Pro",
-            quota?.Windows ?? [], daily);
+        return new(quota.Value.CapturedAt, quota.Value.PlanType ?? "Antigravity",
+            quota.Value.LimitID ?? "Google AI Pro", quota.Value.Windows, daily);
     }
 
     public (DateTimeOffset CapturedAt, List<UsageWindow> Windows, string? PlanType, string? LimitID)? GetOrFetchQuota(DateTimeOffset now)
@@ -138,7 +137,12 @@ public sealed class AgyUsageLoader
                 {
                     var id = bucket.TryGetProperty("id", out var idProp) ? idProp.GetString() : "";
                     var windowType = bucket.TryGetProperty("window", out var wProp) ? wProp.GetString() : "";
-                    var fraction = bucket.TryGetProperty("remaining_fraction", out var fProp) ? fProp.GetDouble() : 1.0;
+                    // 字段缺失按“未知”处理：跳过这个窗口，由 UI 画空条/--%/重置未知，
+                    // 不能默认 100% 剩余。
+                    if (!bucket.TryGetProperty("remaining_fraction", out var fProp) ||
+                        fProp.ValueKind != JsonValueKind.Number) continue;
+                    var fraction = fProp.GetDouble();
+                    if (!double.IsFinite(fraction)) continue;
                     DateTimeOffset? resetTime = bucket.TryGetProperty("reset_time", out var rProp) &&
                                                 DateTimeOffset.TryParse(rProp.GetString(), out var parsedReset)
                         ? parsedReset
@@ -177,8 +181,8 @@ public sealed class AgyUsageLoader
             if (threeP5h is not null) windows.Add(threeP5h);
             if (threePWeekly is not null) windows.Add(threePWeekly);
 
-            if (windows.Count == 0) return null;
-
+            // 结构解析成功但一个字段都没拿到：这是“未知”，不是“没有 quota”。
+            // 返回空窗口快照，让 UI 画全未知占位；真正请求失败才由 Load 返回 null。
             return (now, windows, "Antigravity", "Google AI Pro");
         }
         catch

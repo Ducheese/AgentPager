@@ -5,6 +5,8 @@ public enum TunnelStatus
 {
     Stopped,
     Starting,
+    /// <summary>上一次启动失败，正在退避等待后自动重试（区别于"已经放弃"的 Failed）。</summary>
+    Retrying,
     Running,
     Failed,
     NotFound,

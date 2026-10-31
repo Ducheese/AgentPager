@@ -29,7 +29,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -46,7 +48,10 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.agentgrid.mobile.domain.MermaidSecurityLevel
 import kotlinx.coroutines.delay
+
+val LocalMermaidSecurityLevel = compositionLocalOf { MermaidSecurityLevel.DEFAULT }
 
 /**
  * ```mermaid 代码块的渲染视图：
@@ -58,11 +63,12 @@ import kotlinx.coroutines.delay
 fun MermaidBlockView(
     source: String,
     modifier: Modifier = Modifier,
+    securityLevel: String = LocalMermaidSecurityLevel.current,
 ) {
     val density = LocalDensity.current
-    var isFailed by remember(source) { mutableStateOf(false) }
-    var errorMessage by remember(source) { mutableStateOf<String?>(null) }
-    var contentHeightPx by remember(source) { mutableFloatStateOf(0f) }
+    var isFailed by remember(source, securityLevel) { mutableStateOf(false) }
+    var errorMessage by remember(source, securityLevel) { mutableStateOf<String?>(null) }
+    var contentHeightPx by remember(source, securityLevel) { mutableFloatStateOf(0f) }
     var fullscreen by remember(source) { mutableStateOf(false) }
 
     val base64Code = remember(source) {
@@ -86,10 +92,12 @@ fun MermaidBlockView(
         }
     } else {
         // 语法正确：内嵌自适应渲染，点击任意区域进入全屏查看
-        val inlineHtml = remember(base64Code) { buildMermaidHtml(base64Code, isInteractive = false) }
+        val inlineHtml = remember(base64Code, securityLevel) {
+            buildMermaidHtml(base64Code, isInteractive = false, securityLevel = securityLevel)
+        }
         // 记录已加载的 html（按引用比较）：只有源码真的变了才重载，避免每次重组都把 3.5MB 脚本重跑一遍
         val loadedHtml = remember { arrayOfNulls<String>(1) }
-        val webViewRef = remember(source) { arrayOfNulls<WebView>(1) }
+        val webViewRef = remember(source, securityLevel) { arrayOfNulls<WebView>(1) }
         val dynamicHeight = with(density) {
             if (contentHeightPx > 0f) {
                 (contentHeightPx.toDp() + 12.dp).coerceIn(80.dp, 600.dp)
@@ -138,8 +146,8 @@ fun MermaidBlockView(
             ) {
                 val boxWidthPx = constraints.maxWidth
                 // 渲染过的宽度直接复用截图：滚出屏幕再回来不再重建 WebView、重跑 3.5MB 脚本
-                val cached = remember(source, boxWidthPx) {
-                    MermaidBitmapCache.get(MermaidBitmapCache.key(source, boxWidthPx))
+                val cached = remember(source, boxWidthPx, securityLevel) {
+                    MermaidBitmapCache.get(MermaidBitmapCache.key(source, boxWidthPx, securityLevel))
                 }
                 val boxHeight = cached
                     ?.let { with(density) { it.height.toDp() } }
@@ -148,7 +156,7 @@ fun MermaidBlockView(
 
                 // 20 秒兜底：既没有缓存、也没有任何回调时才降级源码。
                 // 慢设备上多张图同时渲染时，10 秒会误杀还在排队的图。
-                LaunchedEffect(source, cached != null) {
+                LaunchedEffect(source, cached != null, securityLevel) {
                     if (cached != null) return@LaunchedEffect
                     delay(20_000)
                     if (contentHeightPx <= 0f && !isFailed) {
@@ -160,7 +168,7 @@ fun MermaidBlockView(
                 if (cached == null) {
                     // 首次渲染（或新的宽度）：等高度稳定后抓一张图存缓存；
                     // 当前这块仍用 WebView，不切换，避免抓到空图时把可见内容换掉。
-                    LaunchedEffect(source, boxWidthPx, contentHeightPx) {
+                    LaunchedEffect(source, boxWidthPx, contentHeightPx, securityLevel) {
                         if (contentHeightPx <= 0f) return@LaunchedEffect
                         delay(250)
                         val view = webViewRef[0] ?: return@LaunchedEffect
@@ -170,7 +178,7 @@ fun MermaidBlockView(
                         withFrameNanos { }
                         captureWebView(view)?.let { bitmap ->
                             MermaidBitmapCache.put(
-                                MermaidBitmapCache.key(source, view.width),
+                                MermaidBitmapCache.key(source, view.width, securityLevel),
                                 bitmap,
                             )
                         }
@@ -190,6 +198,7 @@ fun MermaidBlockView(
                             contentScale = ContentScale.FillWidth,
                         )
                     } else {
+                        key(source, securityLevel) {
                         AndroidView(
                             modifier = Modifier.fillMaxSize(),
                             factory = { context ->
@@ -248,16 +257,19 @@ fun MermaidBlockView(
                             },
                             update = { view ->
                                 val webView = view as? WebView
-                                // 只在 html 真的换了才重载（之前每次重组都 load 一遍，又卡又闪）
-                                if (webView != null && loadedHtml[0] !== inlineHtml) {
-                                    loadedHtml[0] = inlineHtml
-                                    webView.loadDataWithBaseURL(
-                                        "file:///android_asset/mermaid/",
-                                        inlineHtml,
-                                        "text/html",
-                                        "UTF-8",
-                                        null,
-                                    )
+                                if (webView != null) {
+                                    webViewRef[0] = webView
+                                    // 只在 html 真的换了才重载（之前每次重组都 load 一遍，又卡又闪）
+                                    if (loadedHtml[0] !== inlineHtml) {
+                                        loadedHtml[0] = inlineHtml
+                                        webView.loadDataWithBaseURL(
+                                            "file:///android_asset/mermaid/",
+                                            inlineHtml,
+                                            "text/html",
+                                            "UTF-8",
+                                            null,
+                                        )
+                                    }
                                 }
                             },
                             onRelease = { view ->
@@ -265,6 +277,7 @@ fun MermaidBlockView(
                                 (view as? WebView)?.destroy()
                             },
                         )
+                        }
                     }
 
                     // 核心修复：覆盖在 WebView/截图上层，保证 100% 捕获点击唤起全屏
@@ -282,6 +295,7 @@ fun MermaidBlockView(
     if (fullscreen) {
         MermaidFullscreenDialog(
             base64Code = base64Code,
+            securityLevel = securityLevel,
             onDismiss = { fullscreen = false },
         )
     }
@@ -290,9 +304,12 @@ fun MermaidBlockView(
 @Composable
 private fun MermaidFullscreenDialog(
     base64Code: String,
+    securityLevel: String,
     onDismiss: () -> Unit,
 ) {
-    val fullscreenHtml = remember(base64Code) { buildMermaidHtml(base64Code, isInteractive = true) }
+    val fullscreenHtml = remember(base64Code, securityLevel) {
+        buildMermaidHtml(base64Code, isInteractive = true, securityLevel = securityLevel)
+    }
 
     Dialog(
         onDismissRequest = onDismiss,
@@ -345,32 +362,42 @@ private fun MermaidFullscreenDialog(
                     .fillMaxWidth()
                     .weight(1f),
             ) {
-                AndroidView(
-                    modifier = Modifier.fillMaxSize(),
-                    factory = { context ->
-                        try {
-                            WebView(context).apply {
-                                configureInteractive()
-                                webViewClient = object : WebViewClient() {}
-                                loadDataWithBaseURL(
-                                    "file:///android_asset/mermaid/",
-                                    fullscreenHtml,
-                                    "text/html",
-                                    "UTF-8",
-                                    null,
-                                )
+                key(base64Code, securityLevel) {
+                    AndroidView(
+                        modifier = Modifier.fillMaxSize(),
+                        factory = { context ->
+                            try {
+                                WebView(context).apply {
+                                    configureInteractive()
+                                    webViewClient = object : WebViewClient() {}
+                                    loadDataWithBaseURL(
+                                        "file:///android_asset/mermaid/",
+                                        fullscreenHtml,
+                                        "text/html",
+                                        "UTF-8",
+                                        null,
+                                    )
+                                }
+                            } catch (_: Throwable) {
+                                View(context)
                             }
-                        } catch (_: Throwable) {
-                            View(context)
-                        }
-                    },
-                )
+                        },
+                        onRelease = { view ->
+                            (view as? WebView)?.destroy()
+                        },
+                    )
+                }
             }
         }
     }
 }
 
-private fun buildMermaidHtml(base64Code: String, isInteractive: Boolean): String {
+private fun buildMermaidHtml(
+    base64Code: String,
+    isInteractive: Boolean,
+    securityLevel: String = MermaidSecurityLevel.DEFAULT,
+): String {
+    val safeSecurityLevel = MermaidSecurityLevel.normalize(securityLevel)
     val overflowCss = if (isInteractive) "auto" else "hidden"
     val touchActionCss = if (isInteractive) "pan-x pan-y pinch-zoom" else "none"
     val pointerEventsCss = if (isInteractive) "auto" else "none"
@@ -425,7 +452,7 @@ private fun buildMermaidHtml(base64Code: String, isInteractive: Boolean): String
             mermaid.initialize({
               startOnLoad: false,
               theme: 'dark',
-              securityLevel: 'strict',
+              securityLevel: '$safeSecurityLevel',
               suppressErrorRendering: true,
               darkMode: true,
               fontFamily: 'monospace',
@@ -657,6 +684,10 @@ private fun WebView.configureInteractive() {
     }
 }
 
+fun clearMermaidCache() {
+    MermaidBitmapCache.clear()
+}
+
 private object MermaidBitmapCache {
     private const val MAX_BYTES = 24 * 1024 * 1024
 
@@ -664,12 +695,17 @@ private object MermaidBitmapCache {
         override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
     }
 
-    fun key(source: String, widthPx: Int): String = "${source.hashCode()}:$widthPx"
+    fun key(source: String, widthPx: Int, securityLevel: String): String =
+        "${source.hashCode()}:$widthPx:$securityLevel"
 
     fun get(key: String): Bitmap? = cache.get(key)
 
     fun put(key: String, value: Bitmap) {
         cache.put(key, value)
+    }
+
+    fun clear() {
+        cache.evictAll()
     }
 }
 

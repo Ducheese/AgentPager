@@ -68,7 +68,7 @@ public sealed class CmdcAccountsLoader
         var summaryJson = Get(apiKey, "/alpha/usage/summary");
 
         var windows = CommandCodeUsageLoader.ParseWindows(creditsJson, subscriptionJson, now);
-        if (windows.Count == 0) return null;
+        // credits 成功但字段全缺：返回空窗口快照，让多号面板显示未知，而不是丢掉这个号。
         var daily = CommandCodeUsageLoader.ParseDaily(summaryJson, now);
 
         // LimitID 直接使用账号邮箱，供 App 侧多账号面板展示

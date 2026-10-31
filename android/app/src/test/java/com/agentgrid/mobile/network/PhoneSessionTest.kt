@@ -302,6 +302,35 @@ class PhoneSessionTest {
     }
 
     @Test
+    fun `收到新隧道域名时更新保存的配对并供下次重连使用`() = runTest {
+        val fixture = fixture(pairing = pairing(tunnelHost = "old.trycloudflare.com"))
+
+        fixture.session.start()
+        runCurrent()
+        fixture.transport.emit(TransportEvent.Opened)
+        runCurrent()
+
+        fixture.transport.emit(
+            TransportEvent.TextReceived(
+                snapshotEnvelope(
+                    messageID = "host-update",
+                    sentAt = 200,
+                    taskID = "task",
+                    activeTunnelHost = "https://new.trycloudflare.com/",
+                ),
+            ),
+        )
+        runCurrent()
+
+        assertEquals("new.trycloudflare.com", fixture.credentials.lastSaved?.tunnelHost)
+        assertEquals(
+            "new.trycloudflare.com",
+            fixture.session.uploadEndpoints()[1].host,
+        )
+        fixture.close()
+    }
+
+    @Test
     fun `没配隧道域名时，连不上也只会重试局域网地址`() = runTest {
         val fixture = fixture(pairing = pairing())
 
@@ -506,7 +535,12 @@ class PhoneSessionTest {
 
     private fun secretText() = Base64.getEncoder().encodeToString(SECRET)
 
-    private fun snapshotEnvelope(messageID: String, sentAt: Long, taskID: String): String =
+    private fun snapshotEnvelope(
+        messageID: String,
+        sentAt: Long,
+        taskID: String,
+        activeTunnelHost: String? = null,
+    ): String =
         json.encodeToString(
             StateEnvelope(
                 version = 1,
@@ -524,6 +558,7 @@ class PhoneSessionTest {
                             updatedAt = sentAt,
                         ),
                     ),
+                    activeTunnelHost = activeTunnelHost,
                 ),
             ),
         )
@@ -544,6 +579,7 @@ class PhoneSessionTest {
         var sequence = 0uL
         var cleared = false
         var loadFails = false
+        var lastSaved: PairingPayload? = null
 
         override suspend fun load(): PairingPayload? {
             check(!loadFails) { "凭据损坏" }
@@ -553,6 +589,7 @@ class PhoneSessionTest {
         override suspend fun save(pairing: PairingPayload) {
             operationLog += "保存凭据"
             this.pairing = pairing
+            lastSaved = pairing
         }
 
         override suspend fun clear() {

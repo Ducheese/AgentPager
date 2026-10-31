@@ -128,7 +128,8 @@ public sealed record StateSnapshotPayload(
     UsageSnapshot? Usage,
     string? FocusedTaskID,
     List<PendingRequest> PendingRequests,
-    List<UsageSnapshot>? Usages = null);
+    List<UsageSnapshot>? Usages = null,
+    string? ActiveTunnelHost = null);
 
 public sealed record PairingPayload(
     int Version,

@@ -22,6 +22,9 @@
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
   </PropertyGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="AgentPager.Bridge.Tests" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\AgentPager.Core\AgentPager.Core.csproj" />
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
     <PackageReference Include="QRCoder" />
