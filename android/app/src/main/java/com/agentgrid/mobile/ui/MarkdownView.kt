@@ -46,6 +46,7 @@ sealed interface MarkdownBlock {
     data class Heading(val level: Int, val text: String) : MarkdownBlock
     data class Paragraph(val text: String) : MarkdownBlock
     data class CodeBlock(val language: String, val content: String) : MarkdownBlock
+    data class MathBlock(val content: String) : MarkdownBlock
     data class Table(
         val headers: List<String>,
         val alignments: List<TableAlignment>,
@@ -104,6 +105,7 @@ object MarkdownParser {
 
     private val bulletItemRegex = Regex("^([*\\-+•▪])\\s+(.*)")
     private val orderedItemRegex = Regex("^(\\d+)\\.\\s+(.*)")
+    private val citationMathRegex = Regex("""^\\\[\s*\d+(?:\s*[,;\-]\s*\d+)*\s*\\\]$""")
 
     data class TaskItemInfo(val isTask: Boolean, val isChecked: Boolean, val text: String)
 
@@ -154,6 +156,38 @@ object MarkdownParser {
                 blocks.add(MarkdownBlock.CodeBlock(lang, codeLines.joinToString("\n")))
                 i = nextIdx
                 continue
+            }
+
+            // 1.5 独立数学公式块 ($$ 或 \[...\])
+            val mathEndIdx = findMathBlockEnd(rawLines, i)
+            if (mathEndIdx != -1) {
+                val isDollar = trimmed.startsWith("$$")
+                val opener = if (isDollar) "$$" else "\\["
+                val closer = if (isDollar) "$$" else "\\]"
+
+                if (mathEndIdx == i) {
+                    val mathContent = trimmed.substring(opener.length, trimmed.length - closer.length).trim()
+                    blocks.add(MarkdownBlock.MathBlock(mathContent))
+                    i++
+                    continue
+                } else {
+                    val mathLines = mutableListOf<String>()
+                    val firstLineRemaining = trimmed.removePrefix(opener).trim()
+                    if (firstLineRemaining.isNotEmpty()) {
+                        mathLines.add(firstLineRemaining)
+                    }
+                    for (k in (i + 1) until mathEndIdx) {
+                        mathLines.add(rawLines[k])
+                    }
+                    val lastLineTrim = rawLines[mathEndIdx].trim()
+                    val lastContent = lastLineTrim.removeSuffix(closer).trim()
+                    if (lastContent.isNotEmpty()) {
+                        mathLines.add(lastContent)
+                    }
+                    blocks.add(MarkdownBlock.MathBlock(mathLines.joinToString("\n").trim()))
+                    i = mathEndIdx + 1
+                    continue
+                }
             }
 
             // 2. 表格 (当前行包含 | 且下一行是表格分隔线)
@@ -261,16 +295,20 @@ object MarkdownParser {
             while (nextIdx < rawLines.size) {
                 val nextLine = rawLines[nextIdx]
                 val nextTrim = nextLine.trim()
-                if (nextTrim.isEmpty() ||
-                    nextTrim.startsWith("```") ||
-                    (isTableRowCandidate(nextTrim) && nextIdx + 1 < rawLines.size && isTableSeparator(rawLines[nextIdx + 1])) ||
-                    nextTrim.startsWith(">") ||
-                    nextTrim.startsWith("#") ||
-                    bulletItemRegex.containsMatchIn(nextTrim) ||
-                    orderedItemRegex.containsMatchIn(nextTrim) ||
-                    (nextTrim.length >= 3 && (nextTrim.all { it == '-' } || nextTrim.all { it == '*' } || nextTrim.all { it == '_' }))
-                ) {
-                    break
+                if (nextTrim.isEmpty()) break
+                // 关键：只有从第二行开始（nextIdx > i），遇到其他有效块级语法才切断段落
+                if (nextIdx > i) {
+                    if (nextTrim.startsWith("```") ||
+                        findMathBlockEnd(rawLines, nextIdx) != -1 ||
+                        (isTableRowCandidate(nextTrim) && nextIdx + 1 < rawLines.size && isTableSeparator(rawLines[nextIdx + 1])) ||
+                        nextTrim.startsWith(">") ||
+                        nextTrim.startsWith("#") ||
+                        bulletItemRegex.containsMatchIn(nextTrim) ||
+                        orderedItemRegex.containsMatchIn(nextTrim) ||
+                        (nextTrim.length >= 3 && (nextTrim.all { it == '-' } || nextTrim.all { it == '*' } || nextTrim.all { it == '_' }))
+                    ) {
+                        break
+                    }
                 }
                 paragraphLines.add(nextLine.trimEnd())
                 nextIdx++
@@ -282,6 +320,53 @@ object MarkdownParser {
         }
 
         return blocks
+    }
+
+    fun findMathBlockEnd(rawLines: List<String>, startIdx: Int): Int {
+        val trimmed = rawLines[startIdx].trim()
+        val isDollar = trimmed.startsWith("$$")
+        val isBracket = trimmed.startsWith("\\[")
+        if (!isDollar && !isBracket) return -1
+        if (isBracket && citationMathRegex.matches(trimmed)) return -1
+
+        val opener = if (isDollar) "$$" else "\\["
+        val closer = if (isDollar) "$$" else "\\]"
+
+        if (isSelfClosingMath(trimmed, opener, closer)) {
+            return startIdx
+        }
+
+        for (k in (startIdx + 1) until rawLines.size) {
+            val kTrim = rawLines[k].trim()
+            if (isMathBoundary(kTrim)) return -1
+            if (isSelfClosingMath(kTrim, opener, closer)) return -1
+            if ((kTrim.startsWith("$$") || kTrim.startsWith("\\[")) && kTrim != closer) {
+                return -1
+            }
+            if (kTrim.endsWith(closer)) {
+                return k
+            }
+        }
+        return -1
+    }
+
+    private fun isSelfClosingMath(line: String, opener: String, closer: String): Boolean =
+        line.length >= opener.length + closer.length &&
+            line.startsWith(opener) &&
+            line.endsWith(closer)
+
+    private fun isMathBoundary(line: String): Boolean {
+        if (line.isEmpty()) return true
+        if (line.startsWith("```") || line.startsWith("~~~")) return true
+        if (line.startsWith("#") || line.startsWith(">")) return true
+        if (bulletItemRegex.containsMatchIn(line) || orderedItemRegex.containsMatchIn(line)) return true
+        if (isTableSeparator(line)) return true
+        if (line.length >= 3 &&
+            (line.all { it == '-' } || line.all { it == '*' } || line.all { it == '_' })
+        ) {
+            return true
+        }
+        return false
     }
 
     fun isTableRowCandidate(line: String): Boolean {
@@ -560,10 +645,20 @@ fun MarkdownView(
                 when (block) {
                     is MarkdownBlock.Heading -> HeadingBlockView(block)
                     is MarkdownBlock.Paragraph -> ParagraphBlockView(block)
+                    is MarkdownBlock.MathBlock -> {
+                        DisableSelection {
+                            LatexBlockView(source = block.content)
+                        }
+                    }
                     is MarkdownBlock.CodeBlock -> {
                         DisableSelection {
                             if (block.language.equals("mermaid", ignoreCase = true)) {
                                 MermaidBlockView(source = block.content, securityLevel = mermaidSecurityLevel)
+                            } else if (block.language.equals("latex", ignoreCase = true) ||
+                                block.language.equals("math", ignoreCase = true) ||
+                                block.language.equals("tex", ignoreCase = true)
+                            ) {
+                                LatexBlockView(source = block.content)
                             } else {
                                 CodeBlockView(block)
                             }

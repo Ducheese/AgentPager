@@ -22,10 +22,13 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -330,7 +333,8 @@ private fun MermaidFullscreenDialog(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .background(AgentGridColors.Background),
+                .background(AgentGridColors.Background)
+                .windowInsetsPadding(WindowInsets.safeDrawing),
         ) {
             // 顶部工具栏
             Row(

@@ -282,4 +282,159 @@ class MarkdownParserTest {
         assertEquals(listOf("标题", "加粗大字"), table.rows[0])
         assertEquals(listOf("表格", "有边框"), table.rows[2])
     }
+
+    @Test
+    fun `单行与多行LaTeX公式块能正确解析为MathBlock`() {
+        val markdown = """
+            首先看单行公式：
+            $$ E = mc^2 $$
+
+            然后再看多行微积分方程：
+            $$
+            \int_{-\infty}^\infty e^{-x^2} dx = \sqrt{\pi}
+            $$
+
+            最后是总结文本。
+        """.trimIndent()
+
+        val blocks = MarkdownParser.parse(markdown)
+        assertEquals(5, blocks.size)
+        assertTrue(blocks[0] is MarkdownBlock.Paragraph)
+        assertTrue(blocks[1] is MarkdownBlock.MathBlock)
+        assertTrue(blocks[2] is MarkdownBlock.Paragraph)
+        assertTrue(blocks[3] is MarkdownBlock.MathBlock)
+        assertTrue(blocks[4] is MarkdownBlock.Paragraph)
+
+        val singleLineMath = blocks[1] as MarkdownBlock.MathBlock
+        assertEquals("E = mc^2", singleLineMath.content)
+
+        val multiLineMath = blocks[3] as MarkdownBlock.MathBlock
+        assertEquals("\\int_{-\\infty}^\\infty e^{-x^2} dx = \\sqrt{\\pi}", multiLineMath.content)
+    }
+
+    @Test
+    fun `未闭合的公式块不会吞掉后续正文与列表表格`() {
+        val markdown = """
+            $$ x + 1
+            这是一段普通回复
+            - 列表项 1
+            - 列表项 2
+
+            后面还有更多总结。
+        """.trimIndent()
+
+        val blocks = MarkdownParser.parse(markdown)
+        // 未闭合时不能识别为 MathBlock，应回退为普通段落和列表
+        assertTrue("未闭合的 $$ 不得生成 MathBlock", blocks.none { it is MarkdownBlock.MathBlock })
+        assertTrue("必须保留普通段落", blocks.any { it is MarkdownBlock.Paragraph })
+        assertTrue("必须保留列表项", blocks.any { it is MarkdownBlock.BulletList })
+
+        val firstPara = blocks[0] as MarkdownBlock.Paragraph
+        assertTrue(firstPara.text.contains("$$ x + 1"))
+        assertTrue(firstPara.text.contains("这是一段普通回复"))
+    }
+
+    @Test
+    fun `支持官方标准方括号块级公式`() {
+        val markdown = """
+            \[
+            \lim_{x \to 0} \frac{\sin x}{x} = 1
+            \]
+
+            单行形式：
+            \[ a^2 + b^2 = c^2 \]
+        """.trimIndent()
+
+        val blocks = MarkdownParser.parse(markdown)
+        assertEquals(3, blocks.size)
+        assertTrue(blocks[0] is MarkdownBlock.MathBlock)
+        assertTrue(blocks[1] is MarkdownBlock.Paragraph)
+        assertTrue(blocks[2] is MarkdownBlock.MathBlock)
+
+        val multiLine = blocks[0] as MarkdownBlock.MathBlock
+        assertEquals("\\lim_{x \\to 0} \\frac{\\sin x}{x} = 1", multiLine.content)
+
+        val singleLine = blocks[2] as MarkdownBlock.MathBlock
+        assertEquals("a^2 + b^2 = c^2", singleLine.content)
+    }
+
+    @Test
+    fun `未闭合公式遇到后续独立的自闭合公式时不得贪婪跨块吞噬正文`() {
+        val markdown = """
+            $$ x + 1
+            这里是被夹在中间的正常正文
+            - 列表项 A
+            - 列表项 B
+
+            $$ y = 2 $$
+            最后的总结段落
+        """.trimIndent()
+
+        val blocks = MarkdownParser.parse(markdown)
+        // 第一行未闭合，不应该生成包含中间正文的巨型 MathBlock
+        // 中间正文必须完好保留为段落和列表
+        assertTrue("中间正文必须保留为段落", blocks.any { it is MarkdownBlock.Paragraph && (it as MarkdownBlock.Paragraph).text.contains("这里是被夹在中间的正常正文") })
+        assertTrue("列表项必须完好保留", blocks.any { it is MarkdownBlock.BulletList })
+        // 后续的独立公式正常识别为单个 MathBlock
+        val mathBlocks = blocks.filterIsInstance<MarkdownBlock.MathBlock>()
+        assertEquals(1, mathBlocks.size)
+        assertEquals("y = 2", mathBlocks[0].content)
+    }
+
+    @Test
+    fun `引用编号的方括号不能被识别为公式`() {
+        val markdown = """
+            See \[1\] for details.
+            \[1\]
+            \[ a^2 + b^2 = c^2 \]
+        """.trimIndent()
+
+        val blocks = MarkdownParser.parse(markdown)
+        val mathBlocks = blocks.filterIsInstance<MarkdownBlock.MathBlock>()
+        assertEquals(1, mathBlocks.size)
+        assertEquals("a^2 + b^2 = c^2", mathBlocks[0].content)
+        assertTrue(
+            "引用编号必须保留在段落中",
+            blocks.any {
+                it is MarkdownBlock.Paragraph && it.text.contains("\\[1\\]")
+            },
+        )
+    }
+
+    @Test
+    fun `空白行和列表会中断未闭合的美元公式`() {
+        val markdown = """
+            $$ x + 1
+            normal text
+            - item A
+
+            $$ y = 2
+        """.trimIndent()
+
+        val blocks = MarkdownParser.parse(markdown)
+        assertTrue("未闭合公式不得生成 MathBlock", blocks.none { it is MarkdownBlock.MathBlock })
+        assertTrue(
+            "中间正文必须保留",
+            blocks.any { it is MarkdownBlock.Paragraph && it.text.contains("normal text") },
+        )
+        assertTrue("列表必须保留", blocks.any { it is MarkdownBlock.BulletList })
+    }
+
+    @Test
+    fun `代码围栏会中断未闭合的方括号公式`() {
+        val markdown = """
+            \[ x + 1
+            normal text
+            ```kotlin
+            val x = 1
+            ```
+        """.trimIndent()
+
+        val blocks = MarkdownParser.parse(markdown)
+        assertTrue("未闭合公式不得生成 MathBlock", blocks.none { it is MarkdownBlock.MathBlock })
+        assertTrue(
+            "代码围栏必须保留",
+            blocks.any { it is MarkdownBlock.CodeBlock && it.content.contains("val x = 1") },
+        )
+    }
 }

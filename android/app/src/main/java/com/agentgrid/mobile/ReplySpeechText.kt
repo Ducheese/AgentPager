@@ -39,8 +39,9 @@ object ReplySpeechText {
                         lines += row.joinToString("，") { stripInline(it) }
                     }
                 }
-                // 代码块（含 mermaid）不朗读：念代码只会变成噪音
+                // 代码块（含 mermaid）与数学公式不朗读：念出来只会变成噪音
                 is MarkdownBlock.CodeBlock -> Unit
+                is MarkdownBlock.MathBlock -> Unit
                 MarkdownBlock.HorizontalRule -> Unit
             }
         }
