@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO.Pipes;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -13,6 +14,20 @@ public static class Program
 {
     private const string MutexName = "Local\\AgentPager.Bridge.Singleton";
 
+    [DllImport("user32.dll")]
+    private static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+
+    private static void EnablePerMonitorDpi()
+    {
+        try
+        {
+            SetProcessDpiAwarenessContext(new IntPtr(-4));
+        }
+        catch (EntryPointNotFoundException)
+        {
+        }
+    }
+
     [STAThread]
     public static int Main(string[] args)
     {
@@ -23,6 +38,7 @@ public static class Program
         if (args.Contains("--uninstall-hook", StringComparer.OrdinalIgnoreCase))
             return Maintenance.Uninstall();
 
+        EnablePerMonitorDpi();
         using var mutex = new Mutex(true, MutexName, out var created);
         if (!created)
         {

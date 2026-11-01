@@ -41,6 +41,7 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             val state by viewModel.state.collectAsStateWithLifecycle()
+            val desktopScreenshotState by viewModel.desktopScreenshotState.collectAsStateWithLifecycle()
             val notificationPermission = rememberLauncherForActivityResult(
                 ActivityResultContracts.RequestPermission(),
             ) {}
@@ -79,6 +80,9 @@ class MainActivity : ComponentActivity() {
                 onAddAttachments = viewModel::addAttachments,
                 onRemoveAttachment = viewModel::removeAttachment,
                 onRetryAttachment = viewModel::retryAttachment,
+                desktopScreenshotState = desktopScreenshotState,
+                onFetchDesktopScreenshot = viewModel::fetchDesktopScreenshot,
+                onDismissDesktopScreenshot = viewModel::dismissDesktopScreenshot,
             )
         }
     }

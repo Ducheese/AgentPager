@@ -111,6 +111,50 @@ public sealed class LanBridgeServer(
 
         app.Map("/agentgrid", HandleWebSocket);
 
+        app.MapGet("/api/desktop/screenshot", async context =>
+        {
+            var provided = context.Request.Headers[SecretHeader].ToString();
+            if (!authorize(string.IsNullOrEmpty(provided) ? null : provided))
+            {
+                log.Write("WARN", $"桌面截图被拒：配对密钥无效（{context.Connection.RemoteIpAddress}）");
+                context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                return;
+            }
+
+            var startedAt = Environment.TickCount64;
+            byte[]? bytes;
+            try
+            {
+                bytes = DesktopCapture.CaptureScreenZeroJpeg();
+            }
+            catch (Exception ex)
+            {
+                log.Write("ERROR", $"截取桌面异常：{ex.Message}");
+                context.Response.StatusCode = StatusCodes.Status500InternalServerError;
+                context.Response.ContentType = "text/plain; charset=utf-8";
+                await context.Response.WriteAsync("截取桌面失败");
+                return;
+            }
+
+            if (bytes is null || bytes.Length == 0)
+            {
+                log.Write("WARN", $"[截图] 无可用画面（{context.Connection.RemoteIpAddress}）");
+                context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+                context.Response.ContentType = "text/plain; charset=utf-8";
+                await context.Response.WriteAsync("当前无法截取桌面（可能处于锁屏或无活动显示器状态）");
+                return;
+            }
+
+            log.Write(
+                "INFO",
+                $"[截图] {bytes.Length} 字节，耗时 {Environment.TickCount64 - startedAt}ms（{context.Connection.RemoteIpAddress}）");
+            context.Response.ContentType = "image/jpeg";
+            context.Response.ContentLength = bytes.Length;
+            context.Response.Headers.CacheControl = "no-cache, no-store, must-revalidate";
+            context.Response.Headers["X-Content-Type-Options"] = "nosniff";
+            await context.Response.Body.WriteAsync(bytes);
+        });
+
         app.MapPost("/api/attachments/upload", async context =>
         {
             var provided = context.Request.Headers[SecretHeader].ToString();

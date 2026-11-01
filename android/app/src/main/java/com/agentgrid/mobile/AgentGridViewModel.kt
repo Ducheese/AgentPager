@@ -2,6 +2,7 @@ package com.agentgrid.mobile
 
 import android.app.Application
 import android.content.Intent
+import android.graphics.Bitmap
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
@@ -26,6 +27,7 @@ import com.agentgrid.mobile.domain.TaskSnapshot
 import com.agentgrid.mobile.domain.UsageSnapshot
 import com.agentgrid.mobile.network.ControlDelivery
 import com.agentgrid.mobile.network.ControlSubmission
+import com.agentgrid.mobile.network.DesktopScreenshotClient
 import com.agentgrid.mobile.network.LinkState
 import com.agentgrid.mobile.network.PairingOutcome
 import com.agentgrid.mobile.network.PairingSummary
@@ -33,12 +35,20 @@ import com.agentgrid.mobile.network.PhoneSessionFactory
 import com.agentgrid.mobile.network.PhoneSessionProblem
 import com.agentgrid.mobile.network.PhoneSessionState
 import com.agentgrid.mobile.service.LinkKeepAliveService
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+
+sealed interface DesktopScreenshotState {
+    data object Idle : DesktopScreenshotState
+    data object Loading : DesktopScreenshotState
+    data class Success(val bitmap: Bitmap, val capturedAt: Long = System.currentTimeMillis()) : DesktopScreenshotState
+    data class Error(val message: String) : DesktopScreenshotState
+}
 
 data class AgentGridUiState(
     val pairing: PairingSummary? = null,
@@ -108,6 +118,35 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
         // 密钥与候选地址与 WS 共用同一套（含 wss 隧道兜底），见 DefaultPhoneSession.uploadEndpoints。
         // 单例：OkHttpClient 自带连接池，一批 5~10 张图复用同一条连接。
         AttachmentUploader(endpoints = { phoneSession.uploadEndpoints() })
+    }
+
+    private val desktopScreenshotClient: DesktopScreenshotClient by lazy {
+        DesktopScreenshotClient(endpoints = { phoneSession.uploadEndpoints() })
+    }
+
+    private val _desktopScreenshotState = MutableStateFlow<DesktopScreenshotState>(DesktopScreenshotState.Idle)
+    val desktopScreenshotState: StateFlow<DesktopScreenshotState> = _desktopScreenshotState.asStateFlow()
+
+    private var screenshotFetchJob: Job? = null
+
+    fun fetchDesktopScreenshot() {
+        screenshotFetchJob?.cancel()
+        _desktopScreenshotState.value = DesktopScreenshotState.Loading
+        screenshotFetchJob = viewModelScope.launch {
+            try {
+                val bitmap = desktopScreenshotClient.fetchScreenshot()
+                _desktopScreenshotState.value = DesktopScreenshotState.Success(bitmap)
+            } catch (cancelled: CancellationException) {
+                // 协程被取消时不覆盖状态
+            } catch (e: Exception) {
+                _desktopScreenshotState.value = DesktopScreenshotState.Error(e.message ?: "获取桌面截图失败")
+            }
+        }
+    }
+
+    fun dismissDesktopScreenshot() {
+        screenshotFetchJob?.cancel()
+        _desktopScreenshotState.value = DesktopScreenshotState.Idle
     }
 
     /** 选图入口：压缩→后台上传→READY。失败保留 FAILED 卡片可重试，不阻塞打字。 */

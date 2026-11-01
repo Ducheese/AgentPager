@@ -168,6 +168,9 @@ fun AgentGridScreen(
     onAddAttachments: (String, List<android.net.Uri>) -> Unit = { _, _ -> },
     onRemoveAttachment: (String, String) -> Unit = { _, _ -> },
     onRetryAttachment: (String, String) -> Unit = { _, _ -> },
+    desktopScreenshotState: com.agentgrid.mobile.DesktopScreenshotState = com.agentgrid.mobile.DesktopScreenshotState.Idle,
+    onFetchDesktopScreenshot: () -> Unit = {},
+    onDismissDesktopScreenshot: () -> Unit = {},
 ) {
     AgentGridTheme {
         CompositionLocalProvider(LocalMermaidSecurityLevel provides state.mermaidSecurityLevel) {
@@ -212,6 +215,9 @@ fun AgentGridScreen(
                         onAddAttachments = onAddAttachments,
                         onRemoveAttachment = onRemoveAttachment,
                         onRetryAttachment = onRetryAttachment,
+                        desktopScreenshotState = desktopScreenshotState,
+                        onFetchDesktopScreenshot = onFetchDesktopScreenshot,
+                        onDismissDesktopScreenshot = onDismissDesktopScreenshot,
                     )
                 }
             }
@@ -454,6 +460,9 @@ private fun TaskTerminal(
     onAddAttachments: (String, List<android.net.Uri>) -> Unit = { _, _ -> },
     onRemoveAttachment: (String, String) -> Unit = { _, _ -> },
     onRetryAttachment: (String, String) -> Unit = { _, _ -> },
+    desktopScreenshotState: com.agentgrid.mobile.DesktopScreenshotState = com.agentgrid.mobile.DesktopScreenshotState.Idle,
+    onFetchDesktopScreenshot: () -> Unit = {},
+    onDismissDesktopScreenshot: () -> Unit = {},
 ) {
     val projection = state.taskProjection
     val tasks = projection.orderedTasks
@@ -466,6 +475,7 @@ private fun TaskTerminal(
     // 像素预览是第三个内容态（任务列表 / 额度面板 / 像素预览三选一），不是浮窗——
     // 按额度面板竞态做互斥：开预览时回任务态，开额度/开设置时关预览。
     var pixelPreviewVisible by remember { mutableStateOf(false) }
+    var desktopScreenshotVisible by remember { mutableStateOf(false) }
     // 相册 launcher 必须挂在无条件处：写进「展开 + 无待批请求」分支里时，
     // 选图期间状态一抖（心跳重组、待批请求弹出）launcher 就被注销，
     // 返回的 URI 投给已释放的回调——选完无反应的根因（2026-10-22 真机实测）。
@@ -502,12 +512,19 @@ private fun TaskTerminal(
     // 提示音/震动触发已搬到 LinkKeepAliveService（跟完成通知同一帧收快照），
     // 后台也响。这里只留 sound 给设置面板的开关用，不再触发播放——否则前台响两遍。
 
-    // 层级返回：预览 → 设置小窗 → 额度面板 → 回任务面板；都没开才交给系统（退桌面）。
+    // 层级返回：桌面截图 → 预览 → 设置小窗 → 额度面板 → 回任务面板；都没开才交给系统（退桌面）。
     // 预览是内容态（跟额度面板同一槽），返回键关预览回到任务列表。
-    BackHandler(enabled = pixelPreviewVisible || settingsVisible || showDashboard) {
-        if (pixelPreviewVisible) pixelPreviewVisible = false
-        else if (settingsVisible) settingsVisible = false
-        else if (showDashboard) onToggleDashboard()
+    BackHandler(enabled = desktopScreenshotVisible || pixelPreviewVisible || settingsVisible || showDashboard) {
+        if (desktopScreenshotVisible) {
+            desktopScreenshotVisible = false
+            onDismissDesktopScreenshot()
+        } else if (pixelPreviewVisible) {
+            pixelPreviewVisible = false
+        } else if (settingsVisible) {
+            settingsVisible = false
+        } else if (showDashboard) {
+            onToggleDashboard()
+        }
     }
 
     // 从完成通知进入：等任务进入可见集合（可能刚随快照到达），再展开并滚到它。
@@ -551,6 +568,7 @@ private fun TaskTerminal(
             settingsVisible = settingsVisible,
             dashboardVisible = showDashboard,
             previewVisible = pixelPreviewVisible,
+            desktopScreenshotVisible = desktopScreenshotVisible,
             onToggleDashboard = {
                 onToggleDashboard()
                 // 三个内容态互斥：切额度时把预览和设置都收掉。
@@ -562,6 +580,10 @@ private fun TaskTerminal(
                 if (!pixelPreviewVisible && showDashboard) onToggleDashboard()
                 pixelPreviewVisible = !pixelPreviewVisible
                 settingsVisible = false
+            },
+            onOpenDesktopScreenshot = {
+                desktopScreenshotVisible = true
+                onFetchDesktopScreenshot()
             },
             onToggleSettings = {
                 settingsVisible = !settingsVisible
@@ -777,6 +799,17 @@ private fun TaskTerminal(
                 letterSpacing = 1.sp,
             )
         }
+
+        if (desktopScreenshotVisible) {
+            DesktopScreenshotDialog(
+                state = desktopScreenshotState,
+                onRefresh = onFetchDesktopScreenshot,
+                onDismiss = {
+                    desktopScreenshotVisible = false
+                    onDismissDesktopScreenshot()
+                },
+            )
+        }
     }
 }
 
@@ -870,8 +903,10 @@ private fun TopControls(
     settingsVisible: Boolean,
     dashboardVisible: Boolean,
     previewVisible: Boolean,
+    desktopScreenshotVisible: Boolean = false,
     onToggleDashboard: () -> Unit,
     onTogglePreview: () -> Unit,
+    onOpenDesktopScreenshot: () -> Unit = {},
     onToggleSettings: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -882,6 +917,18 @@ private fun TopControls(
     ) {
         windows.take(2).forEach { window ->
             UsagePill(window)
+        }
+        // 桌面截图入口：像素预览按钮左边，手画桌面显示器图标
+        Box(
+            modifier = Modifier
+                .size(28.dp)
+                .clickable(onClick = onOpenDesktopScreenshot)
+                .semantics {
+                    contentDescription = "查看桌面截图"
+                },
+            contentAlignment = Alignment.Center,
+        ) {
+            DesktopScreenshotIcon(active = desktopScreenshotVisible)
         }
         // 像素图预览入口：额度切换按钮的左边，手画九宫格图标（跟 ViewSwitchIcon 同风格）。
         Box(
