@@ -1454,6 +1454,32 @@ var slashPair = ReadTranscript(
 Check(slashPair.QueuedPrompt is null && slashPair.QueuedAt is null,
     "claude: slash enqueue+dequeue pair reads as drained");
 
+// 系统注入标签不能冒充用户提示词；只按已知标签过滤，不能把所有 < 开头文本都吞掉。
+var notificationOnly = ReadTranscript(
+[
+    "{\"type\":\"user\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":\"<task-notification><task-id>x</task-id></task-notification>\"}}",
+]);
+Check(notificationOnly.LatestPrompt is null, "claude: task-notification is not a user prompt");
+
+var channelPrompt = ReadTranscript(
+[
+    "{\"type\":\"user\",\"isSidechain\":false,\"message\":{\"role\":\"user\",\"content\":\"<channel source=\\\"plugin:discord:discord\\\">远程消息</channel>\"}}",
+]);
+Check(channelPrompt.LatestPrompt?.Contains("远程消息") == true,
+    "claude: channel is a user prompt, not a system tag");
+
+var systemPromptCatalog = new TaskCatalog();
+systemPromptCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_system_prompt", prompt = "正常提示词" }), claudeNow);
+systemPromptCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_system_prompt", prompt = "<task-notification><task-id>x</task-id></task-notification>" }), claudeNow.AddSeconds(1));
+var systemPromptTask = systemPromptCatalog.Projection().Tasks.First(t => t.Id == "claude_system_prompt");
+Check(systemPromptTask.UserPrompt == "正常提示词",
+    $"claude: system payload must not overwrite UserPrompt (got '{systemPromptTask.UserPrompt}')");
+
+var notificationCatalog = new TaskCatalog();
+notificationCatalog.Accept(C("UserPromptSubmit", new { session_id = "claude_notification_only", prompt = "<task-notification><task-id>x</task-id></task-notification>" }), claudeNow);
+Check(notificationCatalog.Projection().Tasks.All(t => t.Id != "claude_notification_only"),
+    "claude: system payload alone must not create a task");
+
 // ---- 离线：10 分钟静默兜底（G23）----
 claude.Accept(C("UserPromptSubmit", new { prompt = "长跑任务" }), claudeNow.AddSeconds(22));
 claude.Maintain(claudeNow.AddMinutes(2));

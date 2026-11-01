@@ -171,6 +171,8 @@ fun AgentGridScreen(
     desktopScreenshotState: com.agentgrid.mobile.DesktopScreenshotState = com.agentgrid.mobile.DesktopScreenshotState.Idle,
     onFetchDesktopScreenshot: () -> Unit = {},
     onDismissDesktopScreenshot: () -> Unit = {},
+    onToggleHideCodexQuota: () -> Unit = {},
+    onToggleHideCmdcQuota: () -> Unit = {},
 ) {
     AgentGridTheme {
         CompositionLocalProvider(LocalMermaidSecurityLevel provides state.mermaidSecurityLevel) {
@@ -218,6 +220,8 @@ fun AgentGridScreen(
                         desktopScreenshotState = desktopScreenshotState,
                         onFetchDesktopScreenshot = onFetchDesktopScreenshot,
                         onDismissDesktopScreenshot = onDismissDesktopScreenshot,
+                        onToggleHideCodexQuota = onToggleHideCodexQuota,
+                        onToggleHideCmdcQuota = onToggleHideCmdcQuota,
                     )
                 }
             }
@@ -463,6 +467,8 @@ private fun TaskTerminal(
     desktopScreenshotState: com.agentgrid.mobile.DesktopScreenshotState = com.agentgrid.mobile.DesktopScreenshotState.Idle,
     onFetchDesktopScreenshot: () -> Unit = {},
     onDismissDesktopScreenshot: () -> Unit = {},
+    onToggleHideCodexQuota: () -> Unit = {},
+    onToggleHideCmdcQuota: () -> Unit = {},
 ) {
     val projection = state.taskProjection
     val tasks = projection.orderedTasks
@@ -557,13 +563,28 @@ private fun TaskTerminal(
         val isCompact = maxWidth < 600.dp || isPortraitWindow
         val isVeryNarrow = maxWidth < 400.dp
 
+        val effectiveUsage = remember(state.usage, state.usages, state.hideCodexQuota, state.hideCmdcQuota) {
+            val list = state.usages.ifEmpty { listOfNotNull(state.usage) }
+            // 这里的分类必须与 UsageDashboard.providerName 保持同一口径；新增 provider 时两处同步改。
+            list.firstOrNull { u ->
+                val label = when {
+                    u.planType?.contains("Antigravity", ignoreCase = true) == true -> "AGY"
+                    u.planType?.contains("Command Code", ignoreCase = true) == true -> "CMDC"
+                    u.planType?.contains("OpenCode Go", ignoreCase = true) == true -> "OCG"
+                    else -> "CODEX"
+                }
+                !(state.hideCodexQuota && label == "CODEX") &&
+                !(state.hideCmdcQuota && label == "CMDC")
+            }
+        }
+
         TopControls(
             windows = if (showDashboard || isVeryNarrow) {
                 emptyList()
             } else if (isCompact) {
-                state.usage?.windows.orEmpty().take(1)
+                effectiveUsage?.windows.orEmpty().take(1)
             } else {
-                state.usage?.windows.orEmpty()
+                effectiveUsage?.windows.orEmpty()
             },
             settingsVisible = settingsVisible,
             dashboardVisible = showDashboard,
@@ -639,6 +660,8 @@ private fun TaskTerminal(
                     usage = state.usage,
                     usages = state.usages,
                     connected = state.linkState == LinkState.CONNECTED,
+                    hideCodexQuota = state.hideCodexQuota,
+                    hideCmdcQuota = state.hideCmdcQuota,
                 )
                 else -> {
                 LazyColumn(
@@ -776,6 +799,8 @@ private fun TaskTerminal(
                 onUnpair = onUnpair,
                 onToggleTerminalMode = onToggleTerminalMode,
                 onMermaidSecurityLevelChange = onMermaidSecurityLevelChange,
+                onToggleHideCodexQuota = onToggleHideCodexQuota,
+                onToggleHideCmdcQuota = onToggleHideCmdcQuota,
                 onControl = onControl,
                 // 矮窗口（横屏/悬浮窗）下 6 行会顶出可视区：面板限高 + 内部滚动，键才点得到。
                 panelMaxHeight = maxHeight - 60.dp,
@@ -2139,6 +2164,8 @@ private fun SettingsPanel(
     onUnpair: () -> Unit,
     onToggleTerminalMode: () -> Unit,
     onMermaidSecurityLevelChange: (String) -> Unit,
+    onToggleHideCodexQuota: () -> Unit,
+    onToggleHideCmdcQuota: () -> Unit,
     onControl: (String, ControlAction, String?, List<String>?) -> Unit,
     panelMaxHeight: Dp,
 ) {
@@ -2192,6 +2219,18 @@ private fun SettingsPanel(
             if (state.terminalMode) AgentGridColors.Green else AgentGridColors.Muted,
         ) {
             onToggleTerminalMode()
+        }
+        PixelButton(
+            if (state.hideCodexQuota) "隐藏 CODEX：开" else "隐藏 CODEX：关",
+            if (state.hideCodexQuota) AgentGridColors.Green else AgentGridColors.Muted,
+        ) {
+            onToggleHideCodexQuota()
+        }
+        PixelButton(
+            if (state.hideCmdcQuota) "隐藏 CMDC：开" else "隐藏 CMDC：关",
+            if (state.hideCmdcQuota) AgentGridColors.Green else AgentGridColors.Muted,
+        ) {
+            onToggleHideCmdcQuota()
         }
         PixelButton("解除配对", AgentGridColors.Red) { onUnpair() }
         // 关机：点两次才发（第一次布防，8 秒内没点第二次自动撤防），误触保护。

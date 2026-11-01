@@ -68,8 +68,10 @@ internal fun UsageDashboard(
     connected: Boolean,
     modifier: Modifier = Modifier,
     usages: List<UsageSnapshot> = emptyList(),
+    hideCodexQuota: Boolean = false,
+    hideCmdcQuota: Boolean = false,
 ) {
-    val availableUsages = remember(usage, usages) {
+    val availableUsages = remember(usage, usages, hideCodexQuota, hideCmdcQuota) {
         val list = usages.ifEmpty { listOfNotNull(usage) }
         list
             // 桌面号只活在"全部"列表里，不进提供商切换：它们的 LimitID 是邮箱（含 @），
@@ -79,6 +81,8 @@ internal fun UsageDashboard(
                     it.limitID?.contains('@') == true
             }
             .distinctBy { providerKey(it) }
+            .filterNot { hideCodexQuota && providerLabel(it) == "CODEX" }
+            .filterNot { hideCmdcQuota && providerLabel(it) == "CMDC" }
     }
     // 选择按提供商身份记住，而不是按列表实例：额度每 10 分钟刷新会重建 list，
     // 旧写法 remember(availableUsages) 会把用户踢回第一个提供商。
@@ -108,6 +112,22 @@ internal fun UsageDashboard(
     BoxWithConstraints(
         modifier = modifier.fillMaxWidth(),
     ) {
+        if (availableUsages.isEmpty()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 40.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    text = "所有额度面板已在设置中隐藏",
+                    color = AgentGridColors.Muted,
+                    fontSize = 12.sp,
+                )
+            }
+            return@BoxWithConstraints
+        }
+
         val isCompact = maxWidth < 600.dp || maxHeight > maxWidth
         val contentPadding = if (isCompact) {
             Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
@@ -450,7 +470,7 @@ private fun QuotaPanel(
     }
 }
 
-/** 额度的来源全称：新增提供商只改这里。 */
+/** 额度的来源全称：新增提供商时，同步修改 AgentGridScreen.effectiveUsage 的分类。 */
 private fun providerName(usage: UsageSnapshot?): String = when {
     usage?.planType?.contains("Antigravity", ignoreCase = true) == true -> "Antigravity"
     usage?.planType?.contains("Command Code", ignoreCase = true) == true -> "Command Code"

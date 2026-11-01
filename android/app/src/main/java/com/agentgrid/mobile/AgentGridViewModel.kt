@@ -66,6 +66,8 @@ data class AgentGridUiState(
     val speechFailure: ReplySpeech.SpeechFailure? = null,
     val speechRate: Float = 2.0f,
     val mermaidSecurityLevel: String = MermaidSecurityLevel.DEFAULT,
+    val hideCodexQuota: Boolean = false,
+    val hideCmdcQuota: Boolean = false,
 ) {
     val focusedTask: TaskSnapshot?
         get() = taskProjection.focusedTask
@@ -89,6 +91,8 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
             mermaidSecurityLevel = MermaidSecurityLevel.normalize(
                 preferences.getString("mermaid-security-level", MermaidSecurityLevel.DEFAULT),
             ),
+            hideCodexQuota = preferences.getBoolean("hide-codex-quota", false),
+            hideCmdcQuota = preferences.getBoolean("hide-cmdc-quota", false),
         ),
     )
     val state: StateFlow<AgentGridUiState> = mutableState.asStateFlow()
@@ -612,6 +616,16 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
         val normalized = MermaidSecurityLevel.normalize(level)
         preferences.edit { putString("mermaid-security-level", normalized) }
         mutableState.value = mutableState.value.copy(mermaidSecurityLevel = normalized)
+    }
+
+    fun setHideCodexQuota(hide: Boolean) {
+        preferences.edit { putBoolean("hide-codex-quota", hide) }
+        mutableState.value = mutableState.value.copy(hideCodexQuota = hide)
+    }
+
+    fun setHideCmdcQuota(hide: Boolean) {
+        preferences.edit { putBoolean("hide-cmdc-quota", hide) }
+        mutableState.value = mutableState.value.copy(hideCmdcQuota = hide)
     }
 
     /**

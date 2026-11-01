@@ -54,6 +54,44 @@ public static class ClaudeTranscriptReader
     /// <summary>尾部最多读 512 KB：Claude 的工具结果行可能极大，256 KB 有时读不到最后一条 assistant。</summary>
     private const int TailBytes = 512 * 1024;
 
+    /// <summary>
+    /// 已知由 Claude Code 注入的系统载荷标签。只过滤这些标签，不能把所有以 &lt; 开头的文本
+    /// 都当成系统消息——真实用户可能直接提交 HTML/XML，&lt;channel&gt; 等包装也承载用户消息。
+    /// </summary>
+    private static readonly HashSet<string> SystemPayloadTags = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "task-notification",
+        "system-reminder",
+        "local-command-caveat",
+        "command-name",
+        "command-message",
+        "command-args",
+        "local-command-stdout",
+        "local-command-stderr",
+        "bash-input",
+        "bash-stdout",
+        "bash-stderr",
+        "agent-message",
+    };
+
+    /// <summary>是否为 Claude Code 注入的、不能当作 UserPrompt 的系统标签载荷。</summary>
+    public static bool IsSystemPayload(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return false;
+        var trimmed = value.TrimStart();
+        if (trimmed.Length < 3 || trimmed[0] != '<') return false;
+
+        var nameStart = trimmed[1] == '/' ? 2 : 1;
+        var nameEnd = nameStart;
+        while (nameEnd < trimmed.Length &&
+               (char.IsLetterOrDigit(trimmed[nameEnd]) || trimmed[nameEnd] is '-' or '_' or ':'))
+        {
+            nameEnd++;
+        }
+
+        return nameEnd > nameStart && SystemPayloadTags.Contains(trimmed[nameStart..nameEnd]);
+    }
+
     public static ClaudeTranscriptSnapshot Read(string? transcriptPath)
     {
         if (string.IsNullOrWhiteSpace(transcriptPath) || !File.Exists(transcriptPath)) return Empty;
@@ -154,7 +192,7 @@ public static class ClaudeTranscriptReader
                                     queueOwed--;
                                 }
                                 else if (Text(root, "content") is { } queuedContent &&
-                                         !queuedContent.TrimStart().StartsWith('<') &&
+                                         !IsSystemPayload(queuedContent) &&
                                          !queuedContent.TrimStart().StartsWith('/'))
                                 {
                                     queueSettled = true;
@@ -375,7 +413,7 @@ public static class ClaudeTranscriptReader
 
     /// <summary>
     /// 真实用户输入才算回合边界：content 为字符串（工具结果行是数组）、非 meta、
-    /// 且不是系统注入的尖括号载荷（如 &lt;task-notification&gt; 后台任务完成通知）。
+    /// 且不是已知系统注入标签（如 &lt;task-notification&gt; 后台任务完成通知）。
     /// 返回该输入文本，非用户输入时返回 null。
     /// </summary>
     private static string? TurnBoundaryText(JsonElement root)
@@ -386,7 +424,7 @@ public static class ClaudeTranscriptReader
         if (!message.TryGetProperty("content", out var content) || content.ValueKind != JsonValueKind.String)
             return null;
         var text = content.GetString();
-        return string.IsNullOrWhiteSpace(text) || text.TrimStart().StartsWith('<') ? null : text;
+        return string.IsNullOrWhiteSpace(text) || IsSystemPayload(text) ? null : text;
     }
 
     /// <summary>assistant 行里所有 text 块的拼接（thinking / tool_use 不计入）。</summary>

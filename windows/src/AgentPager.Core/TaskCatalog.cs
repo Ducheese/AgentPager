@@ -295,6 +295,14 @@ public sealed class TaskCatalog
         if (!string.IsNullOrWhiteSpace(hook.Cwd))
             _claudeCwds[hook.SessionID] = hook.Cwd!;
 
+        // Claude Code 会把后台任务通知等系统载荷也走 UserPromptSubmit；
+        // 它们不是用户提交的回合，不能覆盖第二行，也不能触发新一轮计时。
+        if (hook.HookEventName == "UserPromptSubmit" &&
+            ClaudeTranscriptReader.IsSystemPayload(hook.Prompt))
+        {
+            return false;
+        }
+
         // 任一事件到达 = 该会话活着、且投出去的 Prompt 已被某个进程接管（回退子进程只会
         // 在真跑起来后才发 hook）——清掉投递确认，不再重投。
         _claudeDeliveries.Remove(hook.SessionID);
@@ -3496,6 +3504,7 @@ public static class ClaudeEventReducer
 
     private static TaskSnapshot UserPrompt(TaskSnapshot task, string? prompt, DateTimeOffset now, bool queuedDelivery = false)
     {
+        if (ClaudeTranscriptReader.IsSystemPayload(prompt)) return task;
         var normalized = Normalize(prompt);
         // 本轮计时：一轮的第一个 prompt 开始计时；轮内插入的 prompt 不重置；新一轮清第三行。
         // 与 opencode/agy 同一条规则（旧实现把 StartedAt 停在会话创建时刻，显示的是"会话总长"，G5/G6）。

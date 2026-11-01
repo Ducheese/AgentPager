@@ -69,6 +69,12 @@ class MainActivity : ComponentActivity() {
                     viewModel.setTerminalMode(!viewModel.state.value.terminalMode)
                     updateSystemBars()
                 },
+                onToggleHideCodexQuota = {
+                    viewModel.setHideCodexQuota(!viewModel.state.value.hideCodexQuota)
+                },
+                onToggleHideCmdcQuota = {
+                    viewModel.setHideCmdcQuota(!viewModel.state.value.hideCmdcQuota)
+                },
                 onOpenTaskConsumed = viewModel::consumeOpenTask,
                 onSpeechRateChange = viewModel::setSpeechRate,
                 onToggleReplySpeech = viewModel::toggleReplySpeech,
