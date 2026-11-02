@@ -329,6 +329,9 @@ private fun MermaidFullscreenDialog(
     ) {
         // 关键：拦截系统返回键，返回键退出全屏
         BackHandler(onBack = onDismiss)
+        // 横屏专用模式下 Activity 已隐藏系统栏；对话框是独立窗口，需同样隐藏，
+        // 否则 safeDrawing 会把状态栏高度算成内边距，顶部白白浪费一条。
+        MatchActivitySystemBars()
 
         Column(
             modifier = Modifier

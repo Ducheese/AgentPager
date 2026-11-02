@@ -2706,6 +2706,43 @@ finally
     try { File.Delete(agyQueuePath); } catch { /* 清理失败不影响断言 */ }
 }
 
+// ---- 远程多行 Prompt 不得被自己的 history 记录误判成排队（2026-11-02 用户报出）----
+// 注入器把换行折成空格（ConsoleKeystrokes.NormalizeText），history.jsonl 记的是折行后的那一行，
+// 而 task.UserPrompt 保留手机原文。逐字比较会让**本回合自己那条**变成"排队中"：远程投递时
+// StartedAt 记在注入之后、history 落盘晚几十毫秒到几秒，时间戳守卫挡不住；误挂的徽章再被
+// 成功 Stop 的 keepQueued 保留，直到下一次 PreInvocation（不排队就永远不来）。
+var agyMultilinePath = Path.Combine(Path.GetTempPath(), $"agy_multiline_{Guid.NewGuid():N}.jsonl");
+var previousMultilineHistory = AgyHistoryReader.HistoryPathOverride;
+AgyHistoryReader.HistoryPathOverride = agyMultilinePath;
+try
+{
+    var multilineT0 = DateTimeOffset.UtcNow;
+    var multilineTask = new TaskSnapshot(
+        "agy_multiline", AgentSource.Antigravity, "demo", "demo",
+        "第一行\n第二行", null, null, [],
+        AgentLifecycle.Running, AgentActivity.Thinking,
+        multilineT0, multilineT0, null, false, false, false, []);
+    File.WriteAllLines(agyMultilinePath, new[]
+    {
+        $"{{\"conversationId\":\"agy_multiline\",\"display\":\"第一行 第二行\",\"timestamp\":{multilineT0.AddSeconds(2).ToUnixTimeMilliseconds()}}}",
+    });
+    Check(AgyEventReducer.DetectQueuedPrompt("agy_multiline", multilineTask) is null,
+        "agy queue: the round's own multiline prompt is not mistaken for a queued follow-up");
+
+    // 真正不同的一句仍然要判成排队
+    File.WriteAllLines(agyMultilinePath, new[]
+    {
+        $"{{\"conversationId\":\"agy_multiline\",\"display\":\"插一句\",\"timestamp\":{multilineT0.AddSeconds(2).ToUnixTimeMilliseconds()}}}",
+    });
+    Check(AgyEventReducer.DetectQueuedPrompt("agy_multiline", multilineTask) is not null,
+        "agy queue: a genuinely different prompt is still detected");
+}
+finally
+{
+    AgyHistoryReader.HistoryPathOverride = previousMultilineHistory;
+    try { File.Delete(agyMultilinePath); } catch { /* 清理失败不影响断言 */ }
+}
+
 // ---- opencode 离线兜底：与 agy 同一口径（10 分钟无更新 + 没在跑工具）----
 var ocOfflineCatalog = new TaskCatalog();
 var ocOfflineT0 = DateTimeOffset.UtcNow;

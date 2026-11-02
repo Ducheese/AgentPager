@@ -808,7 +808,17 @@ public static class AgyEventReducer
         if (task.Lifecycle != AgentLifecycle.Running) return null;
         var (prompt, timestamp) = AgyHistoryReader.ExtractLatestPrompt(sessionID);
         if (prompt is null || timestamp is null) return null;
-        if (timestamp.Value <= task.StartedAt || prompt == task.UserPrompt) return null;
+        if (timestamp.Value <= task.StartedAt) return null;
+        if (prompt == task.UserPrompt) return null;
+        // history.jsonl 记的是**注入进终端的那一行**：ConsoleKeystrokes 会把换行折成空格再回车
+        // （见 ConsoleKeystrokes.NormalizeText），而 task.UserPrompt 保留手机原文（可多行）。
+        // 逐字比较因此会把**本回合自己那条**误判成"回合中插入的排队提示词"——远程投递时
+        // StartedAt 记在注入之后、history 落盘晚几十毫秒到几秒（实测 4.7s），时间戳守卫挡不住；
+        // 误挂的徽章再被成功 Stop 的 keepQueued 保留，直至下一次 PreInvocation（若那条根本没排队，
+        // 就永远不会来），手机上表现为"跑完了仍显示排队中"（2026-11-02 用户报出）。
+        // 按注入时同样的折行规则归一化后比较，同一句话不再冒充排队。
+        if (task.UserPrompt is { } current && ConsoleKeystrokes.NormalizeText(prompt) == ConsoleKeystrokes.NormalizeText(current))
+            return null;
         return (prompt, timestamp.Value);
     }
 
