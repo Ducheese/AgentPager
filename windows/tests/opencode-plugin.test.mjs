@@ -182,6 +182,11 @@ check(
   events("subagent").some((i) => i.payload.properties.id === "ses_child" && i.payload.properties.phase === "started"),
   "child session registered as a subagent row"
 )
+await emit("session.updated", { info: { id: "ses_child", parentID: "ses_t", title: "真实标题 (@explore subagent)" } })
+await flush()
+const childTitle = events("subagent").find((i) => i.payload.properties.id === "ses_child" && i.payload.properties.phase === "title")
+check(childTitle?.payload.properties.title === "真实标题 (@explore subagent)",
+  `a late child title is sent as its own phase (got ${JSON.stringify(childTitle?.payload.properties.title)})`)
 await emit("session.deleted", { info: { id: "ses_child", parentID: "ses_t" } })
 await flush()
 const childPhases = events("subagent").filter((i) => i.payload.properties.id === "ses_child").map((i) => i.payload.properties.phase)

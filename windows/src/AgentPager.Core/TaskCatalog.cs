@@ -916,6 +916,8 @@ public sealed class TaskCatalog
 
         if (hook.WorkspacePaths is { Length: > 0 } paths && !string.IsNullOrWhiteSpace(paths[0]))
             _agyWorkspaces[sessionID] = paths[0];
+        if (!string.IsNullOrWhiteSpace(hook.TranscriptPath))
+            _agyTranscripts[sessionID] = hook.TranscriptPath!;
 
         int? observedHostPid = null;
         if (hook.HostPid is { } rawPid && rawPid > 0)
@@ -938,6 +940,8 @@ public sealed class TaskCatalog
         // 2. 解析父会话（内存映射 / 先验派发窗口认领 / 转录本 sender 探测 / SQLite 四重保障）
         var parentSessionID = ResolveAgyParentSession(hook, now, out var resolvedRole);
         parentSessionID ??= !string.IsNullOrWhiteSpace(dbInfo?.ParentConversationId) ? dbInfo.ParentConversationId : null;
+        if (parentSessionID is not null && AgySubagentNames.Pick(resolvedRole) is null)
+            resolvedRole = RecoverAgyChildRole(sessionID, parentSessionID) ?? resolvedRole;
 
         // 2.5 终端换过会话（C，2026-10-19）：同一个 pid 上除父子关系外的旧会话映射作废。
         // 不清理的话，被切走的任务会一直挂着一个**不会再看它**的终端：既给出假入口，又永远不会判离线。
@@ -1093,10 +1097,12 @@ public sealed class TaskCatalog
             if (!string.IsNullOrWhiteSpace(detectedParent))
             {
                 _agyChildToParent[sessionID] = detectedParent;
-                if (_agyPendingParentRoles.TryGetValue(detectedParent, out var pending) && pending.Count > 0)
+                if (_agySpawningParents.TryGetValue(detectedParent, out var pending) && pending.Roles.Count > 0)
                 {
-                    role = pending[0];
-                    pending.RemoveAt(0);
+                    role = pending.Roles[0];
+                    pending.Roles.RemoveAt(0);
+                    if (pending.Roles.Count == 0) _agySpawningParents.Remove(detectedParent);
+                    else _agySpawningParents[detectedParent] = pending;
                     _agyChildRoles[sessionID] = role;
                 }
                 return detectedParent;
@@ -1107,15 +1113,37 @@ public sealed class TaskCatalog
         if (!string.IsNullOrWhiteSpace(dbInfo?.ParentConversationId))
         {
             _agyChildToParent[sessionID] = dbInfo.ParentConversationId;
-            if (!string.IsNullOrWhiteSpace(dbInfo.Title))
+            if (AgySubagentNames.Pick(dbInfo.Title) is { } dbRole)
             {
-                role = dbInfo.Title;
+                role = dbRole;
                 _agyChildRoles[sessionID] = role;
             }
             return dbInfo.ParentConversationId;
         }
 
         return null;
+    }
+
+    private string? RecoverAgyChildRole(string childId, string parentId)
+    {
+        if (_agyChildRoles.TryGetValue(childId, out var cached) &&
+            AgySubagentNames.Pick(cached) is { } cachedRole)
+            return cachedRole;
+        if (!_agyRoleRecoveryAttempted.Add(childId)) return null;
+
+        var transcriptPath = _agyTranscripts.TryGetValue(parentId, out var tracked)
+            ? tracked
+            : AgyTranscriptReader.TranscriptPathFor(parentId);
+        transcriptPath = AgyTranscriptReader.ResolveTranscriptPath(transcriptPath);
+        var roles = AgyTranscriptReader.DetectInvokeSubagentRoles(transcriptPath);
+        if (roles.Count == 0) return null;
+        var children = AgyTranscriptReader.DetectCreatedSubagents(transcriptPath);
+        var index = children.FindIndex(id => string.Equals(id, childId, StringComparison.OrdinalIgnoreCase));
+        if (index < 0 || index >= roles.Count) return null;
+        var role = roles[index];
+        if (AgySubagentNames.IsPlaceholder(role)) return null;
+        _agyChildRoles[childId] = role;
+        return role;
     }
 
     private void InspectInvokeSubagent(AgyHookPayload hook, DateTimeOffset now)
@@ -1147,10 +1175,12 @@ public sealed class TaskCatalog
                 if (!_agyChildToParent.ContainsKey(childId))
                 {
                     _agyChildToParent[childId] = sessionID;
-                    if (_agyPendingParentRoles.TryGetValue(sessionID, out var pending) && pending.Count > 0)
+                    if (_agySpawningParents.TryGetValue(sessionID, out var pending) && pending.Roles.Count > 0)
                     {
-                        var role = pending[0];
-                        pending.RemoveAt(0);
+                        var role = pending.Roles[0];
+                        pending.Roles.RemoveAt(0);
+                        if (pending.Roles.Count == 0) _agySpawningParents.Remove(sessionID);
+                        else _agySpawningParents[sessionID] = pending;
                         _agyChildRoles[childId] = role;
                     }
                 }
@@ -1158,59 +1188,8 @@ public sealed class TaskCatalog
         }
     }
 
-    private static List<string> ExtractRolesFromInvokeSubagent(JsonElement? args)
-    {
-        var result = new List<string>();
-        if (args is null) return result;
-        try
-        {
-            if (args.Value.TryGetProperty("Subagents", out var subsProp))
-            {
-                JsonElement arrayElement;
-                JsonDocument? parsedDoc = null;
-                if (subsProp.ValueKind == JsonValueKind.String)
-                {
-                    parsedDoc = JsonDocument.Parse(subsProp.GetString()!);
-                    arrayElement = parsedDoc.RootElement;
-                }
-                else
-                {
-                    arrayElement = subsProp;
-                }
-
-                if (arrayElement.ValueKind == JsonValueKind.Array)
-                {
-                    foreach (var item in arrayElement.EnumerateArray())
-                        if (SubagentName(item) is { } name) result.Add(name);
-                }
-                parsedDoc?.Dispose();
-            }
-
-            // agy 1.4.3 起子代理参数平铺在根层级（TypeName / Role / Prompt），不再有 Subagents 数组。
-            if (result.Count == 0 && SubagentName(args.Value) is { } flat)
-                result.Add(flat);
-        }
-        catch { }
-        return result;
-    }
-
-    /// <summary>
-    /// 子代理显示名的来源：<c>Role</c> 优先，缺失或空白时回退 <c>TypeName</c>。
-    /// 与第三行步骤（<c>AgyHooks.ExtractToolDetail</c> 的 <c>Role ?? TypeName</c>）同一优先级；
-    /// 1.4.3 schema 里 Role 必填，这里只是防御——两个分支（数组 / 根层级平铺）保持对称。
-    /// </summary>
-    private static string? SubagentName(JsonElement item)
-    {
-        foreach (var key in new[] { "Role", "TypeName" })
-        {
-            if (item.TryGetProperty(key, out var prop) &&
-                prop.ValueKind == JsonValueKind.String &&
-                prop.GetString() is { Length: > 0 } text &&
-                !string.IsNullOrWhiteSpace(text))
-                return text;
-        }
-        return null;
-    }
+    private static List<string> ExtractRolesFromInvokeSubagent(JsonElement? args) =>
+        args is { } value ? AgySubagentNames.RolesFromArgs(value) : [];
 
     /// <summary>
     /// agy 主代理的 `manage_subagents` 是主动 kill 子代理的唯一即时信号：
@@ -1302,8 +1281,9 @@ public sealed class TaskCatalog
         if (existing?.IsTerminal == true && hook.EffectiveEvent != "PostInvocation") return parent;
 
         var agentName = dbInfo?.AgentName ?? "research";
-        var role = !string.IsNullOrWhiteSpace(customRole) ? customRole : (!string.IsNullOrWhiteSpace(dbInfo?.Title) ? dbInfo.Title : agentName);
-        var displayName = SubagentDisplayName(role, null);
+        var displayName = SubagentDisplayName(
+            AgySubagentNames.Pick(customRole, dbInfo?.Title, agentName) ?? "子代理",
+            null);
         var path = existing?.Path ?? ("/" + agentName);
 
         var subagent = existing ?? new SubagentSnapshot(
@@ -1403,7 +1383,8 @@ public sealed class TaskCatalog
     // 子代理与父任务映射关系与角色记录（通道 1 转录本 sender 探测 / 通道 2 invoke_subagent / 通道 3 SQLite）
     private readonly Dictionary<string, string> _agyChildToParent = new();
     private readonly Dictionary<string, string> _agyChildRoles = new();
-    private readonly Dictionary<string, List<string>> _agyPendingParentRoles = new();
+    private readonly Dictionary<string, string> _agyTranscripts = new();
+    private readonly HashSet<string> _agyRoleRecoveryAttempted = new(StringComparer.OrdinalIgnoreCase);
     // 先验派发窗口：父任务调用 invoke_subagent 时开启，子代理在 PreInvocation 首帧零时差直接认领绑定
     private readonly Dictionary<string, (List<string> Roles, DateTimeOffset Deadline)> _agySpawningParents = new();
 
@@ -1541,7 +1522,9 @@ public sealed class TaskCatalog
                 if (parent is not null)
                 {
                     var agentName = dbInfo?.AgentName ?? "research";
-                    var displayName = SubagentDisplayName(roleName ?? agentName, dbInfo?.Title);
+                    var displayName = SubagentDisplayName(
+                        AgySubagentNames.Pick(roleName, dbInfo?.Title, agentName) ?? "子代理",
+                        null);
                     var sub = new SubagentSnapshot(
                         task.Id, "/" + agentName, displayName,
                         task.Lifecycle, task.Activity ?? AgentActivity.Thinking,
@@ -3955,7 +3938,7 @@ public static class OpenCodeEventReducer
         var phase = Text(value, "phase");
         if (id is null || phase is null) return task;
         var existing = task.Subagents.FirstOrDefault(item => item.Id == id);
-        if (existing?.IsTerminal == true && phase != "tokens") return task;
+        if (existing?.IsTerminal == true && phase is not ("tokens" or "title")) return task;
         var agent = Text(value, "agent");
         var path = existing?.Path ?? (agent is null ? "/subagent" : "/" + agent);
         var subagent = existing ?? new SubagentSnapshot(
@@ -3967,6 +3950,14 @@ public static class OpenCodeEventReducer
         {
             case "started":
                 subagent = subagent with { Lifecycle = AgentLifecycle.Running };
+                break;
+            case "title":
+                var lateTitle = Text(value, "title");
+                if (!string.IsNullOrWhiteSpace(lateTitle))
+                {
+                    var lateName = SubagentName(agent, lateTitle);
+                    if (lateName != subagent.DisplayName) subagent = subagent with { DisplayName = lateName };
+                }
                 break;
             case "tool":
                 var tool = Text(value, "tool");
@@ -4023,12 +4014,12 @@ public static class OpenCodeEventReducer
     private static string SubagentName(string? agent, string? title)
     {
         // 有标题显示标题（子会话标题去 " (@type subagent)" 尾），没有才回落 subagent type。
-        if (title is not null)
+        if (!string.IsNullOrWhiteSpace(title))
         {
             var index = title.IndexOf(" (@", StringComparison.Ordinal);
             return Clamp(index > 0 ? title[..index] : title, 40);
         }
-        if (agent is not null) return char.ToUpperInvariant(agent[0]) + agent[1..];
+        if (!string.IsNullOrWhiteSpace(agent)) return char.ToUpperInvariant(agent[0]) + agent[1..];
         return "opencode 子代理";
     }
 

@@ -425,23 +425,12 @@ public static class AgyTranscriptReader
         try
         {
             var results = new List<string>();
-            var fileInfo = new FileInfo(transcriptPath);
-            var readSize = (int)Math.Min(fileInfo.Length, 64 * 1024);
-            if (readSize <= 0) return results;
-
-            byte[] buffer = new byte[readSize];
-            using (var stream = new FileStream(transcriptPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-            {
-                stream.Seek(-readSize, SeekOrigin.End);
-                int bytesRead = stream.Read(buffer, 0, readSize);
-                if (bytesRead <= 0) return results;
-            }
-
-            var text = Encoding.UTF8.GetString(buffer);
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var text = ReadTail(transcriptPath, 256 * 1024);
             var matches = SubagentCreatedRegex.Matches(text);
             foreach (Match m in matches)
             {
-                if (m.Success) results.Add(m.Groups[1].Value);
+                if (m.Success && seen.Add(m.Groups[1].Value)) results.Add(m.Groups[1].Value);
             }
             return results;
         }
@@ -449,6 +438,86 @@ public static class AgyTranscriptReader
         {
             return [];
         }
+    }
+
+    public static List<string> DetectInvokeSubagentRoles(string? transcriptPath)
+    {
+        if (string.IsNullOrWhiteSpace(transcriptPath) || !File.Exists(transcriptPath))
+            return [];
+
+        try
+        {
+            var roles = new List<string>();
+            foreach (var rawLine in ReadTail(transcriptPath, 256 * 1024).Split('\n'))
+            {
+                var line = rawLine.Trim();
+                if (line.Length == 0) continue;
+                try
+                {
+                    using var doc = JsonDocument.Parse(line);
+                    if (!doc.RootElement.TryGetProperty("tool_calls", out var calls) ||
+                        calls.ValueKind != JsonValueKind.Array)
+                        continue;
+                    foreach (var call in calls.EnumerateArray())
+                    {
+                        if (call.ValueKind != JsonValueKind.Object) continue;
+                        if (!string.Equals(ToolCallName(call), "invoke_subagent", StringComparison.OrdinalIgnoreCase))
+                            continue;
+                        if (ToolCallArgs(call) is { } args)
+                            roles.AddRange(AgySubagentNames.RolesFromArgs(args));
+                    }
+                }
+                catch { }
+            }
+            return roles;
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    private static string ReadTail(string path, int limit)
+    {
+        var fileInfo = new FileInfo(path);
+        var readSize = (int)Math.Min(fileInfo.Length, limit);
+        if (readSize <= 0) return "";
+        var buffer = new byte[readSize];
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        stream.Seek(-readSize, SeekOrigin.End);
+        var bytesRead = stream.Read(buffer, 0, readSize);
+        return bytesRead <= 0 ? "" : Encoding.UTF8.GetString(buffer, 0, bytesRead);
+    }
+
+    private static string? ToolCallName(JsonElement call)
+    {
+        if (call.TryGetProperty("name", out var name) && name.ValueKind == JsonValueKind.String)
+            return name.GetString();
+        if (call.TryGetProperty("function", out var function) &&
+            function.ValueKind == JsonValueKind.Object &&
+            function.TryGetProperty("name", out var functionName) &&
+            functionName.ValueKind == JsonValueKind.String)
+            return functionName.GetString();
+        return null;
+    }
+
+    private static JsonElement? ToolCallArgs(JsonElement call)
+    {
+        if (call.TryGetProperty("args", out var args)) return ParseArgs(args);
+        if (call.TryGetProperty("arguments", out var arguments)) return ParseArgs(arguments);
+        if (!call.TryGetProperty("function", out var function) || function.ValueKind != JsonValueKind.Object)
+            return null;
+        if (function.TryGetProperty("arguments", out var functionArguments)) return ParseArgs(functionArguments);
+        if (function.TryGetProperty("args", out var functionArgs)) return ParseArgs(functionArgs);
+        return null;
+    }
+
+    private static JsonElement? ParseArgs(JsonElement value)
+    {
+        if (value.ValueKind == JsonValueKind.Object) return value;
+        if (value.ValueKind != JsonValueKind.String || value.GetString() is not { Length: > 0 } text) return null;
+        using var doc = JsonDocument.Parse(text);
+        return doc.RootElement.Clone();
     }
 
     private static string? CleanUserPrompt(string raw)
@@ -467,6 +536,72 @@ public static class AgyTranscriptReader
         var result = string.Join(' ', value.Replace('\r', ' ').Replace('\n', ' ')
             .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
         return result.Length == 0 ? null : result;
+    }
+}
+
+public static class AgySubagentNames
+{
+    private static readonly HashSet<string> Placeholders = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "self",
+        "subagent",
+    };
+
+    public static bool IsPlaceholder(string? value) =>
+        string.IsNullOrWhiteSpace(value) || Placeholders.Contains(value.Trim());
+
+    public static string? Pick(params string?[] values)
+    {
+        foreach (var value in values)
+        {
+            if (!IsPlaceholder(value)) return value!.Trim();
+        }
+        return null;
+    }
+
+    public static string? FromElement(JsonElement item)
+    {
+        foreach (var key in new[] { "Role", "TypeName" })
+        {
+            if (item.TryGetProperty(key, out var prop) &&
+                prop.ValueKind == JsonValueKind.String &&
+                Pick(prop.GetString()) is { } name)
+                return name;
+        }
+        return null;
+    }
+
+    public static List<string> RolesFromArgs(JsonElement args)
+    {
+        var result = new List<string>();
+        try
+        {
+            if (args.TryGetProperty("Subagents", out var subsProp))
+            {
+                JsonElement arrayElement;
+                JsonDocument? parsedDoc = null;
+                if (subsProp.ValueKind == JsonValueKind.String)
+                {
+                    parsedDoc = JsonDocument.Parse(subsProp.GetString()!);
+                    arrayElement = parsedDoc.RootElement;
+                }
+                else
+                {
+                    arrayElement = subsProp;
+                }
+
+                if (arrayElement.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var item in arrayElement.EnumerateArray())
+                        if (FromElement(item) is { } name) result.Add(name);
+                }
+                parsedDoc?.Dispose();
+            }
+
+            if (result.Count == 0 && FromElement(args) is { } flat) result.Add(flat);
+        }
+        catch { }
+        return result;
     }
 }
 
@@ -918,15 +1053,16 @@ public static class AgyEventReducer
             {
                 var first = subs.EnumerateArray().FirstOrDefault();
                 if (first.ValueKind == JsonValueKind.Object)
-                {
-                    var role = first.TryGetProperty("Role", out var r) ? r.GetString() : null;
-                    var type = first.TryGetProperty("TypeName", out var t) ? t.GetString() : null;
-                    return NormalizeText(role ?? type ?? "subagent");
-                }
+                    return NormalizeText(AgySubagentNames.FromElement(first) ?? "派生子代理");
             }
 
-            if (FirstString(value, "Role", "TypeName") is { } flat)
-                return NormalizeText(flat);
+            var role = value.TryGetProperty("Role", out var roleProp) && roleProp.ValueKind == JsonValueKind.String
+                ? roleProp.GetString()
+                : null;
+            var type = value.TryGetProperty("TypeName", out var typeProp) && typeProp.ValueKind == JsonValueKind.String
+                ? typeProp.GetString()
+                : null;
+            return NormalizeText(AgySubagentNames.Pick(role, type) ?? "派生子代理");
         }
 
         // 白名单参数扫描（严格不含 Prompt）

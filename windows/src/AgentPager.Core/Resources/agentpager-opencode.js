@@ -92,6 +92,7 @@ export const AgentPagerOpenCode = async (input) => {
   const runningSessions = new Set()
   const queuedSessions = new Set()
   const childParent = new Map()
+  const childTitles = new Map()
   // 乱序残帧守卫：某会话最近一次工具事件的**开始时刻**（ms）。
   // v8 用"有没有收到过工具事件"这种到达顺序判定，会把**合法的**结束帧一起丢掉（见下方注释）；
   // v11 改成比时间戳：正文的 time.end 早于工具 time.start 才算残帧。
@@ -477,6 +478,7 @@ export const AgentPagerOpenCode = async (input) => {
             queuedSessions.delete(deletedID)
             childSessions.delete(deletedID)
             childParent.delete(deletedID)
+            childTitles.delete(deletedID)
             if (replies.has(deletedID)) {
               const r = replies.get(deletedID)
               if (r && r.timer) clearTimeout(r.timer)
@@ -487,11 +489,18 @@ export const AgentPagerOpenCode = async (input) => {
         }
         if (isChild(properties)) {
           const childID = sessionIDOf(properties)
-          if (typeof childID === "string" && event.type === "session.created") {
-            sendSubagent(childID, "started", {
-              agent: parseAgent(properties.info?.title),
-              title: cap(properties.info?.title, 200),
-            })
+          if (typeof childID === "string") {
+            const title = cap(properties.info?.title, 200)
+            if (event.type === "session.created") {
+              if (title !== undefined) childTitles.set(childID, title)
+              sendSubagent(childID, "started", {
+                agent: parseAgent(properties.info?.title),
+                title,
+              })
+            } else if (event.type === "session.updated" && title !== undefined && childTitles.get(childID) !== title) {
+              childTitles.set(childID, title)
+              sendSubagent(childID, "title", { title })
+            }
           }
           return
         }

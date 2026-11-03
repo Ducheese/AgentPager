@@ -2396,6 +2396,64 @@ var noRoleParent = agyNoRoleCatalog.Projection().Tasks.First(x => x.Id == "paren
 Check(noRoleParent.Subagents is [{ DisplayName: "Research" }],
     $"agy 1.4.3: missing Role falls back to TypeName (got {noRoleParent.Subagents.FirstOrDefault()?.DisplayName})");
 
+var agySelfCatalog = new TaskCatalog();
+var agySelfT0 = flatT0.AddMinutes(10);
+agySelfCatalog.Accept(A("PreInvocation", new { conversationId = "parent_self", workspacePaths = new[] { @"C:\test" } }), agySelfT0);
+agySelfCatalog.Accept(A("PreToolUse", new
+{
+    conversationId = "parent_self",
+    toolCall = new { name = "invoke_subagent", args = new { TypeName = "self", Prompt = "调查这个仓库" } }
+}), agySelfT0.AddSeconds(1));
+agySelfCatalog.Accept(A("PreInvocation", new { conversationId = "child_self" }), agySelfT0.AddSeconds(2));
+var selfParent = agySelfCatalog.Projection().Tasks.First(x => x.Id == "parent_self");
+var selfName = selfParent.Subagents.FirstOrDefault()?.DisplayName;
+Check(selfParent.LatestStep == "Task 派生子代理",
+    $"agy: type placeholder does not leak into the parent step (got '{selfParent.LatestStep}')");
+Check(selfName is "Research" or "子代理",
+    $"agy: self/Subagent is not used as a display name (got '{selfName}')");
+
+var agyRecoverCatalog = new TaskCatalog();
+var recoverT0 = flatT0.AddMinutes(20);
+var recoverBrain = Path.Combine(Path.GetTempPath(), "ap-agy-brain-" + Guid.NewGuid().ToString("N"));
+var previousBrain = AgyTranscriptReader.BrainRoot;
+AgyTranscriptReader.BrainRoot = recoverBrain;
+try
+{
+    var recoverParentId = "parent_recover";
+    var recoverChildId = Guid.NewGuid().ToString();
+    var parentTranscript = AgyTranscriptReader.TranscriptPathFor(recoverParentId);
+    Directory.CreateDirectory(Path.GetDirectoryName(parentTranscript)!);
+    File.WriteAllLines(parentTranscript, new[]
+    {
+        "{\"type\":\"PLANNER_RESPONSE\",\"tool_calls\":[{\"name\":\"invoke_subagent\",\"args\":{\"Subagents\":[{\"Role\":\"Recovered Role\",\"TypeName\":\"self\"}]}}]}",
+        "{\"type\":\"GENERIC\",\"conversationId\":\"" + recoverChildId + "\"}",
+    });
+    var recoverChildTranscript = Path.Combine(recoverBrain, "child_recover.jsonl");
+    File.WriteAllLines(recoverChildTranscript, new[]
+    {
+        "{\"type\":\"SYSTEM_MESSAGE\",\"content\":\"[Message] sender=" + recoverParentId + " content=测试\"}",
+    });
+
+    agyRecoverCatalog.Accept(A("PreInvocation", new
+    {
+        conversationId = recoverParentId,
+        workspacePaths = new[] { @"C:\test" }
+    }), recoverT0);
+    agyRecoverCatalog.Accept(A("PreInvocation", new
+    {
+        conversationId = recoverChildId,
+        transcriptPath = recoverChildTranscript
+    }), recoverT0.AddSeconds(1));
+    var recoverParent = agyRecoverCatalog.Projection().Tasks.First(x => x.Id == recoverParentId);
+    Check(recoverParent.Subagents is [{ DisplayName: "Recovered Role" }],
+        $"agy: missing Role is recovered from the parent transcript (got {recoverParent.Subagents.FirstOrDefault()?.DisplayName})");
+}
+finally
+{
+    AgyTranscriptReader.BrainRoot = previousBrain;
+    try { Directory.Delete(recoverBrain, true); } catch { }
+}
+
 // ===================== 27. 1a/1c 回归（子代理只进面板 / 掐掉要同步 / agy 主对话不被误删）=====================
 
 // ---- 1c：Claude Code 掐子代理时**不发 SubagentStop**（探针实测），靠 TaskStop 入参收敛 ----
@@ -2493,6 +2551,16 @@ var ocTestCatalog = new TaskCatalog();
 var ocT0 = DateTimeOffset.UtcNow;
 ocTestCatalog.Accept(H("chat.message", new { sessionID = "ses_oc", text = "跑测试" }), ocT0);
 ocTestCatalog.Accept(H("subagent", new { sessionID = "ses_oc", id = "sub_a", phase = "started", agent = "build" }), ocT0.AddSeconds(1));
+ocTestCatalog.Accept(H("subagent", new
+{
+    sessionID = "ses_oc",
+    id = "sub_a",
+    phase = "title",
+    title = "构建项目 (@build subagent)"
+}), ocT0.AddSeconds(1.5));
+var ocTitledSub = ocTestCatalog.Projection().Tasks.First(t => t.Id == "ses_oc").Subagents[0];
+Check(ocTitledSub.DisplayName == "构建项目",
+    $"opencode subagent: a late title replaces the agent type (got {ocTitledSub.DisplayName})");
 ocTestCatalog.Accept(H("subagent", new
 {
     sessionID = "ses_oc",
