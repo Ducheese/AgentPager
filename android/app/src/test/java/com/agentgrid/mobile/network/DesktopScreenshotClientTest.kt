@@ -36,6 +36,7 @@ class DesktopScreenshotClientTest {
     private var responseBytesToReturn: ByteArray =
         byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xE0.toByte(), 1, 2, 3, 4)
     private var responseContentType: String = "image/jpeg"
+    private var capturedAtHeader: String? = null
     private var shouldThrowIoException: Boolean = false
 
     private fun createTestClient(): OkHttpClient {
@@ -55,6 +56,7 @@ class DesktopScreenshotClientTest {
                         .protocol(Protocol.HTTP_1_1)
                         .code(responseCodeToReturn)
                         .message("OK")
+                        .apply { capturedAtHeader?.let { header("X-AgentGrid-Captured-At", it) } }
                         .body(responseBytesToReturn.toResponseBody(responseContentType.toMediaType()))
                         .build()
                 },
@@ -66,6 +68,7 @@ class DesktopScreenshotClientTest {
     fun `成功请求桌面截图并正确携带配对密钥鉴权头`() = runBlocking {
         val dummyBitmap = createFakeBitmap()
         var decodedBytes: ByteArray? = null
+        var ticks = 0
 
         val client = DesktopScreenshotClient(
             endpoints = {
@@ -76,16 +79,38 @@ class DesktopScreenshotClientTest {
                 decodedBytes = bytes
                 dummyBitmap
             },
+            now = { if (ticks++ == 0) 1_000L else 1_500L },
         )
 
         val result = client.fetchScreenshot()
-        assertNotNull(result)
         assertEquals("/api/desktop/screenshot", lastReceivedPath)
         assertEquals("test-secret-123", lastReceivedSecret)
         assertArrayEquals(
             byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 0xFF.toByte(), 0xE0.toByte(), 1, 2, 3, 4),
             decodedBytes,
         )
+        // 桥没给快门时间时退回请求发出时间；总耗时从请求前到解码完成。
+        assertEquals(1_000L, result.capturedAtMillis)
+        assertEquals(500L, result.elapsedMillis)
+        assertFalse(result.viaTunnel)
+    }
+
+    @Test
+    fun `桥端快门时间优先且隧道端点标记为 TUNNEL`() = runBlocking {
+        capturedAtHeader = "1793632728067"
+        val client = DesktopScreenshotClient(
+            endpoints = {
+                listOf(PhoneEndpoint(host = "tunnel.test", port = 443, secure = true, secret = "s"))
+            },
+            okHttpClient = createTestClient(),
+            bitmapDecoder = { createFakeBitmap() },
+            now = { 9_000L },
+        )
+
+        val result = client.fetchScreenshot()
+        assertEquals(1_793_632_728_067L, result.capturedAtMillis)
+        assertEquals(0L, result.elapsedMillis)
+        assertTrue(result.viaTunnel)
     }
 
     @Test

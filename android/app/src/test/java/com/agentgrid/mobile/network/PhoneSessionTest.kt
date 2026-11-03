@@ -453,6 +453,25 @@ class PhoneSessionTest {
         fixture.close()
     }
 
+    @Test
+    fun `nudge 会重启卡在 CONNECTING 的局域网连接`() = runTest {
+        val fixture = fixture(pairing())
+        fixture.probe.reachable = true
+        fixture.session.start()
+        runCurrent()
+        assertEquals(LinkState.CONNECTING, fixture.session.state.value.link)
+        assertEquals(1, fixture.transport.connections.size)
+        assertFalse(fixture.transport.connections.last().secure)
+
+        fixture.session.nudge()
+        runCurrent()
+
+        // 即使局域网探测可达，nudge 也要断开重来，专门治被冻结卡住的握手。
+        assertEquals(2, fixture.transport.connections.size)
+        assertFalse(fixture.transport.connections.last().secure)
+        fixture.close()
+    }
+
     private suspend fun kotlinx.coroutines.test.TestScope.connectedFixture(): Fixture {
         val fixture = fixture(pairing())
         fixture.session.start()
@@ -468,6 +487,8 @@ class PhoneSessionTest {
         val operationLog = mutableListOf<String>()
         val credentials = InMemoryCredentialStore(pairing, operationLog)
         val transport = InMemoryPhoneSessionTransport(operationLog)
+        val network = NetworkState()
+        val probe = ProbeState()
         val scope = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler))
         var requestIndex = 0
         val session = DefaultPhoneSession(
@@ -478,9 +499,15 @@ class PhoneSessionTest {
             now = { 1_000L },
             requestID = { "request-${++requestIndex}" },
             nonce = { "nonce-$requestIndex" },
+            networkKind = { network.kind },
+            probeLocal = { _ ->
+                probe.calls++
+                if (probe.delayMillis > 0) kotlinx.coroutines.delay(probe.delayMillis)
+                probe.reachable
+            },
         )
         runCurrent()
-        return Fixture(session, credentials, transport, operationLog)
+        return Fixture(session, credentials, transport, operationLog, network, probe)
     }
 
     @Test
@@ -511,6 +538,332 @@ class PhoneSessionTest {
         assertEquals("example.ngrok-free.dev", endpoints[1].host)
         assertTrue(endpoints[1].secure)
         assertEquals(secretText(), endpoints[1].secret)
+        fixture.close()
+    }
+
+    @Test
+    fun `蜂窝网络下隧道优先且保留局域网兜底`() = runTest {
+        val fixture = fixture(pairing("example.ngrok-free.dev"))
+        fixture.network.kind = NetworkKind.Remote
+        fixture.session.start()
+        runCurrent()
+
+        assertEquals(
+            listOf(
+                PhoneEndpoint(
+                    "example.ngrok-free.dev",
+                    443,
+                    secure = true,
+                    secret = secretText(),
+                ),
+            ),
+            fixture.transport.connections,
+        )
+        val endpoints = fixture.session.uploadEndpoints()
+        assertEquals(2, endpoints.size)
+        assertTrue(endpoints[0].secure)
+        assertEquals("example.ngrok-free.dev", endpoints[0].host)
+        assertEquals("127.0.0.1", endpoints[1].host)
+        assertFalse(endpoints[1].secure)
+        fixture.close()
+    }
+
+    @Test
+    fun `断线后 linkRoute 清空`() = runTest {
+        val fixture = connectedFixture()
+        assertTrue(fixture.session.state.value.linkRoute != null)
+
+        fixture.transport.emit(TransportEvent.Failed("drop"))
+        runCurrent()
+
+        assertEquals(null, fixture.session.state.value.linkRoute)
+        fixture.close()
+    }
+
+    @Test
+    fun `隧道首次握手失败时先探测局域网而不是直接回退`() = runTest {
+        val fixture = fixture(pairing("example.ngrok-free.dev"))
+        fixture.network.kind = NetworkKind.Local
+        fixture.probe.reachable = false
+        fixture.session.start()
+        runCurrent()
+        // 冷启动先拨 LAN；探测失败后切到隧道。
+        fixture.session.onNetworkChanged()
+        runCurrent()
+        assertTrue(fixture.transport.connections.last().secure)
+
+        // 隧道还没 Opened 就失败：不应无脑轮换回 LAN，而应再次探测后继续隧道。
+        fixture.transport.emit(TransportEvent.Failed("tunnel first handshake"))
+        runCurrent()
+
+        assertEquals(3, fixture.transport.connections.size)
+        assertTrue(fixture.transport.connections.last().secure)
+        fixture.close()
+    }
+
+    @Test
+    fun `同网络类型的重复回调不会取消在飞探测`() = runTest {
+        val fixture = fixture(pairing("example.ngrok-free.dev"))
+        fixture.network.kind = NetworkKind.Local
+        fixture.probe.reachable = true
+        fixture.probe.delayMillis = 1_000
+        fixture.session.start()
+        runCurrent()
+
+        fixture.session.onNetworkChanged()
+        runCurrent()
+        advanceTimeBy(600)
+        fixture.session.onNetworkChanged()
+        runCurrent()
+        advanceTimeBy(1_000)
+        runCurrent()
+
+        // 600ms 补调被同类型去重，1.2s 的探测只跑了一次。
+        assertEquals(1, fixture.probe.calls)
+        assertEquals(1, fixture.transport.connections.size)
+        fixture.close()
+    }
+
+    @Test
+    fun `升级探测失败会按窗口重试并在局域网可达后切换`() = runTest {
+        val fixture = fixture(pairing("example.ngrok-free.dev"))
+        fixture.network.kind = NetworkKind.Remote
+        fixture.session.start()
+        runCurrent()
+        fixture.transport.emit(TransportEvent.Opened)
+        runCurrent()
+        assertEquals(BridgeRoute.TUNNEL, fixture.session.state.value.linkRoute)
+
+        fixture.network.kind = NetworkKind.Local
+        fixture.probe.reachable = false
+        fixture.session.forceNetworkChanged()
+        runCurrent()
+        assertEquals(1, fixture.probe.calls)
+        assertTrue(fixture.transport.connections.last().secure)
+
+        fixture.probe.reachable = true
+        advanceTimeBy(600)
+        runCurrent()
+
+        assertEquals(2, fixture.probe.calls)
+        assertFalse(fixture.transport.connections.last().secure)
+        fixture.transport.emit(TransportEvent.Opened)
+        runCurrent()
+        assertEquals(BridgeRoute.LAN, fixture.session.state.value.linkRoute)
+        fixture.close()
+    }
+
+    @Test
+    fun `升级探测重试有上限`() = runTest {
+        val fixture = fixture(pairing("example.ngrok-free.dev"))
+        fixture.network.kind = NetworkKind.Remote
+        fixture.session.start()
+        runCurrent()
+        fixture.transport.emit(TransportEvent.Opened)
+        runCurrent()
+
+        fixture.network.kind = NetworkKind.Local
+        fixture.probe.reachable = false
+        fixture.session.forceNetworkChanged()
+        runCurrent()
+        advanceTimeBy(10_000)
+        runCurrent()
+
+        assertEquals(4, fixture.probe.calls)
+        assertEquals(BridgeRoute.TUNNEL, fixture.session.state.value.linkRoute)
+        assertEquals(1, fixture.transport.connections.size)
+        fixture.close()
+    }
+
+    @Test
+    fun `已连隧道时上传候选把隧道排到最前`() = runTest {
+        val fixture = fixture(pairing("example.ngrok-free.dev"))
+        fixture.session.start()
+        runCurrent()
+        fixture.transport.emit(TransportEvent.Failed("局域网不可达"))
+        runCurrent()
+        advanceTimeBy(1_000)
+        runCurrent()
+        fixture.transport.emit(TransportEvent.Opened)
+        runCurrent()
+
+        val endpoints = fixture.session.uploadEndpoints()
+
+        assertEquals("example.ngrok-free.dev", endpoints[0].host)
+        assertTrue(endpoints[0].secure)
+        assertEquals(LinkState.CONNECTED, fixture.session.state.value.link)
+        assertEquals(BridgeRoute.TUNNEL, fixture.session.state.value.linkRoute)
+        fixture.close()
+    }
+
+    @Test
+    fun `隧道换域名后上传仍优先新隧道`() = runTest {
+        val fixture = fixture(pairing("old.trycloudflare.com"))
+        fixture.session.start()
+        runCurrent()
+        fixture.transport.emit(TransportEvent.Failed("局域网不可达"))
+        runCurrent()
+        advanceTimeBy(1_000)
+        runCurrent()
+        fixture.transport.emit(TransportEvent.Opened)
+        runCurrent()
+
+        fixture.transport.emit(
+            TransportEvent.TextReceived(
+                snapshotEnvelope(
+                    messageID = "host-rotate",
+                    sentAt = 200,
+                    taskID = "task",
+                    activeTunnelHost = "new.trycloudflare.com",
+                ),
+            ),
+        )
+        runCurrent()
+
+        val endpoints = fixture.session.uploadEndpoints()
+        assertEquals("new.trycloudflare.com", endpoints[0].host)
+        assertTrue(endpoints[0].secure)
+        assertEquals(BridgeRoute.TUNNEL, fixture.session.state.value.linkRoute)
+        fixture.close()
+    }
+
+    @Test
+    fun `从局域网切到蜂窝时立刻改连隧道`() = runTest {
+        val fixture = fixture(pairing("example.ngrok-free.dev"))
+        fixture.session.start()
+        runCurrent()
+        fixture.transport.emit(TransportEvent.Opened)
+        runCurrent()
+        assertFalse(fixture.transport.connections.last().secure)
+
+        fixture.network.kind = NetworkKind.Remote
+        fixture.session.onNetworkChanged()
+        runCurrent()
+
+        assertEquals(2, fixture.transport.connections.size)
+        assertEquals(
+            PhoneEndpoint("example.ngrok-free.dev", 443, secure = true, secret = secretText()),
+            fixture.transport.connections.last(),
+        )
+        fixture.close()
+    }
+
+    @Test
+    fun `回家探测可达后从隧道切回局域网`() = runTest {
+        val fixture = fixture(pairing("example.ngrok-free.dev"))
+        fixture.session.start()
+        runCurrent()
+        fixture.transport.emit(TransportEvent.Failed("局域网不可达"))
+        runCurrent()
+        advanceTimeBy(1_000)
+        runCurrent()
+        fixture.transport.emit(TransportEvent.Opened)
+        runCurrent()
+
+        fixture.network.kind = NetworkKind.Local
+        fixture.probe.reachable = true
+        fixture.session.onNetworkChanged()
+        runCurrent()
+
+        assertEquals(3, fixture.transport.connections.size)
+        assertEquals(
+            PhoneEndpoint("127.0.0.1", 8765, secret = secretText()),
+            fixture.transport.connections.last(),
+        )
+        fixture.close()
+    }
+
+    @Test
+    fun `异地 WiFi 探测失败时保持隧道`() = runTest {
+        val fixture = fixture(pairing("example.ngrok-free.dev"))
+        fixture.session.start()
+        runCurrent()
+        fixture.transport.emit(TransportEvent.Failed("局域网不可达"))
+        runCurrent()
+        advanceTimeBy(1_000)
+        runCurrent()
+        fixture.transport.emit(TransportEvent.Opened)
+        runCurrent()
+
+        fixture.network.kind = NetworkKind.Local
+        fixture.probe.reachable = false
+        fixture.session.onNetworkChanged()
+        runCurrent()
+
+        assertEquals(2, fixture.transport.connections.size)
+        assertTrue(fixture.transport.connections.last().secure)
+        fixture.close()
+    }
+
+    @Test
+    fun `已经在局域网时网络变化不重复重连`() = runTest {
+        val fixture = fixture(pairing("example.ngrok-free.dev"))
+        fixture.session.start()
+        runCurrent()
+        fixture.transport.emit(TransportEvent.Opened)
+        runCurrent()
+
+        fixture.network.kind = NetworkKind.Local
+        fixture.session.onNetworkChanged()
+        runCurrent()
+
+        assertEquals(1, fixture.transport.connections.size)
+        fixture.close()
+    }
+
+    @Test
+    fun `异地 WiFi 上隧道断开重连不会先退回局域网`() = runTest {
+        val fixture = fixture(pairing("example.ngrok-free.dev"))
+        fixture.network.kind = NetworkKind.Remote
+        fixture.session.start()
+        runCurrent()
+        fixture.transport.emit(TransportEvent.Opened)
+        runCurrent()
+        assertTrue(fixture.transport.connections.last().secure)
+
+        // 人到了异地 WiFi：局域网不可达，此时隧道抖动断开，重连应继续走隧道。
+        fixture.network.kind = NetworkKind.Local
+        fixture.probe.reachable = false
+        fixture.transport.emit(TransportEvent.Failed("tunnel flap"))
+        runCurrent()
+        advanceTimeBy(1_000)
+        runCurrent()
+
+        assertEquals(2, fixture.transport.connections.size)
+        assertTrue(fixture.transport.connections.last().secure)
+        fixture.close()
+    }
+
+    @Test
+    fun `异地 WiFi 冷启动探测失败直接切隧道`() = runTest {
+        val fixture = fixture(pairing("example.ngrok-free.dev"))
+        fixture.probe.reachable = false
+        fixture.session.start()
+        runCurrent()
+        // start 先拨局域网（CONNECTING），网络回调探测失败后立即改拨隧道。
+        fixture.session.onNetworkChanged()
+        runCurrent()
+
+        assertEquals(2, fixture.transport.connections.size)
+        assertEquals(
+            PhoneEndpoint("example.ngrok-free.dev", 443, secure = true, secret = secretText()),
+            fixture.transport.connections.last(),
+        )
+        fixture.close()
+    }
+
+    @Test
+    fun `家里冷启动探测可达时保留局域网`() = runTest {
+        val fixture = fixture(pairing("example.ngrok-free.dev"))
+        fixture.probe.reachable = true
+        fixture.session.start()
+        runCurrent()
+
+        fixture.session.onNetworkChanged()
+        runCurrent()
+
+        assertEquals(1, fixture.transport.connections.size)
+        assertFalse(fixture.transport.connections.last().secure)
         fixture.close()
     }
 
@@ -568,9 +921,19 @@ class PhoneSessionTest {
         val credentials: InMemoryCredentialStore,
         val transport: InMemoryPhoneSessionTransport,
         val operationLog: List<String>,
+        val network: NetworkState,
+        val probe: ProbeState,
     ) {
         fun close() = session.close()
     }
+
+    private class NetworkState(var kind: NetworkKind = NetworkKind.Unknown)
+
+    private class ProbeState(
+        var reachable: Boolean = true,
+        var delayMillis: Long = 0,
+        var calls: Int = 0,
+    )
 
     private class InMemoryCredentialStore(
         private var pairing: PairingPayload?,

@@ -44,6 +44,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -92,23 +93,37 @@ fun DesktopScreenshotDialog(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Row(
+                    modifier = Modifier.weight(1f),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     Text(
-                        text = "DESKTOP · 屏幕截图",
+                        text = "DESKTOP",
                         color = AgentGridColors.Cyan,
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                     )
                     if (state is DesktopScreenshotState.Success) {
-                        val timeStr = remember(state.capturedAt) {
-                            SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(state.capturedAt))
+                        // 桥端快门时间 + 实际走的腿 + 从点击到收到图片的总耗时。
+                        val detail = remember(
+                            state.capturedAt,
+                            state.viaTunnel,
+                            state.elapsedMillis,
+                        ) {
+                            val timeStr = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
+                                .format(Date(state.capturedAt))
+                            val route = if (state.viaTunnel) "TUNNEL" else "LAN"
+                            val seconds = state.elapsedMillis / 1000.0
+                            "$timeStr · $route · ${String.format(Locale.getDefault(), "%.1fs", seconds)}"
                         }
                         Text(
-                            text = timeStr,
+                            text = detail,
                             color = AgentGridColors.Muted,
                             fontSize = 11.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
                         )
                     }
                 }

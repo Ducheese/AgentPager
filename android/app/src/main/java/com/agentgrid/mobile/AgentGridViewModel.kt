@@ -25,9 +25,11 @@ import com.agentgrid.mobile.domain.TaskDashboardProjection
 import com.agentgrid.mobile.domain.TaskDashboardProjector
 import com.agentgrid.mobile.domain.TaskSnapshot
 import com.agentgrid.mobile.domain.UsageSnapshot
+import com.agentgrid.mobile.network.BridgeRoute
 import com.agentgrid.mobile.network.ControlDelivery
 import com.agentgrid.mobile.network.ControlSubmission
 import com.agentgrid.mobile.network.DesktopScreenshotClient
+import com.agentgrid.mobile.network.DesktopScreenshotResult
 import com.agentgrid.mobile.network.LinkState
 import com.agentgrid.mobile.network.PairingOutcome
 import com.agentgrid.mobile.network.PairingSummary
@@ -46,13 +48,23 @@ import kotlinx.coroutines.launch
 sealed interface DesktopScreenshotState {
     data object Idle : DesktopScreenshotState
     data object Loading : DesktopScreenshotState
-    data class Success(val bitmap: Bitmap, val capturedAt: Long = System.currentTimeMillis()) : DesktopScreenshotState
+    data class Success(
+        val bitmap: Bitmap,
+        /** 桥端按下快门的 Unix 毫秒；旧桥没有这个头时退回发出请求的时间。 */
+        val capturedAt: Long,
+        /** 这次实际走的是隧道还是局域网。 */
+        val viaTunnel: Boolean,
+        /** 从 App 发出请求到拿到可显示图片的总耗时。 */
+        val elapsedMillis: Long,
+    ) : DesktopScreenshotState
     data class Error(val message: String) : DesktopScreenshotState
 }
 
 data class AgentGridUiState(
     val pairing: PairingSummary? = null,
     val linkState: LinkState = LinkState.DISCONNECTED,
+    /** 已连接时走的是 LAN 还是 TUNNEL，用于设置页 LINK 行。 */
+    val linkRoute: BridgeRoute? = null,
     val taskProjection: TaskDashboardProjection = TaskDashboardProjection.empty(),
     val usage: UsageSnapshot? = null,
     val usages: List<UsageSnapshot> = emptyList(),
@@ -138,8 +150,13 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
         _desktopScreenshotState.value = DesktopScreenshotState.Loading
         screenshotFetchJob = viewModelScope.launch {
             try {
-                val bitmap = desktopScreenshotClient.fetchScreenshot()
-                _desktopScreenshotState.value = DesktopScreenshotState.Success(bitmap)
+                val result: DesktopScreenshotResult = desktopScreenshotClient.fetchScreenshot()
+                _desktopScreenshotState.value = DesktopScreenshotState.Success(
+                    bitmap = result.bitmap,
+                    capturedAt = result.capturedAtMillis,
+                    viaTunnel = result.viaTunnel,
+                    elapsedMillis = result.elapsedMillis,
+                )
             } catch (cancelled: CancellationException) {
                 // 协程被取消时不覆盖状态
             } catch (e: Exception) {
@@ -356,6 +373,7 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
                 mutableState.value = mutableState.value.copy(
                     pairing = session.pairing,
                     linkState = session.link,
+                    linkRoute = session.linkRoute,
                     taskProjection = projection,
                     usage = session.snapshot.usage,
                     usages = allUsages,
@@ -368,6 +386,8 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
         }
         viewModelScope.launch {
             phoneSession.start()
+            // 冷启动也按当前网络类型选一次路：蜂窝直接隧道，异地 WiFi 先探测再决定。
+            phoneSession.onNetworkChanged()
         }
         viewModelScope.launch {
             ReplySpeech.speakingTaskId.collect { speakingTaskId ->
@@ -381,9 +401,10 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
         }
     }
 
-    /** 回前台时立刻把退避里的重连拎起来（配合保活服务，后台掉线只丢几秒）。 */
+    /** 回前台先强制恢复可能被冻结卡住的连接，再按当前网络强制重排路由。 */
     fun onForeground() {
         phoneSession.nudge()
+        phoneSession.forceNetworkChanged()
         if (mutableState.value.pairing != null) ensureKeepAliveService()
     }
 

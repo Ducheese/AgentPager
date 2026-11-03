@@ -2181,7 +2181,11 @@ private fun SettingsPanel(
         Text("设置", color = AgentGridColors.Text, fontSize = 13.sp, fontWeight = FontWeight.Bold)
         DetailLine(
             "LINK",
-            if (state.linkState == LinkState.CONNECTED) "已连接" else "正在重连",
+            when {
+                state.linkState != LinkState.CONNECTED -> "正在重连"
+                state.linkRoute != null -> "已连接 · ${state.linkRoute.label}"
+                else -> "已连接"
+            },
             if (state.linkState == LinkState.CONNECTED) AgentGridColors.Green else AgentGridColors.Red,
         )
         DetailLine("TASK", "${state.taskProjection.orderedTasks.size}", AgentGridColors.Cyan)

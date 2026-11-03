@@ -6,15 +6,15 @@ using System.Windows.Forms;
 namespace AgentPager.Bridge;
 
 /// <summary>
-/// 桌面屏幕截图服务：优先系统主显示器（无主屏时回退枚举首项），保持原始像素尺寸，按 JPEG Q100 编码。
+/// 桌面屏幕截图服务：优先系统主显示器（无主屏时回退枚举首项），保持原始像素尺寸，按 JPEG Q85 编码。
 /// DPI 由 Windows 系统设置决定，不做手工缩放。
 /// </summary>
 public static class DesktopCapture
 {
-    private const long JpegQuality = 100L;
+    private const long JpegQuality = 85L;
 
     /// <summary>
-    /// 截取主显示器的画面并返回 JPEG 字节数组。保持原始分辨率，固定 Q100，不限制文件大小；
+    /// 截取主显示器的画面并返回 JPEG 字节数组。保持原始分辨率，固定 Q85，不限制文件大小；
     /// 失败（如锁屏或无活动显示器）返回 null。
     /// </summary>
     public static byte[]? CaptureScreenZeroJpeg()

@@ -353,7 +353,7 @@ private fun MermaidFullscreenDialog(
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
                     Text(
-                        text = "MERMAID · 全屏",
+                        text = "MERMAID",
                         color = AgentGridColors.Cyan,
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold,

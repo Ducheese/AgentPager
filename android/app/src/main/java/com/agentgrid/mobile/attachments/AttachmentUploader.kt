@@ -19,18 +19,26 @@ import okhttp3.Response
 
 /**
  * 图片二进制直传 Bridge 暂存区（POST /api/attachments/upload）。
- * 走同一套候选地址（局域网优先、隧道兜底），握手头与 WS 一致。
+ * 候选顺序跟随当前 WS 连接（蜂窝下只有隧道），握手头与 WS 一致。
  * 用 enqueue + invokeOnCancellation：删图取消协程时立刻 abort 请求，不留孤儿文件。
  */
 class AttachmentUploader(
     private val endpoints: suspend () -> List<PhoneEndpoint>,
     private val json: Json = Json { ignoreUnknownKeys = true },
 ) {
-    private val http = OkHttpClient.Builder()
-        .connectTimeout(5, TimeUnit.SECONDS)
+    /** 候选轮换由调用方负责；OkHttp 自己重试只会把局域网失败拖得更久，POST 重发还可能多落一份。 */
+    private val baseHttp = OkHttpClient.Builder()
         .writeTimeout(30, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
-        .retryOnConnectionFailure(true)
+        .retryOnConnectionFailure(false)
+        .build()
+
+    /** 局域网路由不通时快速失败；隧道在移动网络下 TLS 建连可能偏慢。 */
+    private val lanHttp = baseHttp.newBuilder()
+        .connectTimeout(2, TimeUnit.SECONDS)
+        .build()
+    private val tunnelHttp = baseHttp.newBuilder()
+        .connectTimeout(10, TimeUnit.SECONDS)
         .build()
 
     suspend fun upload(bytes: ByteArray, fileName: String, meta: String? = null): AttachmentUploadResponse {
@@ -72,7 +80,8 @@ class AttachmentUploader(
             .post(multipart.build())
             .build()
         return suspendCancellableCoroutine { continuation ->
-            val call = http.newCall(request)
+            val client = if (endpoint.secure) tunnelHttp else lanHttp
+            val call = client.newCall(request)
             continuation.invokeOnCancellation { call.cancel() }
             call.enqueue(object : Callback {
                 override fun onFailure(call: Call, e: IOException) {

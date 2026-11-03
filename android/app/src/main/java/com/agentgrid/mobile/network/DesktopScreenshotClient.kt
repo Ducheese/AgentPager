@@ -18,7 +18,7 @@ import okhttp3.ResponseBody
 
 /**
  * 桌面屏幕截图客户端（GET /api/desktop/screenshot）。
- * 复用 PhoneSession 的候选地址与配对密钥鉴权（局域网优先，隧道兜底）。
+ * 候选顺序由 [PhoneSession.uploadEndpoints] 给出：当前 WS 所在腿排第一，蜂窝下不含局域网。
  */
 class DesktopScreenshotException(
     message: String,
@@ -26,24 +26,48 @@ class DesktopScreenshotException(
     cause: Throwable? = null,
 ) : IllegalStateException(message, cause)
 
+/** 一次截屏的完整结果：位图 + 桥端快门时间 + 实际走的腿 + 总耗时。 */
+data class DesktopScreenshotResult(
+    val bitmap: Bitmap,
+    val capturedAtMillis: Long,
+    val viaTunnel: Boolean,
+    val elapsedMillis: Long,
+)
+
 class DesktopScreenshotClient(
     private val endpoints: suspend () -> List<PhoneEndpoint>,
     private val okHttpClient: OkHttpClient = defaultClient(),
     private val bitmapDecoder: (ByteArray) -> Bitmap? = { bytes ->
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
     },
+    private val now: () -> Long = System::currentTimeMillis,
 ) {
     companion object {
         private const val MAX_IMAGE_BYTES = 64L * 1024 * 1024
 
+        /** 桥端在按下快门时写入的 Unix 毫秒；旧桥没有这个头。 */
+        private const val CAPTURED_AT_HEADER = "X-AgentGrid-Captured-At"
+
         fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
-            .connectTimeout(5, TimeUnit.SECONDS)
-            .readTimeout(15, TimeUnit.SECONDS)
-            .retryOnConnectionFailure(true)
+            .readTimeout(30, TimeUnit.SECONDS)
+            // 候选轮换由本类负责；OkHttp 自己重试只会把局域网失败拖得更久。
+            .retryOnConnectionFailure(false)
             .build()
     }
 
-    suspend fun fetchScreenshot(): Bitmap {
+    /** 局域网路由不通时快速失败；连上后不回包也不能拖到 30s。 */
+    private val lanHttp = okHttpClient.newBuilder()
+        .connectTimeout(2, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.SECONDS)
+        .build()
+    private val tunnelHttp = okHttpClient.newBuilder()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        // GET 截图可安全重试，保留 Cloudflare/ngrok 多 Anycast/IP 容灾。
+        .retryOnConnectionFailure(true)
+        .build()
+
+    suspend fun fetchScreenshot(): DesktopScreenshotResult {
+        val startedAt = now()
         val candidates = endpoints()
         if (candidates.isEmpty()) {
             throw IllegalStateException("未连接或未配对，没有可用的服务端地址")
@@ -52,7 +76,13 @@ class DesktopScreenshotClient(
         var lastError: Exception? = null
         for (endpoint in candidates) {
             try {
-                return fetchFrom(endpoint)
+                val fetched = fetchFrom(endpoint)
+                return DesktopScreenshotResult(
+                    bitmap = fetched.bitmap,
+                    capturedAtMillis = fetched.capturedAtMillis ?: startedAt,
+                    viaTunnel = endpoint.secure,
+                    elapsedMillis = now() - startedAt,
+                )
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: DesktopScreenshotException) {
@@ -65,7 +95,7 @@ class DesktopScreenshotClient(
         throw lastError ?: IllegalStateException("获取桌面截图失败：所有服务端地址均不可达")
     }
 
-    private suspend fun fetchFrom(endpoint: PhoneEndpoint): Bitmap {
+    private suspend fun fetchFrom(endpoint: PhoneEndpoint): FetchedScreenshot {
         val scheme = if (endpoint.secure) "https" else "http"
         val defaultPort = if (endpoint.secure) 443 else 80
         val authority = if (endpoint.port == defaultPort) endpoint.host else "${endpoint.host}:${endpoint.port}"
@@ -79,7 +109,8 @@ class DesktopScreenshotClient(
             .build()
 
         return suspendCancellableCoroutine { continuation ->
-            val call = okHttpClient.newCall(request)
+            val client = if (endpoint.secure) tunnelHttp else lanHttp
+            val call = client.newCall(request)
             continuation.invokeOnCancellation { call.cancel() }
             call.enqueue(object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
@@ -125,7 +156,13 @@ class DesktopScreenshotClient(
                                 )
 
                             if (!continuation.isCancelled) {
-                                continuation.resume(bitmap)
+                                continuation.resume(
+                                    FetchedScreenshot(
+                                        bitmap = bitmap,
+                                        capturedAtMillis = response.header(CAPTURED_AT_HEADER)
+                                            ?.toLongOrNull(),
+                                    ),
+                                )
                             }
                         } catch (error: DesktopScreenshotException) {
                             if (!continuation.isCancelled) continuation.resumeWithException(error)
@@ -180,4 +217,9 @@ class DesktopScreenshotClient(
             bytes[1] == 0xD8.toByte() &&
             bytes[2] == 0xFF.toByte()
     }
+
+    private data class FetchedScreenshot(
+        val bitmap: Bitmap,
+        val capturedAtMillis: Long?,
+    )
 }

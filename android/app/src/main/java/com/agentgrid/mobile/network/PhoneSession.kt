@@ -7,12 +7,17 @@ import com.agentgrid.mobile.domain.ControlResult
 import com.agentgrid.mobile.domain.PairingPayload
 import com.agentgrid.mobile.domain.SignedControlEnvelope
 import com.agentgrid.mobile.domain.StateSnapshotPayload
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.util.Base64
 import java.util.UUID
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -20,6 +25,7 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
@@ -31,6 +37,22 @@ enum class LinkState {
     DISCONNECTED,
     CONNECTING,
     CONNECTED,
+}
+
+/** 当前桥连接走的腿；截图/设置页只展示，不参与鉴权。 */
+enum class BridgeRoute(val label: String) {
+    LAN("LAN"),
+    TUNNEL("TUNNEL"),
+}
+
+/**
+ * 手机默认网络对桥的局域网地址意味着什么。
+ * Remote = 蜂窝等非本地传输：局域网不可能可达，候选里直接不生成它，避免每次请求先等连接超时。
+ */
+enum class NetworkKind {
+    Unknown,
+    Local,
+    Remote,
 }
 
 data class PairingSummary(
@@ -76,6 +98,8 @@ sealed interface ControlDelivery {
 data class PhoneSessionState(
     val pairing: PairingSummary? = null,
     val link: LinkState = LinkState.DISCONNECTED,
+    /** 当前连接实际走的腿；未连接时为 null。设置页的 LINK 行用它显示 LAN/TUNNEL。 */
+    val linkRoute: BridgeRoute? = null,
     val snapshot: StateSnapshotPayload = StateSnapshotPayload(emptyList()),
     val controls: Map<String, ControlDelivery> = emptyMap(),
     val problem: PhoneSessionProblem? = null,
@@ -104,8 +128,21 @@ interface PhoneSession : AutoCloseable {
     fun nudge()
 
     /**
-     * 附件上传用的候选地址（含配对密钥）：与 WS 连接走同一套局域网优先+隧道兜底。
-     * 未配对时返回空列表。
+     * 默认网络变了（WiFi 连上/断开、切蜂窝、回前台/亮屏）时调用。
+     * 按当前网络类型与局域网可达性调整真实连接：
+     * - 切到蜂窝：立即放弃局域网、改连隧道；
+     * - WiFi 回来：先探测局域网，通才从隧道切回，避免异地 WiFi 把可用隧道掐掉；
+     * - 未连接：按探测结果直接选 LAN 或 TUNNEL。
+     * 幂等，可在网络回调、回前台、亮屏时随手调用。
+     */
+    fun onNetworkChanged()
+
+    /** 网络恢复/回前台等必须重排的场景：跳过同网络类型去重，强制重新探测/选路。 */
+    fun forceNetworkChanged()
+
+    /**
+     * 附件上传/桌面截图用的候选地址（含配对密钥）。顺序跟随当前连接与网络类型：
+     * 当前腿排第一，蜂窝下不含局域网候选。未配对时返回空列表。
      */
     suspend fun uploadEndpoints(): List<PhoneEndpoint>
 }
@@ -127,7 +164,10 @@ data class PhoneEndpoint(
     val secure: Boolean = false,
     /** 握手要带的配对密钥（桥用 X-AgentGrid-Secret 校验），局域网也带。 */
     val secret: String? = null,
-)
+) {
+    val route: BridgeRoute
+        get() = if (secure) BridgeRoute.TUNNEL else BridgeRoute.LAN
+}
 
 internal sealed interface TransportEvent {
     data object Opened : TransportEvent
@@ -156,6 +196,43 @@ internal class DefaultPhoneSession(
     private val nonce: () -> String = { UUID.randomUUID().toString() },
     private val wait: suspend (Long) -> Unit = { delay(it) },
     private val acknowledgmentTimeoutMillis: Long = 15_000L,
+    /** 当前默认网络类型；生产由 PhoneSessionFactory 接 ConnectivityManager，单测默认 Unknown。 */
+    private val networkKind: () -> NetworkKind = { NetworkKind.Unknown },
+    /** 切回局域网前的可达性探测；默认请求桥的 /api/ping，测试可注入。 */
+    private val probeLocal: suspend (PhoneEndpoint) -> Boolean = { endpoint ->
+        withContext(Dispatchers.IO) {
+            runCatching {
+                Socket().use { socket ->
+                    socket.connect(InetSocketAddress(endpoint.host, endpoint.port), PROBE_TIMEOUT_MS)
+                    socket.soTimeout = PROBE_TIMEOUT_MS
+                    val secret = endpoint.secret
+                        ?.let { "X-AgentGrid-Secret: $it\r\n" }
+                        .orEmpty()
+                    val request = "GET /api/ping HTTP/1.1\r\n" +
+                        "Host: ${endpoint.host}:${endpoint.port}\r\n" +
+                        secret +
+                        "Connection: close\r\n\r\n"
+                    socket.getOutputStream().apply {
+                        write(request.toByteArray(Charsets.US_ASCII))
+                        flush()
+                    }
+                    val reader = socket.getInputStream().bufferedReader(Charsets.US_ASCII)
+                    val status = reader.readLine() ?: return@runCatching false
+                    var hasMarker = false
+                    while (true) {
+                        val line = reader.readLine() ?: break
+                        if (line.isEmpty()) break
+                        if (line.startsWith("X-AgentGrid-Ping:", ignoreCase = true) &&
+                            line.substringAfter(':').trim() == "1"
+                        ) {
+                            hasMarker = true
+                        }
+                    }
+                    status.startsWith("HTTP/1.1 204") && hasMarker
+                }
+            }.getOrDefault(false)
+        }
+    },
 ) : PhoneSession {
     private val json = Json {
         ignoreUnknownKeys = true
@@ -168,12 +245,26 @@ internal class DefaultPhoneSession(
 
     private var pairing: PairingPayload? = null
     private var started = false
+    @Volatile
     private var stopped = false
     private var retryCount = 0
     private var reconnectJob: Job? = null
+    private val tuneLock = Any()
+    /** 重配对代次；探测回来时代次不一致就丢弃，避免旧 LAN 结果作用到新配对。 */
+    @Volatile
+    private var pairingGeneration = 0
     /** 候选地址：局域网在前、隧道在后。连不上就轮换到下一个（见 disconnectAndRetryLocked）。 */
     private var endpoints: List<PhoneEndpoint> = emptyList()
     private var endpointIndex = 0
+    /** 本次 connect 实际拨的地址；Opened 时据此记录 linkRoute，上传也据此排第一。 */
+    private var connectingEndpoint: PhoneEndpoint? = null
+    @Volatile
+    private var networkTuneJob: Job? = null
+    /** 当前排队的选路任务对应的网络类型；同类型回调只保留一份，避免 600ms 补调掐掉在飞探测。 */
+    @Volatile
+    private var networkTuneKind: NetworkKind? = null
+    /** 局域网刚失败过：隧道连上后先别自动探测升级，免得在坏 LAN 上来回切。 */
+    private var localUpgradeBlockedUntil = 0L
     private var lastSnapshotSentAt = Long.MIN_VALUE
     private var lastSnapshotMessageID: String? = null
     private val timeoutJobs = mutableMapOf<String, Job>()
@@ -233,17 +324,22 @@ internal class DefaultPhoneSession(
             started = true
             reconnectJob?.cancel()
             reconnectJob = null
+            cancelTune()
             transport.disconnect()
             pairing = decoded
+            pairingGeneration++
             retryCount = 0
+            localUpgradeBlockedUntil = 0L
             // 重新配对等于重新开始：候选从头走（能扫到码就说明人在局域网里）
             endpoints = emptyList()
             endpointIndex = 0
+            connectingEndpoint = null
             mutableState.value = PhoneSessionState(
                 pairing = decoded.summary,
                 link = LinkState.CONNECTING,
             )
             connectLocked(decoded)
+            requestTune(force = true)
             PairingOutcome.Connecting
         }
     }
@@ -308,6 +404,8 @@ internal class DefaultPhoneSession(
             stopped = true
             reconnectJob?.cancel()
             reconnectJob = null
+            cancelTune()
+            connectingEndpoint = null
             timeoutJobs.values.forEach(Job::cancel)
             timeoutJobs.clear()
             transport.disconnect()
@@ -330,22 +428,43 @@ internal class DefaultPhoneSession(
 
     override fun nudge() {
         scope.launch {
-            mutex.withLock {
-                if (stopped || pairing == null) return@withLock
-                // 健康连接不折腾；重连在飞（CONNECTING）或被冻结卡住时，断开重来一次最快。
-                if (mutableState.value.link == LinkState.CONNECTED) return@withLock
-                reconnectJob?.cancel()
-                reconnectJob = null
-                retryCount = 0
-                transport.disconnect()
-                pairing?.let(::connectLocked)
-            }
+            mutex.withLock { reconnectNowLocked() }
+        }
+    }
+
+    override fun onNetworkChanged() = requestTune(force = false)
+
+    override fun forceNetworkChanged() = requestTune(force = true)
+
+    /**
+     * 同一网络类型的重复回调不重启探测；强制路径用于网络恢复/Opened 补探/配对，
+     * 必须允许覆盖同类型的在飞任务。
+     */
+    private fun requestTune(force: Boolean) {
+        if (stopped) return
+        val kind = networkKind()
+        synchronized(tuneLock) {
+            if (stopped) return
+            if (!force && networkTuneJob?.isActive == true && networkTuneKind == kind) return
+            networkTuneKind = kind
+            val generation = pairingGeneration
+            networkTuneJob?.cancel()
+            networkTuneJob = scope.launch { tuneRoute(kind, generation) }
+        }
+    }
+
+    private fun cancelTune() {
+        synchronized(tuneLock) {
+            networkTuneJob?.cancel()
+            networkTuneJob = null
+            networkTuneKind = null
         }
     }
 
     override fun close() {
         stopped = true
         reconnectJob?.cancel()
+        cancelTune()
         timeoutJobs.values.forEach(Job::cancel)
         transport.disconnect()
         transport.close()
@@ -354,7 +473,11 @@ internal class DefaultPhoneSession(
 
     override suspend fun uploadEndpoints(): List<PhoneEndpoint> = mutex.withLock {
         val current = pairing ?: return emptyList()
-        endpointsFor(current)
+        val candidates = endpointsFor(current)
+        // 以当前连接（或正在拨的）那条腿为准；否则手机已经落在隧道上，
+        // 截图/附件还会先对着局域网空等 connect timeout。
+        val active = activeEndpointLocked(candidates) ?: return candidates
+        listOf(active) + candidates.filter { it != active }
     }
 
     private suspend fun acceptTransportEvent(event: TransportEvent) {
@@ -364,10 +487,21 @@ internal class DefaultPhoneSession(
                     retryCount = 0
                     reconnectJob?.cancel()
                     reconnectJob = null
+                    val endpoint = connectingEndpoint ?: endpoints.getOrNull(endpointIndex)
                     mutableState.value = mutableState.value.copy(
                         link = LinkState.CONNECTED,
+                        linkRoute = endpoint?.route,
                         problem = null,
                     )
+                    // 网络回调可能发生在隧道还在握手时，那次升级探测被跳过；
+                    // 现在隧道已经连上，WiFi 环境下补一次 LAN 探测，通就切回局域网。
+                    // 局域网刚失败过的冷却期内不补探，避免在坏 LAN 上反复切换。
+                    if (endpoint?.secure == true &&
+                        networkKind() == NetworkKind.Local &&
+                        now() >= localUpgradeBlockedUntil
+                    ) {
+                        requestTune(force = true)
+                    }
                 }
 
                 is TransportEvent.TextReceived -> acceptMessageLocked(event.text)
@@ -466,31 +600,63 @@ internal class DefaultPhoneSession(
         val candidates = endpointsFor(value)
         if (candidates == endpoints) return
 
-        val current = endpoints.getOrNull(endpointIndex)
+        // 隧道域名轮换后旧端点对象已不在候选里：按"上次走隧道"的意图落到新域名，
+        // 不要回落到 index 0 的局域网（户外会在下次重连时白等一次超时）。
+        val active = activeEndpointLocked(candidates)
         endpoints = candidates
-        endpointIndex = current?.let { candidates.indexOf(it) }?.takeIf { it >= 0 } ?: 0
+        endpointIndex = active?.let { candidates.indexOf(it) }?.takeIf { it >= 0 } ?: 0
     }
 
     private fun connectLocked(value: PairingPayload) {
         val candidates = endpointsFor(value)
-        // 配对没变时保留轮换位置（重连要接着上次的候选走，不能每次都退回局域网）。
-        if (endpoints != candidates) {
-            endpoints = candidates
-            endpointIndex = 0
+        if (candidates.isEmpty()) return
+        // 候选集合因网络类型/隧道域名变化而变时，保留上一次尝试的腿（按 secure 对齐），
+        // 不要无脑回落到 index 0：在外地 WiFi 上重连隧道不该先撞一次局域网。
+        val index = if (endpoints == candidates) {
+            endpointIndex.coerceIn(0, candidates.lastIndex)
+        } else {
+            val previous = connectingEndpoint ?: endpoints.getOrNull(endpointIndex)
+            val preserved = previous?.let { old -> candidates.firstOrNull { it.secure == old.secure } }
+            preserved?.let { candidates.indexOf(it) }?.takeIf { it >= 0 } ?: 0
         }
-        mutableState.value = mutableState.value.copy(link = LinkState.CONNECTING)
-        transport.connect(endpoints[endpointIndex])
+        startConnectLocked(candidates, index)
+    }
+
+    private fun startConnectLocked(candidates: List<PhoneEndpoint>, index: Int) {
+        endpoints = candidates
+        endpointIndex = index
+        connectingEndpoint = candidates[index]
+        mutableState.value = mutableState.value.copy(
+            link = LinkState.CONNECTING,
+            linkRoute = null,
+        )
+        transport.connect(candidates[index])
     }
 
     /**
-     * 候选地址：局域网优先，配了隧道域名就再挂一个 wss://域名:443。
-     * 在家连局域网、出门自动落到隧道，不需要人手动切。
+     * 候选地址：本地网络 LAN 优先；蜂窝等 Remote 网络隧道优先，但保留 LAN 作为失败兜底
+     * （Wi-Fi/热点仍可能连到同一台桥）。主路径不会先等 LAN，只有隧道失败才会试一次。
      */
     private fun endpointsFor(value: PairingPayload): List<PhoneEndpoint> {
         val local = PhoneEndpoint(value.host, value.port, secret = value.secret)
         val tunnel = tunnelHostOf(value)
             ?.let { PhoneEndpoint(it, 443, secure = true, secret = value.secret) }
-        return if (tunnel == null) listOf(local) else listOf(local, tunnel)
+        return when {
+            tunnel == null -> listOf(local)
+            networkKind() == NetworkKind.Remote -> listOf(tunnel, local)
+            else -> listOf(local, tunnel)
+        }
+    }
+
+    /**
+     * 当前连接（或正在拨的）候选。隧道换域名后旧对象不在候选里时，按 secure 落到新隧道；
+     * 上传/截图据此把当前腿排第一，也用来判断要不要切腿。
+     */
+    private fun activeEndpointLocked(candidates: List<PhoneEndpoint>): PhoneEndpoint? {
+        val attempted = connectingEndpoint ?: endpoints.getOrNull(endpointIndex) ?: return null
+        candidates.firstOrNull { it == attempted }?.let { return it }
+        if (!attempted.secure) return null
+        return candidates.firstOrNull { it.secure }
     }
 
     /**
@@ -507,11 +673,26 @@ internal class DefaultPhoneSession(
     }
 
     private fun disconnectAndRetryLocked(advanceEndpoint: Boolean) {
+        val failed = connectingEndpoint
+        if (failed != null && !failed.secure) {
+            localUpgradeBlockedUntil = now() + LAN_UPGRADE_COOLDOWN_MS
+        }
+        connectingEndpoint = null
         mutableState.value = mutableState.value.copy(
             link = LinkState.DISCONNECTED,
+            linkRoute = null,
             problem = PhoneSessionProblem.TransportFailure,
         )
         if (stopped || pairing == null || reconnectJob?.isActive == true) return
+        // 隧道首次握手失败时不要盲目轮换回局域网：先探测，LAN 真的可达才切；
+        // 否则在异地 WiFi 上会退回 LAN 再等一次 connect timeout。
+        if (advanceEndpoint && failed?.secure == true && networkKind() != NetworkKind.Remote) {
+            val value = pairing ?: return
+            if (endpointsFor(value).any { !it.secure }) {
+                requestTune(force = true)
+                return
+            }
+        }
         // 连不上就换下一个候选：局域网不通试隧道，隧道不通再试回局域网。
         // 只在"根本没连上"时换 —— 断连（连上过又掉）保持原地址，否则在家待着也会漂到隧道去。
         if (advanceEndpoint && endpoints.size > 1) {
@@ -528,6 +709,180 @@ internal class DefaultPhoneSession(
                 reconnectJob = null
             }
         }
+    }
+
+    /** 取消退避，立即重连当前候选；已连接或无配对时不动。 */
+    private fun reconnectNowLocked() {
+        if (stopped || pairing == null) return
+        if (mutableState.value.link == LinkState.CONNECTED) return
+        reconnectJob?.cancel()
+        reconnectJob = null
+        retryCount = 0
+        transport.disconnect()
+        pairing?.let(::connectLocked)
+    }
+
+    private sealed interface RoutePlan {
+        data object None : RoutePlan
+        data object Reconnect : RoutePlan
+        data class Switch(val target: PhoneEndpoint) : RoutePlan
+        data class Probe(val lan: PhoneEndpoint, val mode: ProbeMode) : RoutePlan
+    }
+
+    private enum class ProbeMode {
+        /** 已连隧道、WiFi 回来：探测 LAN，通才升级。 */
+        Upgrade,
+
+        /** 正在连 LAN：探测 LAN，不通就改连隧道，不再等 connect timeout。 */
+        Connecting,
+
+        /** 当前没连接：探测后直接选 LAN 或隧道。 */
+        ColdStart,
+    }
+
+    /**
+     * 网络变化后的唯一调度入口。核心是**非对称切换**：
+     * - 降级到隧道（蜂窝）不需要探测，立刻切；
+     * - 升级到局域网必须先探测，避免异地 WiFi 把一条健康隧道掐掉。
+     */
+    private suspend fun tuneRoute(kind: NetworkKind, generation: Int) {
+        val plan = mutex.withLock {
+            if (generation != pairingGeneration) return
+            planRouteLocked(kind)
+        }
+        when (plan) {
+            RoutePlan.None -> Unit
+            RoutePlan.Reconnect -> mutex.withLock {
+                if (generation == pairingGeneration) reconnectNowLocked()
+            }
+            is RoutePlan.Switch -> mutex.withLock {
+                if (generation != pairingGeneration) return@withLock
+                // 计划是"蜂窝→隧道"，执行前 WiFi 刚回来：放弃这次过期切换，让下一次
+                // onNetworkChanged 走探测升级，避免无谓地把刚恢复的局域网候选丢掉。
+                if (plan.target.secure && networkKind() != NetworkKind.Remote) return@withLock
+                val value = pairing ?: return@withLock
+                val candidates = endpointsFor(value)
+                val target = candidates.firstOrNull { it.secure == plan.target.secure } ?: return@withLock
+                if (activeEndpointLocked(candidates) == target &&
+                    mutableState.value.link == LinkState.CONNECTED
+                ) {
+                    return@withLock
+                }
+                switchToLocked(candidates, target)
+            }
+            is RoutePlan.Probe -> {
+                if (plan.mode == ProbeMode.ColdStart) {
+                    // 没连接时由这次探测决定首选腿；取消已经排队的旧候选重连，避免
+                    // 探测还没回来就被退避任务按旧网络拨了局域网。
+                    mutex.withLock {
+                        if (generation != pairingGeneration) return@withLock
+                        reconnectJob?.cancel()
+                        reconnectJob = null
+                    }
+                }
+                var retryIndex = 0
+                while (true) {
+                    val reachable = probeLocal(plan.lan)
+                    currentCoroutineContext().ensureActive()
+                    val retry = mutex.withLock {
+                        if (stopped) return@withLock false
+                        // 探测期间网络/配对可能已经变了：只在预期状态仍成立时动手。
+                        if (generation != pairingGeneration) return@withLock false
+                        if (networkKind() != kind) return@withLock false
+                        val value = pairing ?: return@withLock false
+                        val candidates = endpointsFor(value)
+                        val local = candidates.firstOrNull { !it.secure }
+                        val tunnel = candidates.firstOrNull { it.secure }
+                        if (plan.lan != local) return@withLock false
+                        val link = mutableState.value.link
+                        when (plan.mode) {
+                            ProbeMode.Upgrade -> {
+                                val active = activeEndpointLocked(candidates)
+                                if (reachable && link == LinkState.CONNECTED &&
+                                    active?.secure == true
+                                ) {
+                                    switchToLocked(candidates, local)
+                                    false
+                                } else {
+                                    !reachable && link == LinkState.CONNECTED &&
+                                        active?.secure == true &&
+                                        retryIndex < LAN_UPGRADE_RETRY_DELAYS_MS.size
+                                }
+                            }
+
+                            ProbeMode.Connecting -> {
+                                if (!reachable && tunnel != null && link == LinkState.CONNECTING &&
+                                    activeEndpointLocked(candidates)?.secure == false
+                                ) {
+                                    // 这次探测失败也是局域网失败：冷却期内隧道 Opened 后别再补探一次。
+                                    localUpgradeBlockedUntil = now() + LAN_UPGRADE_COOLDOWN_MS
+                                    switchToLocked(candidates, tunnel)
+                                }
+                                false
+                            }
+
+                            ProbeMode.ColdStart -> {
+                                if (link == LinkState.DISCONNECTED) {
+                                    when {
+                                        reachable -> switchToLocked(candidates, local)
+                                        tunnel != null -> {
+                                            localUpgradeBlockedUntil = now() + LAN_UPGRADE_COOLDOWN_MS
+                                            switchToLocked(candidates, tunnel)
+                                        }
+                                        else -> reconnectNowLocked()
+                                    }
+                                }
+                                false
+                            }
+                        }
+                    }
+                    if (!retry) return
+                    wait(LAN_UPGRADE_RETRY_DELAYS_MS[retryIndex])
+                    retryIndex += 1
+                }
+            }
+        }
+    }
+
+    private fun planRouteLocked(kind: NetworkKind): RoutePlan {
+        val value = pairing ?: return RoutePlan.None
+        val candidates = endpointsFor(value)
+        val local = candidates.firstOrNull { !it.secure }
+        val tunnel = candidates.firstOrNull { it.secure }
+        val active = activeEndpointLocked(candidates)
+        val link = mutableState.value.link
+
+        if (kind == NetworkKind.Remote) {
+            // 蜂窝：局域网不可能可达。已连隧道不动；连着/正在连局域网就立刻切隧道。
+            return when {
+                tunnel == null -> if (link == LinkState.DISCONNECTED) RoutePlan.Reconnect else RoutePlan.None
+                link == LinkState.DISCONNECTED -> RoutePlan.Reconnect
+                active == tunnel -> RoutePlan.None
+                else -> RoutePlan.Switch(tunnel)
+            }
+        }
+
+        if (local == null) {
+            return if (link == LinkState.DISCONNECTED) RoutePlan.Reconnect else RoutePlan.None
+        }
+        return when (link) {
+            LinkState.DISCONNECTED -> RoutePlan.Probe(local, ProbeMode.ColdStart)
+            LinkState.CONNECTING ->
+                if (active == local) RoutePlan.Probe(local, ProbeMode.Connecting) else RoutePlan.None
+
+            LinkState.CONNECTED ->
+                if (active == local) RoutePlan.None else RoutePlan.Probe(local, ProbeMode.Upgrade)
+        }
+    }
+
+    private fun switchToLocked(candidates: List<PhoneEndpoint>, target: PhoneEndpoint) {
+        val index = candidates.indexOf(target)
+        if (index < 0) return
+        reconnectJob?.cancel()
+        reconnectJob = null
+        retryCount = 0
+        transport.disconnect()
+        startConnectLocked(candidates, index)
     }
 
     private fun updateControl(requestID: String, delivery: ControlDelivery) {
@@ -565,5 +920,8 @@ internal class DefaultPhoneSession(
 
     private companion object {
         const val MAX_CONTROL_HISTORY = 50
+        const val PROBE_TIMEOUT_MS = 1_200
+        const val LAN_UPGRADE_COOLDOWN_MS = 20_000L
+        private val LAN_UPGRADE_RETRY_DELAYS_MS = longArrayOf(600L, 1_500L, 3_000L)
     }
 }

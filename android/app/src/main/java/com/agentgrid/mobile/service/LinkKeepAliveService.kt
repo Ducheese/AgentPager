@@ -11,6 +11,8 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import com.agentgrid.mobile.MainActivity
@@ -28,19 +30,23 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
  * 前台保活服务：把进程从 cached-app freezer 里捞出来，桥的 WebSocket 才能在后台续命。
  * 选 specialUse 而不是 dataSync —— dataSync 在 Android 15+ 有 6 小时/24 小时上限，到点会被系统掐掉。
  *
- * 顺带当两个"该重连了"的信号源：网络恢复（NetworkCallback）与亮屏（ACTION_SCREEN_ON），
- * 两者都只是调 session.nudge()，真正的重连逻辑在会话里。
+ * 顺带当两个"该重连了"的信号源：网络变化（NetworkCallback）与亮屏（ACTION_SCREEN_ON）。
+ * 网络变化只调 session.onNetworkChanged() 选路；亮屏先 nudge() 强制恢复可能被冻结卡住的连接，
+ * 再 onNetworkChanged() 按当前网络选路。
  */
 class LinkKeepAliveService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private lateinit var session: PhoneSession
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    /** WiFi/以太网各自的监听：VPN 做默认网络时，底层 WiFi 变化不会触发默认网络回调。 */
+    private val localNetworkCallbacks = mutableListOf<ConnectivityManager.NetworkCallback>()
     private var screenReceiver: BroadcastReceiver? = null
     private var foregroundStarted = false
     private val completionTracker = TaskCompletionTracker()
@@ -80,17 +86,25 @@ class LinkKeepAliveService : Service() {
         scope.launch {
             session.start()
             // 开机拉起但没有配对（或被解除）时没有活可保，自己退场，不占着一条常驻通知。
-            if (session.state.value.pairing == null) stopSelf()
+            if (session.state.value.pairing == null) {
+                stopSelf()
+                return@launch
+            }
+            // 服务先于界面启动时也补一次选路：蜂窝直接隧道，异地 WiFi 先探测再决定。
+            session.onNetworkChanged()
         }
         return START_STICKY
     }
 
     override fun onDestroy() {
+        val manager = getSystemService(ConnectivityManager::class.java)
         networkCallback?.let { callback ->
-            runCatching {
-                getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(callback)
-            }
+            runCatching { manager?.unregisterNetworkCallback(callback) }
         }
+        localNetworkCallbacks.forEach { callback ->
+            runCatching { manager?.unregisterNetworkCallback(callback) }
+        }
+        localNetworkCallbacks.clear()
         screenReceiver?.let { receiver ->
             runCatching { unregisterReceiver(receiver) }
         }
@@ -100,20 +114,60 @@ class LinkKeepAliveService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    /**
+     * WiFi/以太网刚连上时 activeNetwork 可能还没切过来，先探一次，600ms 后再补一次；
+     * 两次都幂等，已经在 LAN 上时第二次是空操作。
+     */
+    private fun onLocalNetworkEvent() {
+        scope.launch {
+            // 第一次强制重排；600ms 后的补调走同类型去重，不会取消已在飞的 1.2s 探测。
+            session.forceNetworkChanged()
+            delay(600)
+            session.onNetworkChanged()
+        }
+    }
+
     private fun registerNudgeSources() {
+        val manager = getSystemService(ConnectivityManager::class.java)
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
+                // 网络恢复时先强制恢复可能卡在 CONNECTING 的握手，再按新网络选路。
                 session.nudge()
+                session.forceNetworkChanged()
+            }
+
+            override fun onLost(network: Network) {
+                session.forceNetworkChanged()
             }
         }
         runCatching {
-            getSystemService(ConnectivityManager::class.java)
-                ?.registerDefaultNetworkCallback(callback)
+            manager?.registerDefaultNetworkCallback(callback)
         }.onSuccess { networkCallback = callback }
+
+        // 默认网络回调只看"当前默认网络"。Clash 这类 VPN 做默认网络时，底层 WiFi 连上/断开
+        // 不会触发 onAvailable——补一份 Wi-Fi/以太网监听，保证回家/出门都能重新选路。
+        listOf(
+            NetworkCapabilities.TRANSPORT_WIFI,
+            NetworkCapabilities.TRANSPORT_ETHERNET,
+        ).forEach { transport ->
+            val localCallback = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) = onLocalNetworkEvent()
+
+                override fun onLost(network: Network) = onLocalNetworkEvent()
+            }
+            runCatching {
+                manager?.registerNetworkCallback(
+                    NetworkRequest.Builder().addTransportType(transport).build(),
+                    localCallback,
+                )
+            }.onSuccess { localNetworkCallbacks += localCallback }
+        }
 
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
+                // 亮屏是"用户回来了"的恢复信号：先强制重启可能被冻结卡住的连接，再强制重排路由。
                 session.nudge()
+                session.forceNetworkChanged()
             }
         }
         runCatching {

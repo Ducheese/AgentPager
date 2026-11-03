@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Net;
 using System.Net.WebSockets;
 using System.Text;
@@ -111,6 +112,22 @@ public sealed class LanBridgeServer(
 
         app.Map("/agentgrid", HandleWebSocket);
 
+        // 带密钥的轻量探针：公共 WiFi 认证门户会对 TCP 握手回 SYN-ACK，
+        // 但无法伪造桥特有的 204 + X-AgentGrid-Ping 响应。
+        app.MapGet("/api/ping", context =>
+        {
+            var provided = context.Request.Headers[SecretHeader].ToString();
+            if (!authorize(string.IsNullOrEmpty(provided) ? null : provided))
+            {
+                context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                return Task.CompletedTask;
+            }
+            context.Response.Headers.CacheControl = "no-cache, no-store, must-revalidate";
+            context.Response.Headers["X-AgentGrid-Ping"] = "1";
+            context.Response.StatusCode = StatusCodes.Status204NoContent;
+            return Task.CompletedTask;
+        });
+
         app.MapGet("/api/desktop/screenshot", async context =>
         {
             var provided = context.Request.Headers[SecretHeader].ToString();
@@ -121,6 +138,7 @@ public sealed class LanBridgeServer(
                 return;
             }
 
+            var capturedAt = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             var startedAt = Environment.TickCount64;
             byte[]? bytes;
             try
@@ -152,6 +170,9 @@ public sealed class LanBridgeServer(
             context.Response.ContentLength = bytes.Length;
             context.Response.Headers.CacheControl = "no-cache, no-store, must-revalidate";
             context.Response.Headers["X-Content-Type-Options"] = "nosniff";
+            // 手机端用这个头显示“截图时间戳”，而不是图片送达手机的时间。
+            context.Response.Headers["X-AgentGrid-Captured-At"] =
+                capturedAt.ToString(CultureInfo.InvariantCulture);
             await context.Response.Body.WriteAsync(bytes);
         });
 
