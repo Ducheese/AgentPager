@@ -6,12 +6,23 @@ import android.media.AudioFocusRequest
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
+import android.media.SoundPool
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.util.Log
 import java.util.concurrent.Executors
 
-class SoundEngine(context: Context) {
+enum class SoundTheme(val label: String) {
+    RIMWORLD("环世界"),
+    ARCADE("复古街机");
+
+    companion object {
+        fun fromName(name: String?): SoundTheme =
+            entries.firstOrNull { it.name.equals(name, ignoreCase = true) } ?: RIMWORLD
+    }
+}
+
+class SoundEngine(private val context: Context) {
     private val executor = Executors.newSingleThreadExecutor()
     private val vibrator = context.getSystemService(Vibrator::class.java)
     private val audioManager = context.getSystemService(AudioManager::class.java)
@@ -21,11 +32,54 @@ class SoundEngine(context: Context) {
         .setOnAudioFocusChangeListener { }
         .build()
 
+    private val soundPool: SoundPool by lazy {
+        SoundPool.Builder()
+            .setMaxStreams(5)
+            .setAudioAttributes(audioAttributes)
+            .build()
+            .apply {
+                setOnLoadCompleteListener { _, sampleId, status ->
+                    if (status == 0) {
+                        loadedSamples.add(sampleId)
+                        Log.i(LOG_TAG, "RimWorld 音效加载成功: sampleId=$sampleId")
+                    } else {
+                        Log.e(LOG_TAG, "RimWorld 音效加载失败: sampleId=$sampleId, status=$status")
+                    }
+                }
+            }
+    }
+
+    private val loadedSamples = java.util.Collections.synchronizedSet(mutableSetOf<Int>())
+    private var rimGoodId = 0
+    private var rimWarningId = 0
+    private var rimErrorId = 0
+    private var rimNeutralId = 0
+    private var rimClickId = 0
+
+    init {
+        runCatching {
+            rimGoodId = soundPool.load(context, R.raw.sound_rim_letter_good, 1)
+            rimWarningId = soundPool.load(context, R.raw.sound_rim_letter_warning, 1)
+            // 任务出错失败：采用最高紧迫度 BadUrgent.wav（停用海盗突袭 BadUrgentBig）
+            rimErrorId = soundPool.load(context, R.raw.sound_rim_letter_raid, 1)
+            rimNeutralId = soundPool.load(context, R.raw.sound_rim_letter_neutral, 1)
+            rimClickId = soundPool.load(context, R.raw.sound_rim_click, 1)
+            Log.i(LOG_TAG, "RimWorld 音效请求加载: click=$rimClickId good=$rimGoodId neutral=$rimNeutralId error=$rimErrorId warning=$rimWarningId")
+        }.onFailure { Log.e(LOG_TAG, "加载 RimWorld 原生音效失败", it) }
+    }
+
     val isEnabled: Boolean
         get() = preferences.getBoolean(SOUND_ENABLED_KEY, true)
 
     fun setEnabled(enabled: Boolean) {
         preferences.edit().putBoolean(SOUND_ENABLED_KEY, enabled).apply()
+    }
+
+    val soundTheme: SoundTheme
+        get() = SoundTheme.fromName(preferences.getString(SOUND_THEME_KEY, SoundTheme.RIMWORLD.name))
+
+    fun setSoundTheme(theme: SoundTheme) {
+        preferences.edit().putString(SOUND_THEME_KEY, theme.name).apply()
     }
 
     // 震动单独开关（跟提示音解绑）：开会/静音场景只留震动，或全关。
@@ -39,24 +93,64 @@ class SoundEngine(context: Context) {
     fun play(cue: ArcadeSoundCue) {
         if (!isEnabled) return
         executor.execute {
-            runCatching { playCue(cue) }
-                .onFailure { Log.e(LOG_TAG, "提示音播放失败：$cue", it) }
-        }
-        // 任务完成 + 等输入（question/审批）都震；ACK（每次 running 响一声）不震，太吵。
-        if (isVibrationEnabled && (cue == ArcadeSoundCue.INPUT_REQUIRED || cue == ArcadeSoundCue.TASK_COMPLETE)) {
             runCatching {
-                vibrator?.vibrate(VibrationEffect.createOneShot(70, 110))
-            }.onFailure {
-                Log.e(LOG_TAG, "震动失败：$cue", it)
+                if (soundTheme == SoundTheme.RIMWORLD) {
+                    playRimCue(cue)
+                } else {
+                    playArcadeCue(cue)
+                }
+            }.onFailure { Log.e(LOG_TAG, "提示音播放失败：$cue", it) }
+        }
+        // 任务完成 + 等输入（question/审批）都震；崩溃也震。
+        if (isVibrationEnabled) {
+            when (cue) {
+                ArcadeSoundCue.TASK_INTERRUPTED -> runCatching {
+                    vibrator?.vibrate(VibrationEffect.createOneShot(180, 150))
+                }
+                ArcadeSoundCue.INPUT_REQUIRED -> runCatching {
+                    vibrator?.vibrate(VibrationEffect.createOneShot(80, 110))
+                }
+                ArcadeSoundCue.TASK_COMPLETE -> runCatching {
+                    vibrator?.vibrate(VibrationEffect.createOneShot(60, 90))
+                }
+                ArcadeSoundCue.TASK_ACKNOWLEDGE -> Unit
+            }
+        }
+    }
+
+    fun playClick() {
+        if (!isEnabled || soundTheme != SoundTheme.RIMWORLD || rimClickId <= 0) return
+        val streamId = soundPool.play(rimClickId, 1f, 1f, 0, 0, 1f)
+        if (streamId == 0) {
+            Log.w(LOG_TAG, "playClick 播放返回 0 (可能尚未解码完成): rimClickId=$rimClickId")
+        }
+        if (isVibrationEnabled) {
+            runCatching {
+                vibrator?.vibrate(VibrationEffect.createOneShot(15, 60))
             }
         }
     }
 
     fun close() {
         executor.shutdownNow()
+        runCatching { soundPool.release() }
     }
 
-    private fun playCue(cue: ArcadeSoundCue) {
+    private fun playRimCue(cue: ArcadeSoundCue) {
+        val soundId = when (cue) {
+            ArcadeSoundCue.TASK_COMPLETE -> rimGoodId
+            ArcadeSoundCue.INPUT_REQUIRED -> rimWarningId
+            ArcadeSoundCue.TASK_INTERRUPTED -> rimErrorId
+            ArcadeSoundCue.TASK_ACKNOWLEDGE -> rimNeutralId
+        }
+        if (soundId > 0) {
+            val focusResult = audioManager?.requestAudioFocus(focusRequest)
+            val streamId = soundPool.play(soundId, 1f, 1f, 1, 0, 1f)
+            Log.i(LOG_TAG, "playRimCue: cue=$cue soundId=$soundId streamId=$streamId focus=$focusResult")
+        }
+    }
+
+    private fun playArcadeCue(cue: ArcadeSoundCue) {
         val sampleRate = AudioTrack.getNativeOutputSampleRate(AudioManager.STREAM_MUSIC)
             .takeIf { it >= 8_000 }
             ?: ArcadeSoundSynthesizer.DEFAULT_SAMPLE_RATE
@@ -112,6 +206,7 @@ class SoundEngine(context: Context) {
         private const val LOG_TAG = "AgentPagerSound"
         private const val PREFERENCES_NAME = "agentgrid_sound"
         private const val SOUND_ENABLED_KEY = "enabled"
+        private const val SOUND_THEME_KEY = "sound_theme"
         private const val VIBRATION_ENABLED_KEY = "vibration_enabled"
 
         private val audioAttributes = AudioAttributes.Builder()

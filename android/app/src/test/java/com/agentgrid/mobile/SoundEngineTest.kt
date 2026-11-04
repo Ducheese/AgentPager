@@ -1,6 +1,7 @@
 package com.agentgrid.mobile
 
 import android.media.AudioTrack
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -30,5 +31,14 @@ class SoundEngineTest {
                 AudioTrack.STATE_UNINITIALIZED,
             ),
         )
+    }
+
+    @Test
+    fun `SoundTheme 解析及回退`() {
+        assertEquals(SoundTheme.RIMWORLD, SoundTheme.fromName("rimworld"))
+        assertEquals(SoundTheme.RIMWORLD, SoundTheme.fromName("RIMWORLD"))
+        assertEquals(SoundTheme.ARCADE, SoundTheme.fromName("arcade"))
+        assertEquals(SoundTheme.RIMWORLD, SoundTheme.fromName("unknown"))
+        assertEquals(SoundTheme.RIMWORLD, SoundTheme.fromName(null))
     }
 }

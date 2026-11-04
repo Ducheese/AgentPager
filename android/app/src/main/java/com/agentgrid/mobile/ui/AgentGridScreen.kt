@@ -61,6 +61,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
@@ -98,6 +99,8 @@ import com.agentgrid.mobile.ControlFeedback
 import com.agentgrid.mobile.ControlFeedbackKind
 import com.agentgrid.mobile.ReplySpeech
 import com.agentgrid.mobile.SoundEngine
+import com.agentgrid.mobile.SoundTheme
+import com.agentgrid.mobile.ArcadeSoundCue
 import com.agentgrid.mobile.domain.AgentActivity
 import com.agentgrid.mobile.domain.AgentLifecycle
 import com.agentgrid.mobile.domain.AgentSource
@@ -115,6 +118,7 @@ import com.agentgrid.mobile.render.PixelRenderState
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
+val LocalSoundEngine = compositionLocalOf<SoundEngine?> { null }
 private val EaseOutQuart = CubicBezierEasing(0.25f, 1f, 0.5f, 1f)
 private val TaskListAnchorHeight = 1.dp
 private const val TaskListAnchorKey = "agentgrid-task-list-anchor"
@@ -510,12 +514,14 @@ private fun TaskTerminal(
     val sound = remember(context) { SoundEngine(context.applicationContext) }
     var soundEnabled by remember(sound) { mutableStateOf(sound.isEnabled) }
     var vibrationEnabled by remember(sound) { mutableStateOf(sound.isVibrationEnabled) }
+    var soundTheme by remember(sound) { mutableStateOf(sound.soundTheme) }
 
     DisposableEffect(sound) {
         onDispose(sound::close)
     }
 
-    // 提示音/震动触发已搬到 LinkKeepAliveService（跟完成通知同一帧收快照），
+    CompositionLocalProvider(LocalSoundEngine provides sound) {
+        // 提示音/震动触发已搬到 LinkKeepAliveService（跟完成通知同一帧收快照），
     // 后台也响。这里只留 sound 给设置面板的开关用，不再触发播放——否则前台响两遍。
 
     // 层级返回：桌面截图 → 预览 → 设置小窗 → 额度面板 → 回任务面板；都没开才交给系统（退桌面）。
@@ -795,6 +801,12 @@ private fun TaskTerminal(
                     sound.setVibrationEnabled(enabled)
                     vibrationEnabled = enabled
                 },
+                soundTheme = soundTheme,
+                onSoundThemeChange = { theme ->
+                    sound.setSoundTheme(theme)
+                    soundTheme = theme
+                    sound.play(ArcadeSoundCue.TASK_ACKNOWLEDGE)
+                },
                 onSpeechRateChange = onSpeechRateChange,
                 onUnpair = onUnpair,
                 onToggleTerminalMode = onToggleTerminalMode,
@@ -835,6 +847,7 @@ private fun TaskTerminal(
                 },
             )
         }
+    }
     }
 }
 
@@ -1985,8 +1998,12 @@ private fun PixelButton(
     enabled: Boolean = true,
     action: () -> Unit,
 ) {
+    val sound = LocalSoundEngine.current
     OutlinedButton(
-        onClick = action,
+        onClick = {
+            sound?.playClick()
+            action()
+        },
         enabled = enabled,
         shape = RectangleShape,
         colors = ButtonDefaults.outlinedButtonColors(contentColor = color),
@@ -2160,6 +2177,8 @@ private fun SettingsPanel(
     onSoundEnabledChange: (Boolean) -> Unit,
     vibrationEnabled: Boolean,
     onVibrationEnabledChange: (Boolean) -> Unit,
+    soundTheme: SoundTheme,
+    onSoundThemeChange: (SoundTheme) -> Unit,
     onSpeechRateChange: (Float) -> Unit,
     onUnpair: () -> Unit,
     onToggleTerminalMode: () -> Unit,
@@ -2200,6 +2219,14 @@ private fun SettingsPanel(
             if (vibrationEnabled) AgentGridColors.Green else AgentGridColors.Muted,
         ) {
             onVibrationEnabledChange(!vibrationEnabled)
+        }
+        PixelButton(
+            "音效风格：${soundTheme.label}",
+            if (soundTheme == SoundTheme.RIMWORLD) AgentGridColors.Amber else AgentGridColors.Cyan,
+        ) {
+            onSoundThemeChange(
+                if (soundTheme == SoundTheme.RIMWORLD) SoundTheme.ARCADE else SoundTheme.RIMWORLD,
+            )
         }
         PixelButton(
             "朗读语速：${formatSpeechRate(state.speechRate)}",
