@@ -84,6 +84,7 @@ fun DesktopScreenshotDialog(
     onSendClick: (Float, Float, String, Boolean, String, Int, Int) -> Unit,
     onResetClick: () -> Unit,
     onDismiss: () -> Unit,
+    doubleTapScale: Float = 2.5f,
 ) {
     Dialog(
         onDismissRequest = onDismiss,
@@ -237,6 +238,7 @@ fun DesktopScreenshotDialog(
                             bitmap = state.bitmap,
                             viaTunnel = state.viaTunnel,
                             clickState = clickState,
+                            doubleTapScale = doubleTapScale,
                             initialScale = savedScale,
                             initialOffset = savedOffset,
                             onTransformChanged = { newScale, newOffset ->
@@ -269,6 +271,7 @@ private fun DesktopScreenshotCanvas(
     bitmap: Bitmap,
     viaTunnel: Boolean,
     clickState: DesktopClickState,
+    doubleTapScale: Float,
     initialScale: Float,
     initialOffset: Offset,
     onTransformChanged: (Float, Offset) -> Unit,
@@ -375,7 +378,6 @@ private fun DesktopScreenshotCanvas(
                                 scale = 1f
                                 offset = Offset.Zero
                             } else {
-                                val doubleTapScale = 2.5f
                                 scale = doubleTapScale
                                 // 聚焦到双击点
                                 val targetOffsetX =

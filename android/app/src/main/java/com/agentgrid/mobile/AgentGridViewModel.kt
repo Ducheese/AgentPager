@@ -84,6 +84,7 @@ data class AgentGridUiState(
     val openTaskRequest: String? = null,
     val speechFailure: ReplySpeech.SpeechFailure? = null,
     val speechRate: Float = 2.0f,
+    val screenshotDoubleTapScale: Float = 2.5f,
     val mermaidSecurityLevel: String = MermaidSecurityLevel.DEFAULT,
     val hideCodexQuota: Boolean = false,
     val hideCmdcQuota: Boolean = false,
@@ -107,6 +108,7 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
         AgentGridUiState(
             terminalMode = preferences.getBoolean("terminal-mode", true),
             speechRate = preferences.getFloat("speech-rate", 2.0f),
+            screenshotDoubleTapScale = preferences.getFloat("screenshot-double-tap-scale", 2.5f),
             mermaidSecurityLevel = MermaidSecurityLevel.normalize(
                 preferences.getString("mermaid-security-level", MermaidSecurityLevel.DEFAULT),
             ),
@@ -756,6 +758,11 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
     fun setSpeechRate(rate: Float) {
         preferences.edit { putFloat("speech-rate", rate) }
         mutableState.value = mutableState.value.copy(speechRate = rate)
+    }
+
+    fun setScreenshotDoubleTapScale(scale: Float) {
+        preferences.edit { putFloat("screenshot-double-tap-scale", scale) }
+        mutableState.value = mutableState.value.copy(screenshotDoubleTapScale = scale)
     }
 
     override fun onCleared() {

@@ -163,6 +163,7 @@ fun AgentGridScreen(
     onToggleTerminalMode: () -> Unit,
     onOpenTaskConsumed: (String) -> Unit,
     onSpeechRateChange: (Float) -> Unit,
+    onScreenshotDoubleTapScaleChange: (Float) -> Unit = {},
     onToggleReplySpeech: (String) -> Unit,
     onMermaidSecurityLevelChange: (String) -> Unit = {},
     inMultiWindow: Boolean,
@@ -216,6 +217,7 @@ fun AgentGridScreen(
                         onToggleTerminalMode = onToggleTerminalMode,
                         onOpenTaskConsumed = onOpenTaskConsumed,
                         onSpeechRateChange = onSpeechRateChange,
+                        onScreenshotDoubleTapScaleChange = onScreenshotDoubleTapScaleChange,
                         onToggleReplySpeech = onToggleReplySpeech,
                         onMermaidSecurityLevelChange = onMermaidSecurityLevelChange,
                         promptDrafts = promptDrafts,
@@ -466,6 +468,7 @@ private fun TaskTerminal(
     onToggleTerminalMode: () -> Unit,
     onOpenTaskConsumed: (String) -> Unit,
     onSpeechRateChange: (Float) -> Unit,
+    onScreenshotDoubleTapScaleChange: (Float) -> Unit = {},
     onToggleReplySpeech: (String) -> Unit,
     onMermaidSecurityLevelChange: (String) -> Unit = {},
     promptDrafts: Map<String, String>,
@@ -817,6 +820,7 @@ private fun TaskTerminal(
                     sound.play(ArcadeSoundCue.TASK_ACKNOWLEDGE)
                 },
                 onSpeechRateChange = onSpeechRateChange,
+                onScreenshotDoubleTapScaleChange = onScreenshotDoubleTapScaleChange,
                 onUnpair = onUnpair,
                 onToggleTerminalMode = onToggleTerminalMode,
                 onMermaidSecurityLevelChange = onMermaidSecurityLevelChange,
@@ -853,6 +857,7 @@ private fun TaskTerminal(
                 onRefresh = onFetchDesktopScreenshot,
                 onSendClick = onSendDesktopClick,
                 onResetClick = onResetDesktopClick,
+                doubleTapScale = state.screenshotDoubleTapScale,
                 onDismiss = {
                     desktopScreenshotVisible = false
                     onDismissDesktopScreenshot()
@@ -1464,6 +1469,7 @@ private fun TaskDetails(
                     "MODEL",
                     task.modelName ?: agentOriginLabel(task.source),
                     AgentGridColors.Cyan,
+                    compact = true,
                 )
             }
             task.tokenUsage?.let {
@@ -1471,10 +1477,11 @@ private fun TaskDetails(
                     "TOKEN",
                     tokenDetailsText(task),
                     AgentGridColors.Cyan,
+                    compact = compact,
                 )
             }
             if (showToolOutput) {
-                ToolSection(task.latestToolOutput!!)
+                ToolSection(task.latestToolOutput!!, compact = compact)
             }
             if (showResponseBody) {
                 ResponseSection(
@@ -1483,6 +1490,7 @@ private fun TaskDetails(
                     canSpeak = task.isTerminal,
                     failure = speechFailure?.takeIf { it.taskID == task.id }?.message,
                     onToggle = { onToggleReplySpeech(task.id) },
+                    compact = compact,
                 )
             }
         }
@@ -1914,15 +1922,52 @@ private fun SubagentRow(
 }
 
 @Composable
-private fun DetailLine(label: String, value: String, color: Color) {
-    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        Text(label, color = color, fontSize = 9.sp, modifier = Modifier.width(58.dp))
-        Text(value, color = AgentGridColors.Muted, fontSize = 10.sp)
+private fun DetailLine(label: String, value: String, color: Color, compact: Boolean = false) {
+    if (compact) {
+        // 竖屏：标签独占一行，值撑满全宽，不再被 58.dp 标签列挤窄。
+        Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
+            Text(label, color = color, fontSize = 9.sp)
+            Text(value, color = AgentGridColors.Muted, fontSize = 10.sp)
+        }
+    } else {
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text(label, color = color, fontSize = 9.sp, modifier = Modifier.width(58.dp))
+            Text(value, color = AgentGridColors.Muted, fontSize = 10.sp)
+        }
     }
 }
 
 @Composable
-private fun ToolSection(output: String) {
+private fun ToolSection(output: String, compact: Boolean = false) {
+    if (compact) {
+        // 竖屏：标签独占一行，输出框撑满全宽。
+        Column(verticalArrangement = Arrangement.spacedBy(1.dp)) {
+            Text(
+                "TOOL",
+                color = AgentGridColors.Amber,
+                fontSize = 9.sp,
+                modifier = Modifier.padding(vertical = 3.dp),
+            )
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(AgentGridColors.SurfaceRaised.copy(alpha = 0.6f))
+                    .padding(8.dp),
+            ) {
+                // 高度不封顶：跟随 TaskDetails 自适应展开，滚动交给外层 LazyColumn。
+                Column {
+                    Text(
+                        output,
+                        color = AgentGridColors.Text.copy(alpha = 0.9f),
+                        fontSize = 9.sp,
+                        lineHeight = 13.sp,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                }
+            }
+        }
+        return
+    }
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -1962,45 +2007,116 @@ private fun ResponseSection(
     canSpeak: Boolean,
     onToggle: () -> Unit,
     failure: String? = null,
+    compact: Boolean = false,
 ) {
     // 完成态才给「开读」；已在朗读时永远可停（哪怕任务又变回运行态，不留下停不掉的死角）。
     val clickable = speaking || canSpeak
     Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            // 不加粗（2026-10-16）：REPLY 原来带 FontWeight.Bold，而 PixelFontFamily 把同一个 ttf
-            // 同时注册成 Normal/Medium/Bold —— 没有独立粗体字面，系统就做**伪粗体**，描边向外双向扩，
-            // 左边缘跟着多出一点，三个标签里就它看着偏左。去掉后与 MODEL/TOKEN 同字面、同原点，
-            // 标签列严格对齐。
-            Text(
-                text = if (speaking) "STOP" else "REPLY",
-                color = if (speaking) AgentGridColors.Red else AgentGridColors.Green,
-                fontSize = 9.sp,
-                modifier = Modifier
-                    .width(58.dp)
-                    .clickable(
-                        enabled = clickable,
-                        interactionSource = remember { MutableInteractionSource() },
-                        indication = null,
-                        onClick = onToggle,
-                    )
-                    .padding(vertical = 3.dp),
-            )
+        if (compact) {
+            // 竖屏：标签行只占一行（REPLY 开关 + 右对齐复制），正文独占全宽。
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                ReplyToggle(
+                    speaking = speaking,
+                    clickable = clickable,
+                    onToggle = onToggle,
+                    modifier = Modifier,
+                )
+                Spacer(modifier = Modifier.weight(1f))
+                CopyReplyButton(source = markdown)
+            }
             Box(
                 modifier = Modifier
-                    .weight(1f)
+                    .fillMaxWidth()
                     .background(AgentGridColors.SurfaceRaised.copy(alpha = 0.6f))
                     .padding(8.dp),
             ) {
                 MarkdownView(markdown = markdown)
+            }
+        } else {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                // 不加粗（2026-10-16）：REPLY 原来带 FontWeight.Bold，而 PixelFontFamily 把同一个 ttf
+                // 同时注册成 Normal/Medium/Bold —— 没有独立粗体字面，系统就做**伪粗体**，描边向外双向扩，
+                // 左边缘跟着多出一点，三个标签里就它看着偏左。去掉后与 MODEL/TOKEN 同字面、同原点，
+                // 标签列严格对齐。
+                ReplyToggle(
+                    speaking = speaking,
+                    clickable = clickable,
+                    onToggle = onToggle,
+                    modifier = Modifier.width(58.dp),
+                )
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .background(AgentGridColors.SurfaceRaised.copy(alpha = 0.6f))
+                        .padding(8.dp),
+                ) {
+                    MarkdownView(markdown = markdown)
+                }
             }
         }
         if (failure != null) {
             Text(failure, color = AgentGridColors.Red, fontSize = 9.sp, lineHeight = 12.sp)
         }
     }
+}
+
+/** REPLY 开关标签：STOP/REPLY 互斥语义，宽度由调用方定（竖屏自适应、横屏锁 58.dp 对齐）。 */
+@Composable
+private fun ReplyToggle(
+    speaking: Boolean,
+    clickable: Boolean,
+    onToggle: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Text(
+        text = if (speaking) "STOP" else "REPLY",
+        color = if (speaking) AgentGridColors.Red else AgentGridColors.Green,
+        fontSize = 9.sp,
+        modifier = modifier
+            .clickable(
+                enabled = clickable,
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = onToggle,
+            )
+            .padding(vertical = 3.dp),
+    )
+}
+
+/**
+ * REPLY 全文复制：文本锁死 [ 复制 ]，1.2 秒内变灰 + 禁点（不变文本长度、不抖动）。
+ */
+@Composable
+private fun CopyReplyButton(source: String) {
+    val clipboard = androidx.compose.ui.platform.LocalClipboard.current
+    val scope = rememberCoroutineScope()
+    var copied by remember(source) { mutableStateOf(false) }
+    if (copied) {
+        LaunchedEffect(source) {
+            kotlinx.coroutines.delay(1200)
+            copied = false
+        }
+    }
+    Text(
+        text = "[ 复制 ]",
+        color = if (copied) AgentGridColors.Dimmed else AgentGridColors.Cyan,
+        fontSize = 9.sp,
+        fontWeight = FontWeight.Bold,
+        modifier = Modifier.clickable(enabled = !copied) {
+            scope.launch {
+                val data = android.content.ClipData.newPlainText("reply", source)
+                clipboard.setClipEntry(androidx.compose.ui.platform.ClipEntry(data))
+                copied = true
+            }
+        },
+    )
 }
 
 @Composable
@@ -2192,6 +2308,7 @@ private fun SettingsPanel(
     soundTheme: SoundTheme,
     onSoundThemeChange: (SoundTheme) -> Unit,
     onSpeechRateChange: (Float) -> Unit,
+    onScreenshotDoubleTapScaleChange: (Float) -> Unit,
     onUnpair: () -> Unit,
     onToggleTerminalMode: () -> Unit,
     onMermaidSecurityLevelChange: (String) -> Unit,
@@ -2242,9 +2359,15 @@ private fun SettingsPanel(
         }
         PixelButton(
             "朗读语速：${formatSpeechRate(state.speechRate)}",
-            AgentGridColors.Muted,
+            AgentGridColors.Cyan,
         ) {
             onSpeechRateChange(nextSpeechRate(state.speechRate))
+        }
+        PixelButton(
+            "截屏双击：${formatZoomScale(state.screenshotDoubleTapScale)}",
+            AgentGridColors.Cyan,
+        ) {
+            onScreenshotDoubleTapScaleChange(nextZoomScale(state.screenshotDoubleTapScale))
         }
         PixelButton(
             "图表安全：${formatSecurityLevel(state.mermaidSecurityLevel)}",
@@ -2299,7 +2422,7 @@ private fun SettingsPanel(
     }
 }
 
-private val SpeechRates = listOf(1.0f, 1.25f, 1.5f, 1.75f, 2.0f)
+private val SpeechRates = listOf(1.0f, 1.5f, 2.0f, 2.5f, 3.0f, 4.0f)
 
 private fun nextSpeechRate(current: Float): Float {
     val index = SpeechRates.indexOfFirst { kotlin.math.abs(it - current) < 0.01f }
@@ -2308,6 +2431,16 @@ private fun nextSpeechRate(current: Float): Float {
 
 private fun formatSpeechRate(rate: Float): String =
     String.format(java.util.Locale.US, "%.2f", rate).trimEnd('0').trimEnd('.') + "x"
+
+private val ZoomScales = listOf(1.5f, 2.0f, 2.5f, 3.0f, 4.0f)
+
+private fun nextZoomScale(current: Float): Float {
+    val index = ZoomScales.indexOfFirst { kotlin.math.abs(it - current) < 0.01f }
+    return ZoomScales[if (index < 0) ZoomScales.indexOf(2.5f) else (index + 1) % ZoomScales.size]
+}
+
+private fun formatZoomScale(scale: Float): String =
+    String.format(java.util.Locale.US, "%.2f", scale).trimEnd('0').trimEnd('.') + "x"
 
 private fun formatSecurityLevel(level: String): String = when (level) {
     "strict" -> "严格"

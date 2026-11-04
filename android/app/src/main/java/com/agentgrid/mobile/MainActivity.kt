@@ -78,6 +78,7 @@ class MainActivity : ComponentActivity() {
                 },
                 onOpenTaskConsumed = viewModel::consumeOpenTask,
                 onSpeechRateChange = viewModel::setSpeechRate,
+                onScreenshotDoubleTapScaleChange = viewModel::setScreenshotDoubleTapScale,
                 onToggleReplySpeech = viewModel::toggleReplySpeech,
                 onMermaidSecurityLevelChange = viewModel::setMermaidSecurityLevel,
                 inMultiWindow = multiWindowState.value,
