@@ -581,29 +581,40 @@ private fun TaskTerminal(
         val isCompact = maxWidth < 600.dp || isPortraitWindow
         val isVeryNarrow = maxWidth < 400.dp
 
-        val effectiveUsage = remember(state.usage, state.usages, state.hideCodexQuota, state.hideCmdcQuota) {
-            val list = state.usages.ifEmpty { listOfNotNull(state.usage) }
-            // 这里的分类必须与 UsageDashboard.providerName 保持同一口径；新增 provider 时两处同步改。
-            list.firstOrNull { u ->
-                val label = when {
-                    u.planType?.contains("Antigravity", ignoreCase = true) == true -> "AGY"
-                    u.planType?.contains("Command Code", ignoreCase = true) == true -> "CMDC"
-                    u.planType?.contains("OpenCode Go", ignoreCase = true) == true -> "OCG"
-                    else -> "CODEX"
-                }
-                !(state.hideCodexQuota && label == "CODEX") &&
-                !(state.hideCmdcQuota && label == "CMDC")
+        // 状态栏轮播的提供商列表：与 UsageDashboard 共用 availableProviderUsages，口径一致。
+        val rotationUsages = remember(state.usage, state.usages, state.hideCodexQuota, state.hideCmdcQuota) {
+            availableProviderUsages(state.usage, state.usages, state.hideCodexQuota, state.hideCmdcQuota)
+        }
+        // 按 providerKey 记住轮播位置：额度每 10 分钟刷新重建列表，记下标会被踢回第一家。
+        var rotationKey by remember { mutableStateOf<String?>(null) }
+        val rotationIndex = rotationUsages
+            .indexOfFirst { providerKey(it) == rotationKey }
+            .takeIf { it >= 0 } ?: 0
+        LaunchedEffect(isCompact, rotationUsages) {
+            if (isCompact || rotationUsages.isEmpty()) return@LaunchedEffect
+            while (true) {
+                delay(5_000)
+                val current = rotationUsages
+                    .indexOfFirst { providerKey(it) == rotationKey }
+                    .takeIf { it >= 0 } ?: 0
+                rotationKey = providerKey(rotationUsages[(current + 1) % rotationUsages.size])
             }
+        }
+        // 轮播当前家的进度条：直接喂给顶栏已有的 pills 槽位（AGY 只看 Gemini、CMDC 只看当前、OCG 三根全要）。
+        val rotationBars = remember(rotationUsages, rotationIndex) {
+            rotationUsages.getOrNull(rotationIndex)
+                ?.let { providerStatusBars(it) }.orEmpty()
+                .map { (barLabel, window) -> window.copy(label = barLabel) }
         }
 
         TopControls(
-            windows = if (showDashboard || isVeryNarrow) {
+            windows = if (showDashboard || isVeryNarrow || isCompact) {
+                // 竖屏状态栏明确不显示提供商进度条：不是空间不够，是规则如此。
                 emptyList()
-            } else if (isCompact) {
-                effectiveUsage?.windows.orEmpty().take(1)
             } else {
-                effectiveUsage?.windows.orEmpty()
+                rotationBars
             },
+            rotationKey = rotationUsages.getOrNull(rotationIndex)?.let { providerKey(it) },
             settingsVisible = settingsVisible,
             dashboardVisible = showDashboard,
             previewVisible = pixelPreviewVisible,
@@ -955,6 +966,7 @@ private fun PixelPreviewPanel() {
 @Composable
 private fun TopControls(
     windows: List<UsageWindow>,
+    rotationKey: String? = null,
     settingsVisible: Boolean,
     dashboardVisible: Boolean,
     previewVisible: Boolean,
@@ -970,8 +982,23 @@ private fun TopControls(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        windows.take(2).forEach { window ->
-            UsagePill(window)
+        // 轮播当前家的进度条（最多 3 根：OCG 三根全要，其余两根），竖屏/面板打开时为空。
+        // 切提供商时淡入淡出；额度数字刷新不换 key，不闪。
+        AnimatedContent(
+            targetState = rotationKey,
+            transitionSpec = {
+                fadeIn(tween(200)) togetherWith fadeOut(tween(200))
+            },
+            label = "提供商额度轮播",
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                windows.forEach { window ->
+                    UsagePill(window)
+                }
+            }
         }
         // 桌面截图入口：像素预览按钮左边，手画桌面显示器图标
         Box(

@@ -72,17 +72,7 @@ internal fun UsageDashboard(
     hideCmdcQuota: Boolean = false,
 ) {
     val availableUsages = remember(usage, usages, hideCodexQuota, hideCmdcQuota) {
-        val list = usages.ifEmpty { listOfNotNull(usage) }
-        list
-            // 桌面号只活在"全部"列表里，不进提供商切换：它们的 LimitID 是邮箱（含 @），
-            // 不是套餐名。放进来会冒充主号（distinctBy 按 planType 压成一个 CMDC 代表）。
-            .filterNot {
-                providerName(it) == "Command Code" &&
-                    it.limitID?.contains('@') == true
-            }
-            .distinctBy { providerKey(it) }
-            .filterNot { hideCodexQuota && providerLabel(it) == "CODEX" }
-            .filterNot { hideCmdcQuota && providerLabel(it) == "CMDC" }
+        availableProviderUsages(usage, usages, hideCodexQuota, hideCmdcQuota)
     }
     // 选择按提供商身份记住，而不是按列表实例：额度每 10 分钟刷新会重建 list，
     // 旧写法 remember(availableUsages) 会把用户踢回第一个提供商。
@@ -471,7 +461,7 @@ private fun QuotaPanel(
 }
 
 /** 额度的来源全称：新增提供商时，同步修改 AgentGridScreen.effectiveUsage 的分类。 */
-private fun providerName(usage: UsageSnapshot?): String = when {
+internal fun providerName(usage: UsageSnapshot?): String = when {
     usage?.planType?.contains("Antigravity", ignoreCase = true) == true -> "Antigravity"
     usage?.planType?.contains("Command Code", ignoreCase = true) == true -> "Command Code"
     usage?.planType?.contains("OpenCode Go", ignoreCase = true) == true -> "OpenCode Go"
@@ -479,7 +469,7 @@ private fun providerName(usage: UsageSnapshot?): String = when {
 }
 
 /** 切换器与标题上的短名。 */
-private fun providerLabel(usage: UsageSnapshot?): String = when (providerName(usage)) {
+internal fun providerLabel(usage: UsageSnapshot?): String = when (providerName(usage)) {
     "Antigravity" -> "AGY"
     "Command Code" -> "CMDC"
     "OpenCode Go" -> "OCG"
@@ -990,5 +980,64 @@ private fun quotaColor(remaining: Int?): Color = when {
 }
 
 /** 提供商的稳定身份：跨越额度刷新仍是同一个值，选择状态才不会被重建的列表冲掉。 */
-private fun providerKey(usage: UsageSnapshot): String =
+internal fun providerKey(usage: UsageSnapshot): String =
     usage.planType ?: usage.limitID ?: ""
+
+/**
+ * 额度面板与状态栏轮播共用的提供商列表：桌面号过滤、去重、隐藏开关，口径必须一致；
+ * 新增 provider 时只改这里，两处同步生效。
+ */
+internal fun availableProviderUsages(
+    usage: UsageSnapshot?,
+    usages: List<UsageSnapshot>,
+    hideCodexQuota: Boolean,
+    hideCmdcQuota: Boolean,
+): List<UsageSnapshot> {
+    val list = usages.ifEmpty { listOfNotNull(usage) }
+    return list
+        // 桌面号只活在"全部"列表里，不进提供商切换：它们的 LimitID 是邮箱（含 @），
+        // 不是套餐名。放进来会冒充主号（distinctBy 按 planType 压成一个 CMDC 代表）。
+        .filterNot {
+            providerName(it) == "Command Code" &&
+                it.limitID?.contains('@') == true
+        }
+        .distinctBy { providerKey(it) }
+        .filterNot { hideCodexQuota && providerLabel(it) == "CODEX" }
+        .filterNot { hideCmdcQuota && providerLabel(it) == "CMDC" }
+}
+
+/**
+ * 状态栏轮播用的进度条：(显示标签, 窗口)，与 QuotaPanel 的槽位规则同口径。
+ * - AGY 只取 Gemini 组（group 0），不跟 3P 切换；
+ * - CMDC 只取当前视图（cc-5h/cc-weekly），不跟全部账号；
+ * - OCG 三根全要（5 小时/周/月）；
+ * - 缺失的槽位直接跳过不占位，不拿别的窗口顶替。
+ */
+internal fun providerStatusBars(usage: UsageSnapshot): List<Pair<String, UsageWindow>> {
+    val windows = usage.windows
+    val isAgy = usage.planType?.contains("Antigravity", ignoreCase = true) == true
+    val isCmdc = usage.planType?.contains("Command Code", ignoreCase = true) == true
+    val isOpenCodeGo = usage.planType?.contains("OpenCode Go", ignoreCase = true) == true
+    val slots: List<Pair<String, String>> = when {
+        isOpenCodeGo -> listOf(
+            "OpenCode 5小时" to "oc-rolling",
+            "周" to "oc-weekly",
+            "月" to "oc-monthly",
+        )
+        isCmdc -> listOf(
+            "CommandCode 5小时" to "cc-5h",
+            "周" to "cc-weekly",
+        )
+        isAgy -> listOf(
+            "Gemini 5小时" to "primary",
+            "周" to "secondary",
+        )
+        else -> listOf(
+            "Codex 5小时" to "primary",
+            "周" to "secondary",
+        )
+    }
+    return slots.mapNotNull { (label, key) ->
+        windows.firstOrNull { it.key == key }?.let { label to it }
+    }
+}
