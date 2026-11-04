@@ -65,6 +65,8 @@ public sealed class LanBridgeServer(
     public const int PhonePort = 49362;
 
     private readonly ConcurrentDictionary<Guid, Client> _clients = [];
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _clickedRequests = new(StringComparer.Ordinal);
+    private readonly object _clickGate = new();
     private WebApplication? _application;
 
     public int ClientCount => _clients.Count;
@@ -174,6 +176,139 @@ public sealed class LanBridgeServer(
             context.Response.Headers["X-AgentGrid-Captured-At"] =
                 capturedAt.ToString(CultureInfo.InvariantCulture);
             await context.Response.Body.WriteAsync(bytes);
+        });
+
+        app.MapPost("/api/desktop/click", async context =>
+        {
+            var provided = context.Request.Headers[SecretHeader].ToString();
+            if (!authorize(string.IsNullOrEmpty(provided) ? null : provided))
+            {
+                log.Write("WARN", $"桌面点击被拒：配对密钥无效（{context.Connection.RemoteIpAddress}）");
+                context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                return;
+            }
+            if (!context.Request.HasJsonContentType())
+            {
+                context.Response.StatusCode = StatusCodes.Status415UnsupportedMediaType;
+                await context.Response.WriteAsync("需要 application/json");
+                return;
+            }
+            if (context.Request.ContentLength is > 4096)
+            {
+                context.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
+                await context.Response.WriteAsync("请求体过大");
+                return;
+            }
+
+            double normalizedX;
+            double normalizedY;
+            string requestId;
+            string action;
+            int imageWidth;
+            int imageHeight;
+            try
+            {
+                using var document = await JsonDocument.ParseAsync(
+                    context.Request.Body,
+                    cancellationToken: context.RequestAborted);
+                var root = document.RootElement;
+                var requestedId = root.ValueKind == JsonValueKind.Object &&
+                    root.TryGetProperty("requestId", out var requestIdProp) &&
+                    requestIdProp.ValueKind == JsonValueKind.String
+                        ? requestIdProp.GetString()
+                        : null;
+                action = root.ValueKind == JsonValueKind.Object &&
+                    root.TryGetProperty("action", out var actionProp) &&
+                    actionProp.ValueKind == JsonValueKind.String
+                        ? actionProp.GetString() ?? "left"
+                        : "left";
+                if (root.ValueKind != JsonValueKind.Object ||
+                    requestedId is not { Length: > 0 and <= 128 } ||
+                    !root.TryGetProperty("x", out var xProp) ||
+                    !root.TryGetProperty("y", out var yProp) ||
+                    !root.TryGetProperty("imageWidth", out var imageWidthProp) ||
+                    !imageWidthProp.TryGetInt32(out imageWidth) ||
+                    !root.TryGetProperty("imageHeight", out var imageHeightProp) ||
+                    !imageHeightProp.TryGetInt32(out imageHeight) ||
+                    !xProp.TryGetDouble(out normalizedX) ||
+                    !yProp.TryGetDouble(out normalizedY) ||
+                    double.IsNaN(normalizedX) || double.IsInfinity(normalizedX) ||
+                    double.IsNaN(normalizedY) || double.IsInfinity(normalizedY) ||
+                    normalizedX is < 0 or > 1 || normalizedY is < 0 or > 1 ||
+                    imageWidth <= 0 || imageHeight <= 0)
+                {
+                    context.Response.StatusCode = StatusCodes.Status400BadRequest;
+                    await context.Response.WriteAsync("点击请求参数无效");
+                    return;
+                }
+                requestId = requestedId!;
+            }
+            catch (JsonException)
+            {
+                context.Response.StatusCode = StatusCodes.Status400BadRequest;
+                await context.Response.WriteAsync("点击请求不是有效 JSON");
+                return;
+            }
+
+            string? error = null;
+            var errorStatus = StatusCodes.Status503ServiceUnavailable;
+            var duplicate = false;
+            lock (_clickGate)
+            {
+                var now = DateTimeOffset.UtcNow;
+                if (_clickedRequests.TryGetValue(requestId, out var clickedAt) &&
+                    now - clickedAt < TimeSpan.FromMinutes(10))
+                {
+                    duplicate = true;
+                }
+                else
+                {
+                    var screen = DesktopCapture.GetScreenZeroBounds();
+                    if (screen.Width <= 0 || screen.Height <= 0)
+                    {
+                        error = "没有可用的主显示器";
+                    }
+                    else if (imageWidth != screen.Width || imageHeight != screen.Height)
+                    {
+                        error = "截图尺寸已变化，请刷新后重试";
+                        errorStatus = StatusCodes.Status409Conflict;
+                    }
+                    else if (!DesktopInput.ClickNormalized(normalizedX, normalizedY, action, out error))
+                    {
+                        // 失败不记入幂等表，允许客户端用同一个 requestId 重试。
+                    }
+                    else
+                    {
+                        _clickedRequests[requestId] = now;
+                        foreach (var pair in _clickedRequests)
+                        {
+                            if (now - pair.Value >= TimeSpan.FromMinutes(10))
+                                _clickedRequests.TryRemove(pair.Key, out _);
+                        }
+                    }
+                }
+            }
+
+            if (duplicate)
+            {
+                context.Response.Headers.CacheControl = "no-cache, no-store, must-revalidate";
+                context.Response.StatusCode = StatusCodes.Status204NoContent;
+                return;
+            }
+            if (error is not null)
+            {
+                log.Write("WARN", $"[点击] 失败：{error}（{context.Connection.RemoteIpAddress}）");
+                context.Response.StatusCode = errorStatus;
+                context.Response.ContentType = "text/plain; charset=utf-8";
+                await context.Response.WriteAsync(error);
+                return;
+            }
+
+            log.Write(
+                "INFO",
+                $"[点击] id={requestId[..Math.Min(8, requestId.Length)]} act={action} x={normalizedX:0.000000} y={normalizedY:0.000000}（{context.Connection.RemoteIpAddress}）");
+            context.Response.Headers.CacheControl = "no-cache, no-store, must-revalidate";
+            context.Response.StatusCode = StatusCodes.Status204NoContent;
         });
 
         app.MapPost("/api/attachments/upload", async context =>

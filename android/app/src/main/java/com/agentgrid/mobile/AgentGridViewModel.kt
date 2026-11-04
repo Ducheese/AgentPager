@@ -60,6 +60,13 @@ sealed interface DesktopScreenshotState {
     data class Error(val message: String) : DesktopScreenshotState
 }
 
+sealed interface DesktopClickState {
+    data object Idle : DesktopClickState
+    data object Sending : DesktopClickState
+    data object Sent : DesktopClickState
+    data class Error(val message: String) : DesktopClickState
+}
+
 data class AgentGridUiState(
     val pairing: PairingSummary? = null,
     val linkState: LinkState = LinkState.DISCONNECTED,
@@ -143,10 +150,23 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
     private val _desktopScreenshotState = MutableStateFlow<DesktopScreenshotState>(DesktopScreenshotState.Idle)
     val desktopScreenshotState: StateFlow<DesktopScreenshotState> = _desktopScreenshotState.asStateFlow()
 
+    private val _desktopClickState = MutableStateFlow<DesktopClickState>(DesktopClickState.Idle)
+    val desktopClickState: StateFlow<DesktopClickState> = _desktopClickState.asStateFlow()
+
     private var screenshotFetchJob: Job? = null
+    private var desktopClickJob: Job? = null
+    private var activeClickRequestId: String? = null
+
+    private fun cancelDesktopClick() {
+        desktopClickJob?.cancel()
+        desktopClickJob = null
+        activeClickRequestId = null
+        _desktopClickState.value = DesktopClickState.Idle
+    }
 
     fun fetchDesktopScreenshot() {
         screenshotFetchJob?.cancel()
+        cancelDesktopClick()
         _desktopScreenshotState.value = DesktopScreenshotState.Loading
         screenshotFetchJob = viewModelScope.launch {
             try {
@@ -167,7 +187,57 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun dismissDesktopScreenshot() {
         screenshotFetchJob?.cancel()
+        cancelDesktopClick()
         _desktopScreenshotState.value = DesktopScreenshotState.Idle
+    }
+
+    fun sendDesktopClick(
+        normalizedX: Float,
+        normalizedY: Float,
+        action: String = "left",
+        viaTunnel: Boolean,
+        requestId: String,
+        imageWidth: Int,
+        imageHeight: Int,
+    ) {
+        if (desktopClickJob?.isActive == true) return
+        if (!normalizedX.isFinite() || !normalizedY.isFinite() ||
+            normalizedX !in 0f..1f || normalizedY !in 0f..1f ||
+            imageWidth <= 0 || imageHeight <= 0
+        ) {
+            _desktopClickState.value = DesktopClickState.Error("点击坐标超出截图范围")
+            return
+        }
+        activeClickRequestId = requestId
+        _desktopClickState.value = DesktopClickState.Sending
+        desktopClickJob = viewModelScope.launch {
+            try {
+                desktopScreenshotClient.sendClick(
+                    normalizedX = normalizedX,
+                    normalizedY = normalizedY,
+                    action = action,
+                    viaTunnel = viaTunnel,
+                    requestId = requestId,
+                    imageWidth = imageWidth,
+                    imageHeight = imageHeight,
+                )
+                if (activeClickRequestId == requestId) {
+                    _desktopClickState.value = DesktopClickState.Sent
+                }
+            } catch (cancelled: CancellationException) {
+                // 取消不覆盖状态
+            } catch (error: Exception) {
+                if (activeClickRequestId == requestId) {
+                    _desktopClickState.value = DesktopClickState.Error(
+                        error.message ?: "发送点击失败",
+                    )
+                }
+            }
+        }
+    }
+
+    fun resetDesktopClick() {
+        cancelDesktopClick()
     }
 
     /** 选图入口：压缩→后台上传→READY。失败保留 FAILED 卡片可重试，不阻塞打字。 */
@@ -691,6 +761,7 @@ class AgentGridViewModel(application: Application) : AndroidViewModel(applicatio
     override fun onCleared() {
         dashboardTransitionJob?.cancel()
         openTaskTimeout?.cancel()
+        desktopClickJob?.cancel()
         feedbackJobs.values.forEach { it.cancel() }
         feedbackJobs.clear()
         // 会话是进程级单例：Activity/ViewModel 销毁不等于断开，保活服务还握着这条连接

@@ -52,7 +52,7 @@ public static class DesktopCapture
         return ms.ToArray();
     }
 
-    private static Rectangle GetScreenZeroBounds()
+    internal static Rectangle GetScreenZeroBounds()
     {
         // 优先系统主显示器；只有主屏不可用时才回退到枚举首项。
         // 进程按 PerMonitorV2 启动，Bounds 就是该显示器的物理像素；DPI 取系统设置，不手工换算。

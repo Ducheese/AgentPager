@@ -173,8 +173,11 @@ fun AgentGridScreen(
     onRemoveAttachment: (String, String) -> Unit = { _, _ -> },
     onRetryAttachment: (String, String) -> Unit = { _, _ -> },
     desktopScreenshotState: com.agentgrid.mobile.DesktopScreenshotState = com.agentgrid.mobile.DesktopScreenshotState.Idle,
+    desktopClickState: com.agentgrid.mobile.DesktopClickState = com.agentgrid.mobile.DesktopClickState.Idle,
     onFetchDesktopScreenshot: () -> Unit = {},
     onDismissDesktopScreenshot: () -> Unit = {},
+    onSendDesktopClick: (Float, Float, String, Boolean, String, Int, Int) -> Unit = { _, _, _, _, _, _, _ -> },
+    onResetDesktopClick: () -> Unit = {},
     onToggleHideCodexQuota: () -> Unit = {},
     onToggleHideCmdcQuota: () -> Unit = {},
 ) {
@@ -222,8 +225,11 @@ fun AgentGridScreen(
                         onRemoveAttachment = onRemoveAttachment,
                         onRetryAttachment = onRetryAttachment,
                         desktopScreenshotState = desktopScreenshotState,
+                        desktopClickState = desktopClickState,
                         onFetchDesktopScreenshot = onFetchDesktopScreenshot,
                         onDismissDesktopScreenshot = onDismissDesktopScreenshot,
+                        onSendDesktopClick = onSendDesktopClick,
+                        onResetDesktopClick = onResetDesktopClick,
                         onToggleHideCodexQuota = onToggleHideCodexQuota,
                         onToggleHideCmdcQuota = onToggleHideCmdcQuota,
                     )
@@ -469,8 +475,11 @@ private fun TaskTerminal(
     onRemoveAttachment: (String, String) -> Unit = { _, _ -> },
     onRetryAttachment: (String, String) -> Unit = { _, _ -> },
     desktopScreenshotState: com.agentgrid.mobile.DesktopScreenshotState = com.agentgrid.mobile.DesktopScreenshotState.Idle,
+    desktopClickState: com.agentgrid.mobile.DesktopClickState = com.agentgrid.mobile.DesktopClickState.Idle,
     onFetchDesktopScreenshot: () -> Unit = {},
     onDismissDesktopScreenshot: () -> Unit = {},
+    onSendDesktopClick: (Float, Float, String, Boolean, String, Int, Int) -> Unit = { _, _, _, _, _, _, _ -> },
+    onResetDesktopClick: () -> Unit = {},
     onToggleHideCodexQuota: () -> Unit = {},
     onToggleHideCmdcQuota: () -> Unit = {},
 ) {
@@ -840,7 +849,10 @@ private fun TaskTerminal(
         if (desktopScreenshotVisible) {
             DesktopScreenshotDialog(
                 state = desktopScreenshotState,
+                clickState = desktopClickState,
                 onRefresh = onFetchDesktopScreenshot,
+                onSendClick = onSendDesktopClick,
+                onResetClick = onResetDesktopClick,
                 onDismiss = {
                     desktopScreenshotVisible = false
                     onDismissDesktopScreenshot()

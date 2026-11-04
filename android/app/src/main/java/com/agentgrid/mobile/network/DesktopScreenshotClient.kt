@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -11,14 +12,15 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.suspendCancellableCoroutine
 import okhttp3.Call
 import okhttp3.Callback
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.ResponseBody
 
 /**
- * 桌面屏幕截图客户端（GET /api/desktop/screenshot）。
- * 候选顺序由 [PhoneSession.uploadEndpoints] 给出：当前 WS 所在腿排第一，蜂窝下不含局域网。
+ * 桌面屏幕客户端网络/服务异常。
  */
 class DesktopScreenshotException(
     message: String,
@@ -34,6 +36,12 @@ data class DesktopScreenshotResult(
     val elapsedMillis: Long,
 )
 
+/**
+ * 桌面屏幕客户端：
+ * - 获取屏幕截图：GET /api/desktop/screenshot
+ * - 发送桌面输入点击（左键 / 右键 / 双击）：POST /api/desktop/click
+ * 候选顺序由 [PhoneSession.uploadEndpoints] 给出：当前 WS 所在腿排第一，蜂窝下不含局域网。
+ */
 class DesktopScreenshotClient(
     private val endpoints: suspend () -> List<PhoneEndpoint>,
     private val okHttpClient: OkHttpClient = defaultClient(),
@@ -47,6 +55,7 @@ class DesktopScreenshotClient(
 
         /** 桥端在按下快门时写入的 Unix 毫秒；旧桥没有这个头。 */
         private const val CAPTURED_AT_HEADER = "X-AgentGrid-Captured-At"
+        private val JsonMediaType = "application/json; charset=utf-8".toMediaType()
 
         fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
             .readTimeout(30, TimeUnit.SECONDS)
@@ -65,6 +74,102 @@ class DesktopScreenshotClient(
         // GET 截图可安全重试，保留 Cloudflare/ngrok 多 Anycast/IP 容灾。
         .retryOnConnectionFailure(true)
         .build()
+    private val clickLanHttp = okHttpClient.newBuilder()
+        .connectTimeout(2, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(false)
+        .build()
+    private val clickTunnelHttp = okHttpClient.newBuilder()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(false)
+        .build()
+
+    suspend fun sendClick(
+        normalizedX: Float,
+        normalizedY: Float,
+        action: String = "left",
+        viaTunnel: Boolean,
+        requestId: String,
+        imageWidth: Int,
+        imageHeight: Int,
+    ) {
+        if (!normalizedX.isFinite() || !normalizedY.isFinite() ||
+            normalizedX !in 0f..1f || normalizedY !in 0f..1f
+        ) {
+            throw IllegalArgumentException("点击坐标必须在 0..1 之间")
+        }
+        if (requestId.isBlank() || imageWidth <= 0 || imageHeight <= 0) {
+            throw IllegalArgumentException("点击请求缺少请求 ID 或截图尺寸")
+        }
+        val candidates = endpoints()
+        if (candidates.isEmpty()) {
+            throw IllegalStateException("未连接或未配对，没有可用的服务端地址")
+        }
+        val endpoint = candidates.firstOrNull { it.secure == viaTunnel } ?: candidates.first()
+        val scheme = if (endpoint.secure) "https" else "http"
+        val defaultPort = if (endpoint.secure) 443 else 80
+        val authority = if (endpoint.port == defaultPort) endpoint.host else "${endpoint.host}:${endpoint.port}"
+        val body = String.format(
+            Locale.US,
+            "{\"x\":%.6f,\"y\":%.6f,\"action\":\"%s\",\"requestId\":\"%s\",\"imageWidth\":%d,\"imageHeight\":%d}",
+            normalizedX,
+            normalizedY,
+            action,
+            requestId,
+            imageWidth,
+            imageHeight,
+        ).toRequestBody(JsonMediaType)
+        val request = Request.Builder()
+            .url("$scheme://$authority/api/desktop/click")
+            .apply { endpoint.secret?.let { header("X-AgentGrid-Secret", it) } }
+            .header("ngrok-skip-browser-warning", "1")
+            .header("Cache-Control", "no-cache")
+            .post(body)
+            .build()
+
+        val client = if (endpoint.secure) clickTunnelHttp else clickLanHttp
+        val response = suspendCancellableCoroutine { continuation ->
+            val call = client.newCall(request)
+            continuation.invokeOnCancellation { call.cancel() }
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) {
+                    if (!continuation.isCancelled) {
+                        continuation.resumeWithException(
+                            DesktopScreenshotException(
+                                e.message ?: "发送点击失败：网络不可达",
+                                retryable = false,
+                                cause = e,
+                            ),
+                        )
+                    }
+                }
+
+                override fun onResponse(call: Call, response: Response) {
+                    if (!continuation.isCancelled) continuation.resume(response)
+                    else response.close()
+                }
+            })
+        }
+        response.use {
+            if (!it.isSuccessful) {
+                val fallback = when (it.code) {
+                    400 -> "点击坐标或请求参数无效 (400)"
+                    401 -> "桌面点击认证失败：配对密钥不匹配 (401)"
+                    404 -> "Windows 桥端暂不支持桌面点击，请升级桥程序 (404)"
+                    409 -> "截图尺寸已变化，请刷新后重试 (409)"
+                    415 -> "桥端拒绝点击请求格式 (415)"
+                    503 -> "桌面点击失败：桥端无法注入点击 (503)"
+                    else -> "发送点击失败 (HTTP ${it.code})"
+                }
+                val detail = it.body?.string()?.trim()?.takeIf { text -> text.isNotEmpty() }?.take(200)
+                throw DesktopScreenshotException(
+                    if (detail == null) fallback else "$fallback: $detail",
+                    retryable = false,
+                )
+            }
+        }
+    }
 
     suspend fun fetchScreenshot(): DesktopScreenshotResult {
         val startedAt = now()
